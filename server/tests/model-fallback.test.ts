@@ -2,12 +2,14 @@ import { beforeEach, describe, expect, test } from "bun:test";
 import {
   cooldownMs,
   coolingDown,
+  explainModelError,
   type FallbackUse,
   fallbackCandidates,
   fallbackLanguageModel,
   fallbackNotice,
   fallbackReason,
   isQuotaError,
+  providerReason,
   resetModelCooldowns,
   withFallbackListener,
 } from "../src/agents/model-fallback";
@@ -327,5 +329,68 @@ describe("model fallback on quota errors", () => {
       const wrapped = fallbackLanguageModel(primary.model, "c/p", { candidates: async () => [], build: () => null, log: () => {}, firstOutputMs: 20 });
       expect(await wrapped.doGenerate({})).toEqual({ ok: "slow" });
     });
+  });
+});
+
+/*
+ * 2026-10-21：模型出错时对话里要看得到原因。AI SDK 的 APICallError 只在 message 里放状态行，
+ * 供应商原话在 responseBody；包装层原地补上「（模型 id · HTTP 状态码：原因）」，不换错误对象。
+ */
+describe("model errors carry the reason to the conversation", () => {
+  beforeEach(() => resetModelCooldowns());
+
+  test("status line only → model, status and the provider's own words", async () => {
+    const error = Object.assign(new Error("Bad Request"), {
+      name: "AI_APICallError",
+      statusCode: 400,
+      isRetryable: false,
+      responseBody: JSON.stringify({ error: { message: "Model glm-9 does not exist", type: "invalid_request_error" } }),
+    });
+    const primary = fakeModel("p", async () => {
+      throw error;
+    });
+    const wrapped = fallbackLanguageModel(primary.model, "clinepass/glm-9", { candidates: async () => [], build: () => null, log: () => {} });
+    const thrown = await wrapped.doStream({}).catch((e: unknown) => e);
+    expect(thrown).toBe(error);
+    expect(error.message).toBe("Bad Request（模型 clinepass/glm-9 · HTTP 400：Model glm-9 does not exist）");
+    expect((error as { isRetryable?: boolean }).isRetryable).toBe(false);
+  });
+
+  test("the same error is not annotated twice", () => {
+    const error = Object.assign(new Error("Unauthorized"), { statusCode: 401, responseBody: "invalid key" });
+    explainModelError(error, "a/b");
+    explainModelError(error, "a/b");
+    expect(error.message).toBe("Unauthorized（模型 a/b · HTTP 401：invalid key）");
+  });
+
+  test("network failure: the cause is the reason", () => {
+    const cause = Object.assign(new Error("connect ECONNREFUSED 172.18.0.3:3425"), { code: "ECONNREFUSED" });
+    const error = new TypeError("fetch failed", { cause });
+    explainModelError(error, "m/x");
+    expect(error.message).toBe("fetch failed（模型 m/x：connect ECONNREFUSED 172.18.0.3:3425）");
+  });
+
+  test("keys echoed back by the provider are masked", () => {
+    const error = Object.assign(new Error("Unauthorized"), {
+      statusCode: 401,
+      responseBody: JSON.stringify({ error: { message: "Incorrect API key provided: sk-abcdefghijklmnop1234" } }),
+    });
+    explainModelError(error, "a/b");
+    expect(error.message).not.toContain("abcdefghijklmnop1234");
+    expect(error.message).toContain("Incorrect API key provided: sk-abc***");
+  });
+
+  test("the person pressing stop is left alone", () => {
+    const error = Object.assign(new Error("This operation was aborted"), { name: "AbortError" });
+    explainModelError(error, "a/b");
+    expect(error.message).toBe("This operation was aborted");
+  });
+
+  test("providerReason reads common JSON shapes and HTML pages", () => {
+    expect(providerReason('{"message":"quota exceeded"}')).toBe("quota exceeded");
+    expect(providerReason('{"error":"model not found"}')).toBe("model not found");
+    expect(providerReason('{"detail":"Not authenticated"}')).toBe("Not authenticated");
+    expect(providerReason("<html><body><h1>502 Bad Gateway</h1></body></html>")).toBe("502 Bad Gateway");
+    expect(providerReason("")).toBe("");
   });
 });

@@ -94,20 +94,14 @@ export function DeviceAgentsPanel({ device, isThisPc }: { device: DeviceView; is
     const roots = await bridge.pickFolders();
     if (roots.length) update((d) => ({ ...d, workspaceRoots: [...new Set([...d.workspaceRoots, ...roots])] }));
   });
-
-  if (state.isPending || (!draft && !state.isError)) return <PageSkeleton rows={4} />;
-  if (state.isError || !state.data || !draft) return <ErrorCard description={state.error?.message ?? "读取失败"} title="无法读取本地 agent 设置" />;
-  const data = state.data;
-  const detected = data.settings.detected;
-  const sandboxes = detected?.sandboxes ?? {};
-  const agents = detected?.agents ?? [{ kind: "builtin" as LocalAgentKind, version: null, path: null }];
   function update(fn: (d: Draft) => Draft) {
     setDraft((d) => (d ? fn(d) : d));
   }
+  const sandboxes = state.data?.settings.detected?.sandboxes ?? {};
   const available = (iso: Isolation) => iso === "none" || iso === "copy" || sandboxes[iso] === true;
   // 完全访问 = 设备的「完全访问」开关（ADR-0009，有时限）；这里存的只有 只读 / 工作区，完全访问到期后回到它。
   const fullOn = !!device.fullAccess;
-  const storedProfile: AgentProfile = draft.profile === "full" ? "workspace" : draft.profile;
+  const storedProfile: AgentProfile = !draft || draft.profile === "full" ? "workspace" : draft.profile;
   const activeProfile: AgentProfile = fullOn ? "full" : storedProfile;
   const chooseProfile = (profile: AgentProfile) => {
     if (profile === "full") {
@@ -116,9 +110,9 @@ export function DeviceAgentsPanel({ device, isThisPc }: { device: DeviceView; is
     }
     update((d) => ({ ...d, profile }));
   };
-  const rootPlaceholder = device.platform === "win32" ? "C:\\Users\\你\\code\\项目" : "/home/你/code/项目";
-  const builtin = draft.builtinModel;
   // 分段选择的键盘约定（2026-10-20）：roving tabindex + 方向键换档；「完全访问」那档按下去是滚到下面，和点它一致。
+  // 两个钩子必须在下面的加载 / 出错提前返回之前调用：首帧 draft 一定为空，放在后面会让钩子数量在第二帧变多，
+  // React 直接抛「Rendered more hooks than during the previous render」，整个标签页崩掉。
   const profileKeys = useSegmentedKeys<AgentProfile>({
     value: activeProfile,
     values: AGENT_PROFILES,
@@ -132,12 +126,20 @@ export function DeviceAgentsPanel({ device, isThisPc }: { device: DeviceView; is
     .filter((iso) => iso !== "sandbox-exec" || device.platform === "darwin")
     .filter((iso) => iso !== "bwrap" || device.platform === "linux");
   const isolationKeys = useSegmentedKeys<Isolation>({
-    value: draft.isolation,
+    value: draft?.isolation ?? "none",
     values: isolationOptions,
     onChange: (iso) => {
       if (available(iso)) update((d) => ({ ...d, isolation: iso }));
     },
   });
+
+  if (state.isPending || (!draft && !state.isError)) return <PageSkeleton rows={4} />;
+  if (state.isError || !state.data || !draft) return <ErrorCard description={state.error?.message ?? "读取失败"} title="无法读取本地 agent 设置" />;
+  const data = state.data;
+  const detected = data.settings.detected;
+  const agents = detected?.agents ?? [{ kind: "builtin" as LocalAgentKind, version: null, path: null }];
+  const rootPlaceholder = device.platform === "win32" ? "C:\\Users\\你\\code\\项目" : "/home/你/code/项目";
+  const builtin = draft.builtinModel;
 
   return (
     <>

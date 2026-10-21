@@ -6,9 +6,48 @@
 export type FriendlyError = {
   title: string;
   hint?: string;
+  /** 卡片上直接显示的一行原因（不用点「查看详情」）；没有原始错误时为空。 */
+  reason?: string;
   detail: string;
   retryable: boolean;
 };
+
+/**
+ * 服务端补在模型错误末尾的「（模型 <id> · HTTP <状态码>：<供应商原因>）」
+ * （server/src/agents/model-fallback.ts explainModelError，2026-10-21）。
+ */
+const MODEL_TAG = "（模型 ";
+
+/** 规则匹配前去掉模型 id：「qwen-512b」里的 512 不该被认成 5xx。 */
+export function withoutModelId(text: string): string {
+  return text.replace(/（模型 [^\s·：）]+/g, "（");
+}
+
+/**
+ * 一行能直接读的错误原因（2026-10-21，用户：模型出错时要能看到原因）。
+ * 有服务端补的标记时用它（已含状态码和供应商原话）；否则用原文开头，去掉 AI SDK 的「Failed after N attempts」前缀。
+ */
+export function errorReason(raw: string): string {
+  const flat = raw
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/^Failed after \d+ attempts?\.\s*(Last error:\s*)?/i, "");
+  if (!flat) return "";
+  const start = flat.lastIndexOf(MODEL_TAG);
+  const end = flat.lastIndexOf("）");
+  let reason = flat;
+  if (start >= 0 && end > start) {
+    const inner = flat.slice(start + 1, end);
+    const head = flat.slice(0, start).trim();
+    // 有供应商原话（「：」后面）就够了；没有时把原来的那句（如「model gave no output in 30s」）带上。
+    reason = inner.includes("：") || !head ? inner : `${head}（${inner}）`;
+  }
+  return reason.length > 200 ? `${reason.slice(0, 200)}…` : reason;
+}
+
+export function hasModelTag(raw: string): boolean {
+  return raw.includes(MODEL_TAG);
+}
 
 /**
  * 「这一轮发出去了，但没有留下任何回答」的标记（2026-10-20，P1）。
@@ -116,15 +155,28 @@ export function friendlyError(raw: string): FriendlyError {
   if (/^机器人(在「[^」]*」这一步出错|做完「[^」]*」之后没有接着做|这一轮没有给出任何回复)/.test(detail)) {
     return { title: "这一轮没有做完", hint: detail, detail: "", retryable: true };
   }
+  const probe = withoutModelId(detail);
+  const reason = errorReason(detail);
   for (const rule of RULES) {
-    if (rule.test.test(detail)) {
+    if (rule.test.test(probe)) {
       return {
         title: rule.title,
         ...(rule.hint ? { hint: rule.hint } : {}),
+        ...(reason ? { reason } : {}),
         detail,
         retryable: rule.retryable ?? true,
       };
     }
+  }
+  // 服务端补过原因的模型错误（规则都没认出来）：标题说清是模型出错，原因放在下面那行。
+  if (hasModelTag(detail)) {
+    return {
+      title: "模型调用出错了",
+      hint: "换一个模型再试，或点「重试」。",
+      ...(reason ? { reason } : {}),
+      detail,
+      retryable: true,
+    };
   }
   // Already a short Chinese sentence from this app: show it as the headline itself.
   if (/[\u4e00-\u9fff]/.test(detail) && detail.length <= 60) {
@@ -134,6 +186,7 @@ export function friendlyError(raw: string): FriendlyError {
   return {
     title: "这一轮没有收到回答",
     hint: "可能是模型不可用（例如已下线）或这一轮被打断了。换一个模型再试，或点「重试」。",
+    ...(reason ? { reason } : {}),
     detail,
     retryable: true,
   };

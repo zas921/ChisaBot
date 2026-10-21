@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { friendlyError } from "../src/lib/chat/friendly-error";
+import { errorReason, friendlyError } from "../src/lib/chat/friendly-error";
 import { friendlyStopReason } from "../src/lib/copilot/stopped-turn";
 
 describe("模型回答到一半断开（成熟度扫查 F7）", () => {
@@ -45,5 +45,41 @@ describe("模型被服务商下线", () => {
     expect(f.title).toBe("这一轮没有收到回答");
     expect(f.hint).toContain("换一个模型");
     expect(f.retryable).toBe(true);
+  });
+});
+
+/*
+ * 2026-10-21：模型出错时要能直接看到原因。服务端在错误末尾补「（模型 id · HTTP 状态码：供应商原话）」
+ * （server/src/agents/model-fallback.ts explainModelError），卡片和机器人聊天都把它显示出来。
+ */
+describe("模型错误显示原因", () => {
+  const tagged = "Failed after 3 attempts. Last error: Unauthorized（模型 clinepass/glm-9 · HTTP 401：Invalid API key）";
+
+  test("频道聊天：标题照旧翻译，原因一行直接显示", () => {
+    const f = friendlyError(tagged);
+    expect(f.title).toBe("模型密钥无效或已过期");
+    expect(f.reason).toBe("模型 clinepass/glm-9 · HTTP 401：Invalid API key");
+    expect(f.detail).toBe(tagged);
+  });
+
+  test("模型 id 里的数字不会被当成状态码", () => {
+    const f = friendlyError("Bad Request（模型 qwen/qwen-512b · HTTP 400：unsupported parameter: tools）");
+    expect(f.title).toBe("模型调用出错了");
+    expect(f.reason).toBe("模型 qwen/qwen-512b · HTTP 400：unsupported parameter: tools");
+  });
+
+  test("没有供应商原话时带上原来那句", () => {
+    expect(errorReason("model gave no output in 30s（模型 a/b）")).toBe("model gave no output in 30s（模型 a/b）");
+  });
+
+  test("没有服务端标记的原文也给一行原因", () => {
+    expect(friendlyError("Error 429: Too Many Requests").reason).toBe("Error 429: Too Many Requests");
+  });
+
+  test("机器人聊天：中文提示后面接原因", () => {
+    const said = friendlyStopReason(tagged);
+    expect(said).toContain("密钥");
+    expect(said).toContain("（原因：模型 clinepass/glm-9 · HTTP 401：Invalid API key）");
+    expect(friendlyStopReason("Bad Request（模型 a/b · HTTP 400：bad tools）")).toBe("这一轮出错了：Bad Request（原因：模型 a/b · HTTP 400：bad tools）");
   });
 });

@@ -1,3 +1,5 @@
+import { errorReason, hasModelTag } from "../chat/friendly-error";
+
 /**
  * Why the last turn ended without an answer, for a surface that has to say so itself.
  *
@@ -35,6 +37,17 @@ export function stoppedReason(reported: unknown): string {
  * 认得的错误给一句中文 + 下一步；不认得的英文前面加「这一轮出错了：」保留原文便于排查；已经是中文的原样。
  */
 export function friendlyStopReason(said: string): string {
+  if (!said) return "";
+  if (!hasModelTag(said)) return stopSentence(said);
+  // 服务端补了「（模型 id · HTTP 状态码：供应商原因）」（2026-10-21）：按去掉标记的原话翻译，再把原因接在后面。
+  const start = said.lastIndexOf("（模型 ");
+  const end = said.lastIndexOf("）");
+  const bare = `${said.slice(0, start)}${end > start ? said.slice(end + 1) : ""}`.trim();
+  const sentence = stopSentence(bare || said);
+  return `${sentence}（原因：${errorReason(said)}）`;
+}
+
+function stopSentence(said: string): string {
   if (!said) return "";
   const text = said.replace(/^Failed after \d+ attempts?\.\s*(Last error:\s*)?/i, "");
   const wait = /try again in\s*(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?/i.exec(text);

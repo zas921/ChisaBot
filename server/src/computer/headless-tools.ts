@@ -35,6 +35,18 @@ import {
   normalizeCommandTimeout,
 } from "../../../shared/command-timeout";
 
+/**
+ * What the shell tool says about sudo. CHISABOT_COMPUTER_SUDO=full (deploy/compose.yaml, docs/computer-sudo.md)
+ * gives the computer's user passwordless sudo for everything; without saying so a model keeps
+ * assuming only apt-get works and works around permission errors it could simply fix.
+ */
+export function computerSudoGuide(env: Record<string, string | undefined> = process.env): string {
+  return env.CHISABOT_COMPUTER_SUDO?.trim() === "full"
+    ? " You have passwordless sudo for any command on this computer (root inside your own container, not the host); use it when a task needs root."
+    : " For package installation use sudo apt-get; if refused say so rather than retrying.";
+}
+const COMPUTER_SUDO_GUIDE = computerSudoGuide();
+
 /** Client tools supplied by OpenBot when the caller has no browser. */
 export type HeadlessTool = {
   definition: Tool;
@@ -580,7 +592,7 @@ export function createHeadlessComputerTools(options: {
       "computer_run_command",
       "Run a bash shell command in your workspace on your own computer. Pipes and && work; long output is truncated. " +
         COMMAND_TIMEOUT_GUIDE +
-        " For package installation use sudo apt-get; if refused say so rather than retrying.",
+        COMPUTER_SUDO_GUIDE,
       z.strictObject({
         command: text,
         // §102：秒（推荐）或毫秒都收；超出 1–600 秒收到边界上，不拒绝。

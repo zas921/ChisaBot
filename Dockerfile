@@ -180,6 +180,11 @@ COPY --from=app-build /src/app/dist app/dist
 ENV APP_DIST_DIR=/app/app/dist
 
 COPY docker/s6 /etc/s6-overlay
+# Full sudo for the Bot's computer, OFF unless CHISABOT_COMPUTER_SUDO=full (docs/computer-sudo.md).
+# A cont-init script so it runs as root on every start and removes the grant when switched off.
+RUN mkdir -p /etc/cont-init.d \
+  && install -m 755 agent-computer/src/computer-sudo.sh /etc/cont-init.d/50-computer-sudo \
+  && sh -n /etc/cont-init.d/50-computer-sudo
 
 # PostgreSQL, for the deployment that wants one thing to run rather than two.
 #

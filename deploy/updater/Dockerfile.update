@@ -26,6 +26,10 @@ COPY --chown=apiuser:apiuser shared /app/shared
 COPY --chown=apiuser:apiuser examples/zh-CN /app/examples/zh-CN
 # 服务器直接 import agent-computer/src/egress.ts（网络策略同一份代码），计算机服务也从这里跑：和代码层一起换。
 COPY --chown=apiuser:apiuser agent-computer/src /app/agent-computer/src
+# 机器人电脑的完整 sudo 开关（CHISABOT_COMPUTER_SUDO=full，默认关闭）；旧提交里没有这个脚本时跳过。
+RUN if [ -f /app/agent-computer/src/computer-sudo.sh ]; then mkdir -p /etc/cont-init.d \
+      && install -m 755 -o root -g root /app/agent-computer/src/computer-sudo.sh /etc/cont-init.d/50-computer-sudo; \
+    else rm -f /etc/cont-init.d/50-computer-sudo; fi
 COPY --chown=apiuser:apiuser build-info.json /app/build-info.json
 LABEL org.opencontainers.image.title=ChisaBot \
       org.opencontainers.image.revision=@COMMIT@ \

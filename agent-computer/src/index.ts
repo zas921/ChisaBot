@@ -53,6 +53,7 @@ import {
   keepAlivePongPayload,
   isKeepAlivePing,
   isKeepAlivePong,
+  isFrameAck,
   STREAM_IDLE_TIMEOUT_S,
   STREAM_KEEPALIVE_MS,
 } from "./stream-keepalive";
@@ -767,6 +768,13 @@ serve<StreamData>({
         // a heartbeat, not input: dropping it here keeps it away from parseInputMessage, which used
         // to refuse it as an unknown type and cover the takeover screen with an error every 30s.
         if (isKeepAlivePong(maybe)) return;
+        // Flow control (screencast.ts): the viewer drew a frame. Only the socket that owns the cast
+        // counts; a superseded tab's acks must not open the gate for somebody else's screen.
+        if (isFrameAck(maybe)) {
+          const standing = sessions.for(ws.data.botId).viewer.standingOf(ws);
+          if (standing.state === "casting") standing.cast.frameDelivered?.();
+          return;
+        }
       } catch {
         /* fall through to the ordinary parser below */
       }

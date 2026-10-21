@@ -32,6 +32,10 @@ COPY --chown=apiuser:apiuser examples/zh-CN /app/examples/zh-CN
 # 地址栏、标签）它不认识，接管大屏直接显示「That input message has an unknown type.」。
 RUN rm -rf /app/agent-computer/src
 COPY --chown=apiuser:apiuser agent-computer/src /app/agent-computer/src
+# 机器人电脑的完整 sudo 开关（CHISABOT_COMPUTER_SUDO=full，默认关闭；docs/computer-sudo.md）。
+RUN mkdir -p /etc/cont-init.d \
+    && install -m 755 -o root -g root /app/agent-computer/src/computer-sudo.sh /etc/cont-init.d/50-computer-sudo \
+    && sh -n /etc/cont-init.d/50-computer-sudo
 
 RUN cd /app/server \
     && bun -e 'await import("@copilotkit/runtime/v2"); console.log("runtime_import_ok")'

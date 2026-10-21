@@ -526,6 +526,9 @@ export function builtInAgentConfiguration(
 
   const standing = standingInstructionsGuidance(standingInstructions);
   const allTools = [...tools];
+  // 后台刷新面板的回合只拿到 panel_update / panel_fail（没有 panel_create）：它从第一步起就欠一次 panel_update。
+  const panelRefreshRun =
+    allTools.some((tool) => tool.name === "panel_update") && !allTools.some((tool) => tool.name === "panel_create");
 
   return {
     // 每一步开始前看收件箱：机器人回答期间用户又发来的话、后台任务的结果在步与步之间读进去（thread-inbox.ts）。
@@ -610,11 +613,11 @@ export function builtInAgentConfiguration(
                   () => tool.execute(args, signal ? { signal } : undefined),
                 ),
               );
-              // 步数快用完时提醒收尾（§101）。
-              return withStepBudgetNote(result);
+              // 步数快用完时提醒收尾（§101）；面板还没交上去时提醒的是「马上 panel_update」（2026-10-21）。
+              return withStepBudgetNote(result, undefined, { tool: tool.name, panelRefresh: panelRefreshRun });
             },
           })),
-          maxSteps: TOOL_STEPS,
+          maxSteps: allTools.some((tool) => tool.name === "panel_update") ? PANEL_TOOL_STEPS : TOOL_STEPS,
         }
       : {}),
   };
@@ -629,6 +632,16 @@ export function builtInAgentConfiguration(
 const TOOL_STEPS = 12;
 
 /**
+ * 做面板的回合可以多走几步（2026-10-21，用户：在客户端里让写面板经常写不出来）。
+ *
+ * 做一张面板最少是 panel_create → web_search → web_fetch → panel_update，设计规范不合格还会被退回重交
+ * （最多 3 次，结构问题不限次数）。12 步里常常交不上：以前到倒数第三步就提醒「停止调用工具、直接回答」，
+ * 模型照做，卡片永远停在「正在搭建」。所以手里有面板工具的回合硬上限放到 20 步；面板建了还没交上合格规范时
+ * 按 20 步算余量，提醒改成「别再搜了，用已有数据马上 panel_update」。普通回合仍按 12 步提醒收尾。
+ */
+const PANEL_TOOL_STEPS = 20;
+
+/**
  * 步数快用完时提醒模型收尾（DESIGN.md §101）。
  *
  * 到了 TOOL_STEPS 这一轮就硬停：模型最后一步还在调工具，就没有最终回答，界面只能显示「这一轮没有做完」
@@ -636,15 +649,29 @@ const TOOL_STEPS = 12;
  * 从倒数第三次起在工具结果后面加一句「停止调用工具，直接回答」。只加在字符串 / 普通对象结果上，不改别的。
  */
 const stepCounts = new WeakMap<object, number>();
+/** 这一轮有没有「建了卡片、还没交上合格规范」的面板。 */
+const panelPending = new WeakMap<object, boolean>();
 const STEP_NOTE = (left: number) =>
   `【系统提示】这一轮的工具步数快用完了（最多还能再调 ${left} 次）。现在停止调用工具，用已经拿到的信息直接给用户完整的回答；信息不全就说明缺什么。`;
-export function withStepBudgetNote<T>(result: T, turn: object | undefined = currentConfirmTurn()): T {
+const PANEL_STEP_NOTE = (left: number) =>
+  `【系统提示】这一轮的工具步数快用完了（最多还能再调 ${left} 次），面板还没有交上去。不要再搜索或读网页：现在就用已经取到的数据调用 panel_update（数据不全就少放几项）；实在没有数据就调用 panel_fail 写明原因。`;
+export function withStepBudgetNote<T>(
+  result: T,
+  turn: object | undefined = currentConfirmTurn(),
+  /** 刚执行的工具，以及这是不是后台刷新面板的回合（它一开始就欠一次 panel_update）。 */
+  options: { tool?: string; panelRefresh?: boolean } = {},
+): T {
   if (!turn) return result;
   const used = (stepCounts.get(turn) ?? 0) + 1;
   stepCounts.set(turn, used);
-  const left = TOOL_STEPS - used;
+  const refused = typeof result === "string" && result.startsWith(REFUSAL_MARKER);
+  let pending = panelPending.get(turn) ?? options.panelRefresh === true;
+  if (options.tool === "panel_create" && !refused) pending = true;
+  if (options.tool === "panel_update" || options.tool === "panel_fail") pending = refused;
+  panelPending.set(turn, pending);
+  const left = (pending ? PANEL_TOOL_STEPS : TOOL_STEPS) - used;
   if (left > 2) return result;
-  const note = STEP_NOTE(Math.max(left, 0));
+  const note = (pending ? PANEL_STEP_NOTE : STEP_NOTE)(Math.max(left, 0));
   if (typeof result === "string") return `${result}\n\n${note}` as T;
   if (result && typeof result === "object" && !Array.isArray(result) && Object.getPrototypeOf(result) === Object.prototype)
     return { ...(result as Record<string, unknown>), systemNote: note } as T;

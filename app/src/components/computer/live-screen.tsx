@@ -24,6 +24,9 @@ import { socketUrl } from "@/lib/socket-url";
 import { currentPageVisible } from "./preview-visibility";
 import { pageCoordinates } from "./take-the-wheel";
 
+/** The viewer's "one frame reached me" (agent-computer screencast flow control). */
+const FRAME_ACK = JSON.stringify({ type: "frame-ack" });
+
 /**
  * Low-latency screencast used while a human is driving the Bot's browser.
  *
@@ -432,6 +435,18 @@ export function LiveScreen({
       };
       latestFrame.current = frame;
       const frameId = ++latestFrameId.current;
+      /*
+       * 收到一帧就回 frame-ack（2026-10-21 流量控制，agent-computer/src/screencast.ts）：电脑端据此限制在途帧数，
+       * 网络慢时不再把旧帧排成长队，下一帧总是最新画面。和 pong 一样不需要握着方向盘。
+       */
+      const ackSocket = socketRef.current;
+      if (ackSocket?.readyState === WebSocket.OPEN) {
+        try {
+          ackSocket.send(FRAME_ACK);
+        } catch {
+          /* reconnect path will replace the socket */
+        }
+      }
 
       if (!currentPageVisible()) return;
       void drawFrame(frame, frameId);

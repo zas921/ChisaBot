@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { Page } from "playwright";
-import { type InputMessage, startScreencast } from "../src/screencast";
+import { FRAME_ACK_STALL_MS, type InputMessage, MIN_FRAME_INTERVAL_MS, startScreencast } from "../src/screencast";
 
 /**
  * What a person's keystroke turns into on the wire.
@@ -180,5 +180,79 @@ describe("开场帧与地址栏", () => {
       url: "about:blank",
       error: "网络策略不允许访问这个网址。",
     });
+  });
+});
+
+/*
+ * 2026-10-21 流量控制（内置浏览器卡顿）：Chrome 的帧不再立刻 ack。帧率上限 20 fps；查看端回 frame-ack
+ * 之后，在途帧满 MAX_FRAMES_IN_FLIGHT 就先压住 Chrome，等查看端追上，下一帧总是最新画面。
+ */
+describe("直播画面的流量控制", () => {
+  function chrome() {
+    const acks: number[] = [];
+    let handler: ((event: unknown) => void) | undefined;
+    const client = {
+      on(_event: string, listener: (event: unknown) => void) {
+        handler = listener;
+      },
+      async send(method: string, params: { sessionId?: number } = {}) {
+        if (method === "Page.screencastFrameAck" && typeof params.sessionId === "number") acks.push(params.sessionId);
+        return {};
+      },
+      async detach() {},
+    };
+    const page = {
+      context: () => ({ newCDPSession: async () => client }),
+      url: () => "https://example.com/",
+      viewportSize: () => ({ width: 1280, height: 800 }),
+    } as unknown as Page;
+    const frame = (sessionId: number) => handler?.({ data: `F${sessionId}`, sessionId, metadata: { deviceWidth: 1280, deviceHeight: 800 } });
+    return { page, acks, frame };
+  }
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  test("ack 不早于帧间隔：最多每秒 20 帧", async () => {
+    const { page, acks, frame } = chrome();
+    await startScreencast(page, () => {});
+    frame(1);
+    expect(acks).toEqual([]);
+    await sleep(MIN_FRAME_INTERVAL_MS + 20);
+    expect(acks).toEqual([1]);
+  });
+
+  test("旧查看端不回 frame-ack：照常 ack，不会卡住", async () => {
+    const { page, acks, frame } = chrome();
+    await startScreencast(page, () => {});
+    for (let id = 1; id <= 4; id++) {
+      frame(id);
+      await sleep(MIN_FRAME_INTERVAL_MS + 15);
+    }
+    expect(acks).toEqual([1, 2, 3, 4]);
+  });
+
+  test("查看端没追上时压住 Chrome，确认一到就放行", async () => {
+    const { page, acks, frame } = chrome();
+    const cast = await startScreencast(page, () => {});
+    cast.frameDelivered?.(); // 这个查看端会回确认
+    frame(1);
+    await sleep(MIN_FRAME_INTERVAL_MS + 15);
+    frame(2);
+    await sleep(MIN_FRAME_INTERVAL_MS + 15);
+    expect(acks).toEqual([1]); // 在途 2 帧，第 2 帧先不 ack
+    cast.frameDelivered?.();
+    await sleep(5);
+    expect(acks).toEqual([1, 2]);
+  });
+
+  test("确认丢了也不会永远卡住", async () => {
+    const { page, acks, frame } = chrome();
+    const cast = await startScreencast(page, () => {});
+    cast.frameDelivered?.();
+    frame(1);
+    await sleep(MIN_FRAME_INTERVAL_MS + 15);
+    frame(2);
+    await sleep(FRAME_ACK_STALL_MS + MIN_FRAME_INTERVAL_MS + 50);
+    expect(acks).toEqual([1, 2]);
+    await cast.stop();
   });
 });

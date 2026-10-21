@@ -151,7 +151,18 @@ ChisaBot 把自托管的 [Magpie](https://github.com/yetone/magpie)（`ghcr.io/y
 
 ## 部署配置
 
-`/opt/openbot-zh/compose.yaml`（ChisaBot 服务）：
+用仓库自带的 `deploy/compose.yaml`（`deploy/start.sh` / `friend-up.sh` 部署）时**不要改 compose**，在 `deploy/.env` 写：
+
+```sh
+MAGPIE_ADMIN_URL=http://magpie:3430
+MAGPIE_WEB_KEY_FILE=/etc/chisabot/magpie-web.key
+# 宿主机上的 key 文件，相对 deploy/；compose 把它只读挂到上面的容器路径。没设时挂 /dev/null（= 未配置）。
+MAGPIE_WEB_KEY_HOST_FILE=./secrets/magpie-web.key
+```
+
+> 手改 `deploy/compose.yaml` 加挂载会让仓库一直有本地改动：在线更新不再快进服务器上的检出，`start.sh` 也不记录镜像的来源提交。以前这样改过的，按上面写好 `.env` 后执行 `git -C <仓库> checkout -- deploy/compose.yaml` 再 `sh deploy/start.sh`。
+
+手写的 `/opt/openbot-zh/compose.yaml`（ChisaBot 服务）：
 
 ```yaml
     volumes:
@@ -176,6 +187,7 @@ install -m 400 -o 1002 -g 1002 /opt/magpie/private/web.key /opt/openbot-zh/secre
 | --- | --- | --- |
 | `MAGPIE_ADMIN_URL` | Magpie 管理端地址（容器网络内）。未设置时「模型平台 Magpie」页显示未配置。 | 无 |
 | `MAGPIE_WEB_KEY_FILE` / `MAGPIE_WEB_KEY` | Magpie Web key（16+ 位 `A-Za-z0-9-._~`）。缺少时只能显示连接信息，不能读取提供方状态或内嵌控制台。 | 无 |
+| `MAGPIE_WEB_KEY_HOST_FILE` | 仅 `deploy/compose.yaml`：宿主机上的 Web key 文件，只读挂到容器 `/etc/chisabot/magpie-web.key`。 | `/dev/null` |
 | `MODEL_CATALOG_REFRESH_MINUTES` | 模型列表后台自动同步间隔（分钟），`0` 关闭。 | `10` |
 
 ## 模型接口（默认走 Magpie）

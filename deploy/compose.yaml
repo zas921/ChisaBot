@@ -24,6 +24,11 @@ services:
       # docs/online-update.md）。没装时这两个目录是空的，页面显示怎么安装。
       - ${CHISABOT_UPDATER_HOME:-/opt/chisabot-updater}/spool/requests:/var/lib/chisabot-updater/requests
       - ${CHISABOT_UPDATER_HOME:-/opt/chisabot-updater}/spool/state:/var/lib/chisabot-updater/state:ro
+      # 管理后台 → 模型平台 Magpie 的 Web key 文件（docs/magpie.md）。在 .env 里设
+      # MAGPIE_WEB_KEY_HOST_FILE=./secrets/magpie-web.key 和 MAGPIE_WEB_KEY_FILE=/etc/chisabot/magpie-web.key 即可，
+      # 不要再手改本文件：手改会让仓库一直是脏的，在线更新就不会快进检出、start.sh 也不记录来源提交。
+      # 没设时挂 /dev/null：读到空内容 = 未配置，和以前不挂一样。
+      - ${MAGPIE_WEB_KEY_HOST_FILE:-/dev/null}:/etc/chisabot/magpie-web.key:ro
     networks:
       - default
       - magpie
@@ -48,6 +53,8 @@ services:
       MAGPIE_WEB_KEY_FILE: ${MAGPIE_WEB_KEY_FILE:-}
       MODEL_CATALOG_REFRESH_MINUTES: ${MODEL_CATALOG_REFRESH_MINUTES:-10}
       CHISABOT_UPDATER_DIR: /var/lib/chisabot-updater
+      # 机器人电脑的完整 sudo：off（默认，只能 sudo 包管理器）/ full（容器内 root）。风险见 docs/computer-sudo.md。
+      CHISABOT_COMPUTER_SUDO: ${CHISABOT_COMPUTER_SUDO:-off}
     logging:
       driver: json-file
       options:

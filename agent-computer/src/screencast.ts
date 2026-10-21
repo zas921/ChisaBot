@@ -150,7 +150,32 @@ export type Screencast = {
   stop: () => Promise<void>;
   /** Apply one thing the person did. */
   send: (message: InputMessage) => Promise<void>;
+  /**
+   * The viewer says one frame reached it (`{type:"frame-ack"}`, live-screen.tsx). Optional so a cast
+   * that predates flow control, and test doubles, still satisfy the type.
+   */
+  frameDelivered?: () => void;
 };
+
+/*
+ * 直播画面的流量控制（2026-10-21，用户：内置浏览器用起来太卡）。
+ *
+ * 以前收到 Chrome 的每一帧就立刻 ack，Chrome 于是按合成器的速度（动起来时每秒最多 60 帧）编码 JPEG：
+ * 四核的服务器上软件渲染 + 编码本身就和机器人抢 CPU；帧又一路排进 API 转发、nginx 和 20 Mbps 跨洋链路的
+ * 缓冲里，画面越积越旧，点一下要等好几秒才看到结果。
+ *
+ * 现在两道闸：
+ * 1. 帧率上限：距上一帧不到 MIN_FRAME_INTERVAL_MS 就晚一点再 ack，Chrome 最多每秒 20 帧。
+ * 2. 端到端信用：查看端每收到一帧回一个 frame-ack；在途（发出未确认）满 MAX_FRAMES_IN_FLIGHT 帧就先不 ack
+ *    Chrome，等查看端追上。Chrome 在 ack 之前不出下一帧，所以等到的下一帧永远是最新画面，而不是排队的旧帧。
+ *    旧版查看端不回 frame-ack：收到第一个 frame-ack 之前不启用这道闸，行为和以前一样（只多了帧率上限）。
+ *    确认丢了也不会卡死：在途帧 FRAME_ACK_STALL_MS 内没有任何确认，就清零重来。
+ */
+export const MIN_FRAME_INTERVAL_MS = 50;
+export const MAX_FRAMES_IN_FLIGHT = 2;
+export const FRAME_ACK_STALL_MS = 2_000;
+/** 画质：0–100。70 → 60 大约省两成流量，文字仍清楚。 */
+export const SCREENCAST_QUALITY = 60;
 
 /**
  * Start casting `page` to `onFrame`, and return a handle that accepts input.
@@ -182,15 +207,60 @@ export async function startScreencast(
     metadata: { deviceWidth: number; deviceHeight: number };
   };
 
-  client.on("Page.screencastFrame", (event: ScreencastFrame) => {
-    const { data, sessionId, metadata } = event;
-    // Acknowledge every frame. Chrome will not send the next one until the current is acked, which is
-    // the backpressure that stops a slow client drowning in frames. Forgetting this is why a naive
-    // implementation delivers one frame and then appears to hang.
+  /*
+   * Acknowledge every frame, but not necessarily at once. Chrome will not send the next one until the
+   * current is acked, which is the backpressure that stops a slow client drowning in frames; forgetting
+   * the ack is why a naive implementation delivers one frame and then appears to hang. When the ack goes
+   * out is the flow control described above `MIN_FRAME_INTERVAL_MS`.
+   */
+  let pendingAck: number | null = null;
+  let ackTimer: ReturnType<typeof setTimeout> | undefined;
+  let lastFrameAt = 0;
+  /** Set by the first `frame-ack`: this viewer counts frames, so frames in flight can be limited. */
+  let viewerCounts = false;
+  let inFlight = 0;
+  /** When the gate below started holding Chrome back; 0 while it is not. */
+  let blockedSince = 0;
+  const ackChrome = () => {
+    ackTimer = undefined;
+    const sessionId = pendingAck;
+    if (sessionId === null) return;
+    const now = Date.now();
+    const wait = lastFrameAt + MIN_FRAME_INTERVAL_MS - now;
+    if (wait > 0) {
+      ackTimer = setTimeout(ackChrome, wait);
+      return;
+    }
+    if (!stopped && viewerCounts && inFlight >= MAX_FRAMES_IN_FLIGHT) {
+      // The viewer has not caught up. Wait for its ack (frameDelivered), but never forever.
+      if (!blockedSince) blockedSince = now;
+      const stalledFor = now - blockedSince;
+      if (stalledFor < FRAME_ACK_STALL_MS) {
+        ackTimer = setTimeout(ackChrome, FRAME_ACK_STALL_MS - stalledFor);
+        return;
+      }
+      inFlight = 0;
+    }
+    blockedSince = 0;
+    pendingAck = null;
     void client
       .send("Page.screencastFrameAck", { sessionId })
       .catch(() => undefined);
-    if (stopped) return;
+  };
+  const scheduleAck = () => {
+    if (ackTimer !== undefined) clearTimeout(ackTimer);
+    ackChrome();
+  };
+
+  client.on("Page.screencastFrame", (event: ScreencastFrame) => {
+    const { data, sessionId, metadata } = event;
+    pendingAck = sessionId;
+    if (stopped) {
+      scheduleAck();
+      return;
+    }
+    lastFrameAt = Date.now();
+    if (viewerCounts) inFlight += 1;
     castFrameSeen = true;
     const url = pageUrl();
     onFrame({
@@ -200,11 +270,12 @@ export async function startScreencast(
       height: metadata.deviceHeight,
       ...(url ? { url } : {}),
     });
+    scheduleAck();
   });
 
   await client.send("Page.startScreencast", {
     format: "jpeg",
-    quality: options.quality ?? 70,
+    quality: options.quality ?? SCREENCAST_QUALITY,
     maxWidth: options.maxWidth ?? 1280,
     maxHeight: options.maxHeight ?? 800,
     // One frame per change, not per interval. Chrome decides when something moved.
@@ -222,7 +293,7 @@ export async function startScreencast(
     try {
       const shot = (await client.send("Page.captureScreenshot", {
         format: "jpeg",
-        quality: options.quality ?? 70,
+        quality: options.quality ?? SCREENCAST_QUALITY,
       })) as { data?: string } | undefined;
       if (stopped || castFrameSeen || !shot?.data) return;
       const size =
@@ -241,9 +312,22 @@ export async function startScreencast(
   })();
 
   return {
+    frameDelivered() {
+      if (stopped) return;
+      if (!viewerCounts) {
+        // First ack from this viewer: start counting from here; frames sent before it are not owed.
+        viewerCounts = true;
+        inFlight = 0;
+      } else if (inFlight > 0) {
+        inFlight -= 1;
+      }
+      if (pendingAck !== null && inFlight < MAX_FRAMES_IN_FLIGHT) scheduleAck();
+    },
+
     async stop() {
       if (stopped) return;
       stopped = true;
+      if (ackTimer !== undefined) clearTimeout(ackTimer);
       await client.send("Page.stopScreencast").catch(() => undefined);
       await client.detach().catch(() => undefined);
     },

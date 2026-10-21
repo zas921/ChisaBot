@@ -392,7 +392,12 @@ function Stopped({
         {friendly.hint ? (
           <p className="chat-error-hint">{friendly.hint}</p>
         ) : null}
-        {friendly.detail ? (
+        {friendly.reason ? (
+          <p className="chat-error-reason" data-testid="transcript-stopped-reason">
+            {`原因：${friendly.reason}`}
+          </p>
+        ) : null}
+        {friendly.detail && friendly.detail !== friendly.reason ? (
           <>
             <button
               aria-expanded={open}

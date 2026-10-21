@@ -36,6 +36,16 @@ export function isKeepAlivePong(value: unknown): boolean {
   );
 }
 
+/** The viewer's "one frame reached me" (screencast.ts flow control). Not input: no wheel needed. */
+export function isFrameAck(value: unknown): boolean {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value) &&
+    (value as { type?: unknown }).type === "frame-ack"
+  );
+}
+
 export function keepAlivePingPayload(now = Date.now()): { type: "ping"; t: number } {
   return { type: "ping", t: now };
 }

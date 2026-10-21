@@ -148,6 +148,7 @@ import {
   describeComputerIsolation,
 } from "./computer/provider";
 import { createSnapshotStore } from "./computer/snapshot-store";
+import { type RelayState, relayToViewer, viewerDrained } from "./computer/stream-relay";
 import { streamPathBotId } from "./computer/stream-path";
 import { loadConfig } from "./config";
 import {
@@ -3832,6 +3833,8 @@ type StreamData = {
   botId: string;
   recordingId?: string;
   inward?: WebSocket;
+  /** The newest frame held back while the viewer's socket is congested (computer/stream-relay.ts). */
+  relay?: RelayState;
 };
 
 /**
@@ -3971,17 +3974,12 @@ serve<SocketData>({
         return;
       }
       stream.inward = inward;
-      // Frames outward, input inward. Buffered by neither side: a frame the browser is too slow for
-      // should be dropped, not queued, because a stale frame is worse than a missing one.
-      // Bun's ws.send throws when the socket is not OPEN; if a future runtime queues instead,
-      // drop when bufferedAmount is already large rather than grow without bound.
+      // Frames outward, input inward. A frame the browser is too slow for is held back (newest
+      // wins) until the socket drains, never queued: a stale frame is worse than a late one.
+      // See computer/stream-relay.ts for why the old bufferedAmount check never fired under Bun.
       inward.onmessage = (event) => {
         try {
-          const buffered = (ws as unknown as { bufferedAmount?: number }).bufferedAmount;
-          if (typeof buffered === "number" && buffered > 2_000_000) {
-            return; // drop stale frame rather than queue forever
-          }
-          ws.send(String(event.data));
+          relayToViewer(ws, String(event.data), stream.relay ?? (stream.relay = {}));
         } catch {
           try { inward.close(); } catch { /* ignore */ }
         }
@@ -4002,6 +4000,14 @@ serve<SocketData>({
         return;
       }
       if (ws.data.inward?.readyState === 1) ws.data.inward.send(String(raw));
+    },
+    drain(ws) {
+      if (!isProxiedStream(ws.data) || !ws.data.relay) return;
+      try {
+        viewerDrained(ws, ws.data.relay);
+      } catch {
+        /* closing; the close handler tears down */
+      }
     },
     close(ws, code, reason) {
       if (!isProxiedStream(ws.data)) {

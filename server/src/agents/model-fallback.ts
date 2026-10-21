@@ -172,6 +172,67 @@ function errorParts(error: unknown): { status?: number; text: string } {
   return { status, text: texts.join(" ") };
 }
 
+/** 疑似密钥 / 令牌打码后再给人看（供应商有时会把请求里的 key 回显在报错里）。 */
+function maskSecrets(text: string): string {
+  return text
+    .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "$1 ***")
+    .replace(/\b(sk|pk|rk|ak|key|tok)[-_][A-Za-z0-9._-]{8,}/gi, (m) => `${m.slice(0, 6)}***`)
+    .replace(/\b[A-Za-z0-9_-]{40,}\b/g, (m) => `${m.slice(0, 4)}***`);
+}
+
+/** 供应商响应体里给人看的那句话：JSON 的 error.message / message / detail / msg，读不出来就用原文。 */
+export function providerReason(body: string): string {
+  const raw = body.trim();
+  if (!raw) return "";
+  try {
+    const json = JSON.parse(raw) as Record<string, unknown>;
+    const error = json.error;
+    const candidates = [
+      typeof error === "object" && error ? (error as Record<string, unknown>).message : error,
+      json.message,
+      json.detail,
+      json.msg,
+      json.error_msg,
+    ];
+    for (const value of candidates) if (typeof value === "string" && value.trim()) return value.trim();
+  } catch {
+    // 不是 JSON：HTML 错误页之类，去掉标签留文字。
+  }
+  return raw.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+}
+
+const EXPLAINED = Symbol.for("chisabot.modelErrorExplained");
+
+/**
+ * 把「为什么调用失败」写进错误本身（2026-10-21，用户：模型出错时要能看到原因）。
+ *
+ * AI SDK 的 APICallError 只把状态行（「Bad Request」「Unauthorized」）放在 message 里，供应商真正说的原因
+ * 在 responseBody，状态码在 statusCode；CopilotKit 发 RUN_ERROR 时只取 message，于是对话里的错误卡只能说
+ * 「这一轮没有收到回答」，查看详情也只有一个英文状态行。这里原地补上「模型 id · HTTP 状态码：供应商原因」，
+ * 不换错误对象（AI SDK 的重试判断看 isRetryable / 类型标记），也不重复补。用户自己点的停止不动。
+ */
+export function explainModelError(error: unknown, modelId: string): void {
+  if (!(error instanceof Error) || (error as unknown as Record<symbol, unknown>)[EXPLAINED]) return;
+  if (error.name === "AbortError" || /\baborted\b/i.test(error.message)) return;
+  const e = error as Error & { statusCode?: unknown; responseBody?: unknown; cause?: unknown };
+  const status = typeof e.statusCode === "number" ? e.statusCode : undefined;
+  let reason = typeof e.responseBody === "string" ? providerReason(e.responseBody) : "";
+  if (!reason && e.cause instanceof Error && e.cause.message && !error.message.includes(e.cause.message)) {
+    // fetch failed → cause 才是「connect ECONNREFUSED 172.18.0.3:3425」这种真正的原因。
+    const code = (e.cause as Error & { code?: unknown }).code;
+    reason = `${typeof code === "string" && !e.cause.message.includes(code) ? `${code} ` : ""}${e.cause.message}`;
+  }
+  if (reason && error.message.includes(reason)) reason = "";
+  reason = maskSecrets(reason).slice(0, 300);
+  const where = [`模型 ${modelId}`, status !== undefined ? `HTTP ${status}` : ""].filter(Boolean).join(" · ");
+  try {
+    error.message = `${error.message.trim() || "模型调用失败"}（${where}${reason ? `：${reason}` : ""}）`;
+    Object.defineProperty(error, EXPLAINED, { value: true });
+  } catch {
+    // 只读 / 冻结的错误对象：保持原样。
+  }
+}
+
 /** 日志里留一小段原始错误，事后能看出主模型到底为什么被拒。 */
 function errorSnippet(error: unknown): string {
   const { status, text } = errorParts(error);
@@ -235,6 +296,15 @@ export function fallbackLanguageModel<T>(model: T, primaryId: string, deps: Fall
   const log = deps.log ?? ((line) => console.log(JSON.stringify(line)));
   const target = model as unknown as Model;
   const wrap = (property: "doStream" | "doGenerate") => async (options: unknown) => {
+    try {
+      return await attempt(property, options);
+    } catch (error) {
+      // 最后抛出去的是主模型的错误（候选都失败时也是它）：补上模型、状态码和供应商原因再交给对话。
+      if (!(options as { abortSignal?: AbortSignal } | null)?.abortSignal?.aborted) explainModelError(error, primaryId);
+      throw error;
+    }
+  };
+  const attempt = async (property: "doStream" | "doGenerate", options: unknown) => {
     const primaryCall = (target[property] as Call).bind(model);
     let firstError: unknown = null;
     let reason: FallbackReason = "quota";

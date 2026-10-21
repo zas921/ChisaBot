@@ -2115,6 +2115,13 @@ html[data-sky-ease] body::before {
   line-height: 1.55;
   color: var(--glass-ink-2);
 }
+.chat-error-reason {
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--glass-ink-2);
+  word-break: break-word;
+}
 .chat-error-toggle {
   margin-top: 6px;
   font-size: 12px;
