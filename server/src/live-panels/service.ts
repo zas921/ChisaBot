@@ -121,6 +121,7 @@ export const LIVE_PANEL_GUIDANCE = [
   "面板：用户要「面板 / 看板 / 卡片 / 小组件」或想长期盯着某个会变的东西（价格、天气、汇率、排行、倒计时）时，做成右栏面板，不要只在对话里画：",
   "1) 先 panel_create（标题 + 刷新说明 + 刷新间隔），卡片会立刻出现在右栏；对话里只说一句「好的，正在做…面板」。用户说了每天几点刷新（「每天早上 8 点」）就填 refreshAt（\"08:00\"），会准点刷新，不要说做不到。",
   "2) 再用 web_search / web_fetch 取真实数据（优先公开 JSON 接口，例如 api.coingecko.com、api.open-meteo.com），绝不编造数字。",
+  "   模型 / token 用量面板（「每天用了多少 token」）用 model_usage 工具取数：这是 ChisaBot 自己记的账，不要去找 Magpie、数据库或密钥；来源写「ChisaBot 用量记录」，不带网址；刷新说明里写明「用 model_usage 取最近 N 天」。",
   "3) 用 panel_update 交上 json-render 规范 + 来源（来源只写真实读过的网址；本机命令取的数据来源不带 url，不要编网址；数字、列表、表格都直接写成字面值：List 的 items / Table 的 rows 直接列出每一行，不要用 repeat 或 $state 绑定）；最后对话里一句话说做好了、多久刷新一次，并提一个有用的下一步。",
   PANEL_DESIGN_GUIDE,
   "要改已有面板（换内容、换城市、换币种、改刷新频率）时先 panel_list 找到它，取新数据后 panel_update（带新的 instruction / title），不要新建。",

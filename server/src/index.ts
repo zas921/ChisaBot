@@ -253,6 +253,8 @@ import type { Responsibility } from "./responsibilities/types";
 import { createTurnRunner } from "./turns/run-turn";
 import { createWorkflowEngine, type WorkflowEngine } from "./workflows/engine";
 import { createLivePanelService } from "./live-panels/service";
+import { createModelUsageLedger } from "./model-usage/ledger";
+import { setModelUsageSink } from "./model-usage/sink";
 import { createLivePanelStore } from "./live-panels/store";
 import { webTools } from "./web/tools";
 import {
@@ -1276,6 +1278,10 @@ const proactiveReadOnlyRefs = createReadOnlyClassifier(pluginStore);
 /** 长期记忆（DESIGN.md §50）：每轮开头的记忆用法 + 笔记；上游 personal_memories 不再给机器人。 */
 const memoryNotes = createMemoryNotes(database);
 await memoryNotes.ensure();
+/** 模型用量账本（model-usage/ledger.ts）：每次机器人回合里的模型调用记一行；机器人用 model_usage 查。 */
+const modelUsage = createModelUsageLedger(database);
+await modelUsage.ensure();
+setModelUsageSink((entry) => modelUsage.record(entry));
 /** 机器人头像（DESIGN.md §81）：上传的图片 / 表情 / 首字；没有 = 花纹头像。 */
 const botAvatars = createBotAvatars(database, agentProfileStore);
 await botAvatars.ensure();
@@ -1421,6 +1427,8 @@ const loadToolsForActor =
     ...(config.generativeUi && !imConnection ? renderUiTools() : []),
     // 内置联网（web_search / web_fetch）：先搜、再读，浏览器留给需要点击 / 登录 / 给人看的时候。
     ...webTools(),
+    // 模型用量（ChisaBot 自己记的账，只读）：后台刷新「每日 token 用量」面板的回合也要用，所以不排除 lp_。
+    ...modelUsage.tools(actorId),
     // 实时面板（server/src/live-panels）：右栏会自己刷新的卡片，规范与 render_ui 同一套组件。
     // 后台刷新面板的无头回合（initiator 是 lp_… 的 routine）只拿 panel_update / panel_fail / panel_list，且只能动那一张：
     // 以前它也拿到 panel_refresh，刷新里又触发一次刷新，回合叠回合（2026-10-13 实测）。

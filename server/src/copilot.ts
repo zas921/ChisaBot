@@ -537,7 +537,7 @@ export function builtInAgentConfiguration(
       ? planModel
       : model.baseUrl || model.useApiKey === false
         ? // 每一步的用量记到当前运行的计量器（输入框的「上下文」读数，context-usage.ts）。
-          steerLanguageModel(meterLanguageModel(fallbackConnectionModel(model, apiKey)))
+          steerLanguageModel(meterLanguageModel(fallbackConnectionModel(model, apiKey), { botId: agent.id }))
         : `${model.provider}/${model.defaultModel}`,
     /*
      * The package's role, then the person's own standing instructions, then what this Bot actually

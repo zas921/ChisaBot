@@ -2,6 +2,8 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { EventType, type BaseEvent } from "@ag-ui/client";
 import { Observable } from "rxjs";
 import { type FallbackUse, withFallbackListener } from "./agents/model-fallback";
+import { currentConfirmTurn } from "./confirmations/context";
+import { reportModelUsage } from "./model-usage/sink";
 
 /**
  * 输入框里的「上下文」读数（DESIGN.md §25）：这一轮对话现在有多大。
@@ -58,11 +60,17 @@ export function readStepUsage(usage: unknown): Omit<ContextUsage, "model"> | und
   };
 }
 
-function record(usage: unknown, model: string | undefined) {
-  const meter = meters.getStore();
-  if (!meter) return;
+/** 谁在用这个模型：记进用量账本（model-usage/ledger.ts）。对话从当前回合读。 */
+export type UsageAttribution = { botId?: string };
+
+function record(usage: unknown, model: string | undefined, attribution: UsageAttribution | undefined) {
   const step = readStepUsage(usage);
-  if (step) meter.last = { ...step, ...(model ? { model } : {}) };
+  if (!step) return;
+  // 每一次调用都记账（2026-10-21，「每日 token 用量」面板）：和下面的上下文读数无关，没有计量器也记。
+  const threadId = currentConfirmTurn()?.threadId;
+  reportModelUsage({ ...step, ...(model ? { model } : {}), ...(attribution?.botId ? { botId: attribution.botId } : {}), ...(threadId ? { threadId } : {}) });
+  const meter = meters.getStore();
+  if (meter) meter.last = { ...step, ...(model ? { model } : {}) };
 }
 
 type StreamResult = { stream: ReadableStream<unknown> } & Record<string, unknown>;
@@ -76,7 +84,7 @@ type MeterableModel = {
  * 同一个模型对象，只是每一步结束时记一下用量。不改请求、不改流里的任何一块。
  * 不是对象（网关字符串 id）就原样返回。
  */
-export function meterLanguageModel<T>(model: T): T {
+export function meterLanguageModel<T>(model: T, attribution?: UsageAttribution): T {
   if (!model || typeof model !== "object") return model;
   const target = model as unknown as MeterableModel;
   return new Proxy(model as unknown as object, {
@@ -84,7 +92,7 @@ export function meterLanguageModel<T>(model: T): T {
       if (property === "doStream" && typeof target.doStream === "function") {
         return async (options: unknown) => {
           const result = await target.doStream!.call(object, options);
-          if (!meters.getStore() || !(result?.stream instanceof ReadableStream)) return result;
+          if (!(result?.stream instanceof ReadableStream)) return result;
           let responseModel: string | undefined;
           const stream = result.stream.pipeThrough(
             new TransformStream<unknown, unknown>({
@@ -92,7 +100,7 @@ export function meterLanguageModel<T>(model: T): T {
                 const chunk = part as { type?: string; usage?: unknown; modelId?: unknown };
                 if (chunk?.type === "response-metadata" && typeof chunk.modelId === "string")
                   responseModel = chunk.modelId;
-                if (chunk?.type === "finish") record(chunk.usage, responseModel ?? target.modelId);
+                if (chunk?.type === "finish") record(chunk.usage, responseModel ?? target.modelId, attribution);
                 controller.enqueue(part);
               },
             }),
@@ -104,7 +112,7 @@ export function meterLanguageModel<T>(model: T): T {
         return async (options: unknown) => {
           const result = await target.doGenerate!.call(object, options);
           const response = result?.response as { modelId?: unknown } | undefined;
-          record(result?.usage, typeof response?.modelId === "string" ? response.modelId : target.modelId);
+          record(result?.usage, typeof response?.modelId === "string" ? response.modelId : target.modelId, attribution);
           return result;
         };
       }

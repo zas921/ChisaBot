@@ -84,3 +84,35 @@ describe("context usage", () => {
     expect(estimateTokens([{ role: "user", content: [{ type: "image", data: "x".repeat(10_000) }] }])).toBe(4);
   });
 });
+
+/*
+ * 2026-10-21 模型用量账本：每次模型调用都上报（model-usage/sink.ts），带上是哪个机器人；
+ * 不在计量的运行里也报，上下文读数照旧。
+ */
+describe("model usage ledger feed", () => {
+  test("every call is reported with the bot, metered run or not", async () => {
+    const { setModelUsageSink } = await import("../src/model-usage/sink");
+    const seen: unknown[] = [];
+    setModelUsageSink((entry) => seen.push(entry));
+    try {
+      const model = meterLanguageModel(fakeModel([{ input: 120, output: 30, cached: 100 }]), { botId: "bot_1" });
+      await drain((await model.doStream()).stream);
+      expect(seen).toEqual([{ inputTokens: 120, outputTokens: 30, cachedInputTokens: 100, model: "fake/model", botId: "bot_1" }]);
+    } finally {
+      setModelUsageSink(undefined);
+    }
+  });
+
+  test("a sink that throws never breaks the answer", async () => {
+    const { setModelUsageSink } = await import("../src/model-usage/sink");
+    setModelUsageSink(() => {
+      throw new Error("db down");
+    });
+    try {
+      const model = meterLanguageModel(fakeModel([{ input: 5, output: 1 }]));
+      await drain((await model.doStream()).stream);
+    } finally {
+      setModelUsageSink(undefined);
+    }
+  });
+});
