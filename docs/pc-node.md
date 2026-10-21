@@ -139,6 +139,7 @@ PC → 服务器：`hello{clientVersion,platform,osVersion,hostname,arch}`、`re
   同一条路：`session.resolveProxy(url)` 问出 Chromium 的代理（PAC / 系统代理 / 命令行），`src/agent/proxy.js`
   按列表依次尝试（HTTP / HTTPS 代理用 CONNECT，SOCKS5 无认证 CONNECT，`DIRECT` 直连），全部失败才报错。
   只有 `DIRECT` 时与以前完全一样。
+- 代理隧道的 TLS 连接同时保留目标 `host` 与适用的域名 SNI：IP 地址没有 DNS SNI，也必须按目标 IP 的 SAN 校验，不能退回 `localhost`。证书链不受信任或目标身份不匹配仍拒绝连接（CB-088）。
 - 重连：指数退避 1–30 秒；70 秒收不到服务器任何消息（服务器每 25 秒 ping）判定连接已死并重连；休眠唤醒、
   解锁屏幕、聊天网页从服务器加载成功时 `reconnectNow()` 跳过退避立刻重连。
 - 离线时托盘 / 网页设备页显示真实原因（例如「服务器返回 403」「代理拒绝了连接」）和线路（`networkRoute`）；

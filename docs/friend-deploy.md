@@ -18,7 +18,7 @@ sh deploy/friend-up.sh
 1. 若没有 `deploy/.env`，从 `deploy/friend.env.example` 拷一份（权限 600）  
 2. 为空的 `KEY_ENCRYPTION_KEY`（以及已填域名 / 多账号时的 `CHISABOT_GATEWAY_SECRET`）生成随机值，**不打印密钥**  
 3. 硬检查：应用 compose 必须绑 `127.0.0.1:3001`；拒绝把单用户 `TRUSTED_ORIGINS` 配成 https 公网  
-4. 需要时构建前端，再调用 `deploy/start.sh` 起容器  
+4. 缺少前端产物时，依次安装依赖、在仓库根运行 `TENANT_PACKAGE_DIR=../examples/zh-CN bun scripts/generate-app-config.ts` 生成中文租户配置、构建前端，再调用 `deploy/start.sh` 起容器。配置生成失败即停止，不继续构建或启动；无需预先创建根目录 `.env`。已有 `app/dist/index.html` 时保留跳过构建行为（CB-088）。
 
 起来后本机只在 **http://127.0.0.1:3001**。公网必须再走 HTTPS 登录网关，**禁止**把 `:3001` 直接映射到 `0.0.0.0`。
 

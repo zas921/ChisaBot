@@ -159,7 +159,8 @@ function createProxyAgent(proxies, { secure = true, timeoutMs = 15_000, onRoute 
           else socket = await openTunnel(proxy, target, timeoutMs);
           if (secure) {
             const servername = options.servername || (net.isIP(target.host) ? undefined : target.host);
-            socket = tls.connect({ socket, servername, ALPNProtocols: options.ALPNProtocols || ["http/1.1"], ...(options.rejectUnauthorized === false ? { rejectUnauthorized: false } : {}) });
+            // IP targets have no SNI; host still identifies the peer for certificate verification.
+            socket = tls.connect({ socket, host: target.host, servername, ALPNProtocols: options.ALPNProtocols || ["http/1.1"], ...(options.rejectUnauthorized === false ? { rejectUnauthorized: false } : {}) });
             await new Promise((resolve, reject) => {
               socket.once("secureConnect", resolve);
               socket.once("error", reject);

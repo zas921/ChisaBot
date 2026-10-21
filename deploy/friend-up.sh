@@ -82,6 +82,9 @@ fi
 if ! test -f ../app/dist/index.html; then
   say "安装依赖…"
   (cd .. && bun install --frozen-lockfile --linker hoisted) || die "依赖安装失败"
+  say "生成应用配置…"
+  # 直接调用 vite 不会运行 app 的 prebuild；新克隆没有被 .gitignore 排除的生成配置。
+  (cd .. && TENANT_PACKAGE_DIR=../examples/zh-CN bun scripts/generate-app-config.ts) || die "应用配置生成失败"
   say "构建前端…"
   # hoisted 安装把 vite 放在仓库根 node_modules，app/node_modules 里没有；app 的 build 脚本写死
   # app/node_modules/vite，会 "Module not found"。和 updater/update.sh 一样：先找 app 下，找不到用根目录的。

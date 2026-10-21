@@ -11,6 +11,7 @@ ChisaBot 的测试分四层：**单元 / 集成测试 → 预览容器里的端�
 | `bun test` / 各包 `tests/` | ChisaBot 功能的服务器测试在 `server/tests/<功能>*.test.ts`（记忆、保险箱、定时任务、确认、设备、云端 CC…） |
 | `app/tests/*.test.ts(x)` | 网页 DOM 测试；**需要 `NODE_ENV=test`**（镜像里是 production） |
 | `pc/` 下 `npm test` | PC 客户端（含外壳指纹一致性：改了图标 / 安装器要先 `npm run fingerprint`） |
+| `node --test pc/test/proxy-tls.check.js deploy/friend-up.check.cjs` | CB-088：本地代理真实 TLS 校验、好友包隔离构建顺序与失败停止；不连接生产或启动 Docker。Windows 可用 `CHISABOT_TEST_SH` 指定 Git Bash 可执行文件 |
 | `android/` Gradle 测试 | 原生 Android（CI 里跑） |
 | CI「ChisaBot checks」（`.github/workflows/chisabot.yml`） | 每个 PR 必须绿；`bun install --linker hoisted`（和镜像一样） |
 | `pc-shots.yml` | 改到 PC 窗口 UI 的 PR 在 Windows runner 上截图（Windows Server 2025、1024×768、无 GPU：**没有 DWM 圆角**，DPI 用 `--force-device-scale-factor` 模拟） |

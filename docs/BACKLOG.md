@@ -96,6 +96,19 @@
 | [CB-085](#cb-085) | 搜索旁新建机器人；弹出面板与常驻面板一致 | 成熟度 Maturity | `type: bug` · `area: web` · `P1` · `status: done` |
 | [CB-086](#cb-086) | 连续补话不重复执行；停止按钮终止当次计算机命令 | 成熟度 Maturity | `type: bug` · `area: chat` · `area: computer` · `P1` · `status: done` |
 | [CB-087](#cb-087) | 聊天可靠性全面修复：滚动、队列恢复、请求与编码 | 成熟度 Maturity | `type: bug` · `area: chat` · `area: computer` · `P1` · `status: done` |
+| [CB-088](#cb-088) | 代理 IP 证书与好友包首次构建修复 | 成熟度 Maturity | `type: bug` · `area: pc` · `area: infra` · `P1` · `status: in-progress` |
+
+## CB-088
+
+**代理 IP 证书与好友包首次构建修复**
+
+标签：`type: bug` `area: pc` `area: infra` `P1` `status: in-progress`
+分支：`fix/proxy-tls-friend-bootstrap`。修复上传至个人 Fork 的独立分支；尚未创建 PR 或部署。
+
+#### 验收标准
+- [x] 经 HTTP CONNECT / SOCKS5 代理访问受信任 IP SAN 证书成功；域名校验正常，身份不匹配与不受信任证书仍被拒绝
+- [x] 隔离 shell 回归验证好友包从无生成配置的新克隆构建时，安装依赖 → 生成中文租户配置 → 构建前端 → 启动；生成失败必须停止，有产物时保留跳过构建行为
+- [x] 23 项相关测试通过，更新说明与原版对照完成；完整构建和类型检查尚未通过，边界见[验证记录](pipeline-runs/20261021-proxy-tls-friend-bootstrap.md)
 
 ## CB-087
 
