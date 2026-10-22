@@ -377,6 +377,29 @@ export function Composer({
   const [isSubmitting, setIsSubmitting] = useState(false);
   const submitInFlight = useRef(false);
   const promptAreaRef = useRef<PromptAreaHandle>(null);
+  /*
+   * IME state, kept outside React.
+   *
+   * `prompt-area` renders the controlled `value` back into the contenteditable on every change. With
+   * a Chinese/Japanese input method the first composing character arrives through `onChange` while
+   * the composition is still open; writing it back into the DOM at that moment cancels the
+   * composition, which is why the first character looked like it never reached the input. Hold the
+   * change until `compositionend` instead, and let the editor's own DOM keep the composing text.
+   */
+  const composingRef = useRef(false);
+  const pendingChangeRef = useRef<Segment[] | null>(null);
+  /**
+   * WHETHER THE PLACEHOLDER HAS TO STEP ASIDE, as React sees it. The ref above is what decides to
+   * hold the change; this is only what the placeholder is drawn from.
+   *
+   * WHY IT IS NEEDED AT ALL: `prompt-area` draws its placeholder when the controlled `value` is
+   * empty — and during a composition the value deliberately IS empty, because the composing text is
+   * not committed until `compositionend`. The placeholder therefore sat on top of the pinyin the
+   * input method was still drawing. Hiding it takes a render, and a render is safe here only
+   * because nothing it changes touches the editor: `value` keeps its identity, so prompt-area's
+   * write-back effect does not run, and the only thing that changes is the placeholder string.
+   */
+  const [composing, setComposing] = useState(false);
   /**
    * The composer's outer element, and the reason the hook's own `containerRef` is left on the
    * floor.
@@ -1160,6 +1183,11 @@ export function Composer({
 
   const handleChange = useCallback(
     (next: Segment[]) => {
+      // See `composingRef`: the editor keeps the composing text in its own DOM until the IME closes.
+      if (composingRef.current) {
+        pendingChangeRef.current = next;
+        return;
+      }
       const { segments, actions } = applyCommandChips(
         enforceSingleAgent(next),
         commands,
@@ -1173,6 +1201,66 @@ export function Composer({
     },
     [commands],
   );
+
+  /**
+   * Apply whatever the IME produced while the composition was open, once it closes.
+   *
+   * Command chips are resolved here rather than in `handleChange` so a slash command that was
+   * typed as part of the composition takes effect on the committed text.
+   */
+  const flushPendingChange = useCallback(() => {
+    const next = pendingChangeRef.current;
+    pendingChangeRef.current = null;
+    if (!next) return;
+    const { segments, actions } = applyCommandChips(
+      enforceSingleAgent(next),
+      commands,
+    );
+    setValue(segments);
+    for (const action of actions) {
+      action();
+    }
+  }, [commands]);
+
+  /**
+   * COMPOSITION IS TRACKED ON THE DOM, NOT THROUGH REACT STATE, for the reason `composingRef`
+   * records: a render mid-composition is exactly what cancelled it. `setComposing` below does not
+   * contradict that — see its comment: it changes the placeholder only, never `value`.
+   *
+   * THE BLUR RESET IS NOT BELT AND BRACES. `compositionend` is the only event that clears the flag,
+   * and an interrupted composition does not always deliver one — switching windows, clicking away,
+   * an IME that cancels on focus loss. Without a second way out, the flag stayed true for the rest
+   * of the session and every later keystroke was held instead of committed: the box would show the
+   * text and send nothing of it, which is worse than the bug this file fixes. A blurred editor
+   * cannot still be composing, and whatever it holds at that moment is committed text.
+   */
+  useEffect(() => {
+    const element = containerRef.current;
+    if (!element) return;
+    const start = () => {
+      composingRef.current = true;
+      setComposing(true);
+    };
+    const end = () => {
+      composingRef.current = false;
+      setComposing(false);
+      flushPendingChange();
+    };
+    const interrupted = () => {
+      if (!composingRef.current) return;
+      composingRef.current = false;
+      setComposing(false);
+      flushPendingChange();
+    };
+    element.addEventListener("compositionstart", start, true);
+    element.addEventListener("compositionend", end, true);
+    element.addEventListener("blur", interrupted, true);
+    return () => {
+      element.removeEventListener("compositionstart", start, true);
+      element.removeEventListener("compositionend", end, true);
+      element.removeEventListener("blur", interrupted, true);
+    };
+  }, [flushPendingChange]);
 
   /**
    * The single submit path for Enter, the send button, and the form.
@@ -1590,7 +1678,7 @@ export function Composer({
               onChange={handleChange}
               onImagePaste={canAttach ? stagePastedImage : undefined}
               onSubmit={submitDraft}
-              placeholder={"输入消息…"}
+              placeholder={composing ? "" : "输入消息…"}
               ref={promptAreaRef}
               triggers={triggers}
               value={value}
@@ -1678,7 +1766,9 @@ export function Composer({
               onChange={handleChange}
               onImagePaste={canAttach ? stagePastedImage : undefined}
               onSubmit={submitDraft}
-              placeholder={"有什么想让 BOT 帮你做的？用 @ 指定 BOT"}
+              placeholder={
+                composing ? "" : "有什么想让 BOT 帮你做的？用 @ 指定 BOT"
+              }
               ref={promptAreaRef}
               triggers={triggers}
               value={value}

@@ -92,6 +92,7 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         updater.onResume()
+        if (vm.screen is Screen.Chat) vm.loadModels()
     }
 
     override fun onNewIntent(intent: Intent) {

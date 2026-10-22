@@ -93,10 +93,13 @@ fun SettingsScreen(vm: AppViewModel, onCheckUpdate: () -> Unit, onLogout: () -> 
                 Text("管理设备（权限、解绑）请到 更多设置 → 设备。", color = sky.ink3, fontSize = 12.sp, modifier = Modifier.padding(top = 6.dp))
             }
             Section("更多") {
+                LinkLine("云端工作区与项目修复（网页）") { vm.push(Screen.Web("/settings/cloud-workspace", "云端工作区与项目修复")) }
+                LinkLine("GitHub 账号连接（网页）") { vm.push(Screen.Web("/settings/connected-accounts", "账号连接")) }
                 LinkLine("更多设置（网页）") { vm.push(Screen.Web("/settings", "设置")) }
                 LinkLine("审批偏好（网页）") { vm.push(Screen.Web("/settings/approvals", "审批偏好")) }
                 LinkLine("检查更新") { onCheckUpdate() }
                 SettingLine("版本", "ChisaBot ${BuildConfig.VERSION_NAME}（${BuildConfig.VERSION_CODE}）", null)
+                SettingLine("包名", BuildConfig.APPLICATION_ID, null)
             }
             Spacer(Modifier.navigationBarsPadding())
         }

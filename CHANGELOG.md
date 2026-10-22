@@ -1,7 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.1.56 — 2026-10-21（个人定制版）
 
+- 选择性同步上游修复（截至 `ff44a8c1`）：聊天输入法合成期间不回写编辑器、失焦后复位并隐藏重叠占位文字，`prompt-area` 升至 0.6.8；Claude 退出登录核对节点真实状态，CLI 未清理时删除节点凭据后复查，阻止旧的自动检查恢复已退出状态并显示退出失败原因；扩大触屏 CC 工作区操作按钮，改善审计表列宽。保留本地 GitHub 授权、云端修复 / 本地验收和模型用量功能；本批不切换 Hermes、不改客户端版本号。
 - 模型用量账本：ChisaBot 自己记录机器人回合里每一次模型调用的 token（表 `chisabot_model_usage`，按对话当时的主人、机器人、模型记输入 / 输出 / 缓存命中，保留 400 天），不依赖 Magpie；机器人新增只读工具 `model_usage`（按天、按模型汇总，默认北京时间、最近 7 天），「每日 token 用量」面板和「今天用了多少 token」都用它取数，后台刷新面板的回合也能用。起标题、路由、图片 / 语音等辅助调用不计。
 - 机器人电脑可选完整 sudo：`deploy/.env` 设 `CHISABOT_COMPUTER_SUDO=full` 并重建容器后，`pwuser` 免密 sudo 任意命令（容器内 root，碰不到宿主机），默认 `off` 仍只能 sudo 包管理器；启动脚本 `/etc/cont-init.d/50-computer-sudo` 每次开机落定开 / 关，`computer_run_command` 的说明随之告诉模型。风险见 docs/computer-sudo.md。内置浏览器直播画面流量控制：Chrome 的帧不再立刻 ack，帧率上限 20 fps、画质 70 → 60；查看端每收到一帧回 `frame-ack`，在途满 2 帧就压住 Chrome 等查看端追上（旧查看端不回确认时不启用，确认丢失 2 秒后自动放行）；API 转发改用 Bun 的 `getBufferedAmount()`（以前读不存在的 `bufferedAmount`，丢帧保护从未生效，帧在慢链路上无限排队），拥塞时只压住画面帧并只留最新一帧、drain 时补发，标签 / 导航 / 错误 / 心跳从不丢。做面板的回合工具步数上限 12 → 20：面板建了还没交上合格规范时，步数提醒改为「用已有数据马上 panel_update」，不再让模型「停止调用工具」导致卡片一直停在「正在搭建」；后台刷新面板的回合同样处理。
 - 设置 → 设备 → 本地 agent 标签页修复：分段选择的键盘钩子写在加载提前返回之后，数据到达时 React 抛「Rendered more hooks」整页崩溃（59b093cb 引入）；补回归。模型调用出错时，服务端在错误里补上模型、HTTP 状态码和供应商原话（疑似密钥打码），对话错误卡直接显示「原因：…」，机器人聊天的停止提示也带上原因。`deploy/compose.yaml` 的 Magpie Web key 挂载改由 `.env` 的 `MAGPIE_WEB_KEY_HOST_FILE` 控制（默认 /dev/null = 未配置），不再需要手改 compose 让仓库变脏；已手改过的部署按 docs/magpie.md 迁移。

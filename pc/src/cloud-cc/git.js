@@ -26,10 +26,12 @@ function run(args, options = {}) {
 }
 
 function gitEnv(extra = {}) {
-  const env = { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_CONFIG_NOSYSTEM: "1", LANG: "C.UTF-8", ...extra };
+  const env = { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_COUNT: "0", LANG: "C.UTF-8", ...extra };
   delete env.GIT_DIR;
   delete env.GIT_WORK_TREE;
   delete env.GIT_INDEX_FILE;
+  delete env.GIT_CONFIG_PARAMETERS;
+  delete env.GIT_COMMON_DIR;
   return env;
 }
 
@@ -42,7 +44,10 @@ function scrub(text, token) {
 /** 临时 askpass：用户名固定 x-access-token，密码从环境变量 CHISABOT_GIT_TOKEN 读。脚本本身不含令牌。 */
 function withAskpass(token, fn) {
   if (!token) return fn(gitEnv());
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "chisabot-git-"));
+  // Cloud-node /tmp is noexec. Use its private home volume for the executable
+  // helper (no token in the file), then remove it in finally. Windows keeps TEMP.
+  const base = process.platform === "win32" ? os.tmpdir() : os.homedir();
+  const dir = fs.mkdtempSync(path.join(base, "chisabot-git-"));
   fs.chmodSync(dir, 0o700);
   const script = path.join(dir, "askpass.sh");
   fs.writeFileSync(script, '#!/bin/sh\ncase "$1" in\n  Username*) printf "%s\\n" x-access-token ;;\n  *) printf "%s\\n" "$CHISABOT_GIT_TOKEN" ;;\nesac\n', { mode: 0o700 });
@@ -329,7 +334,24 @@ function createGitWorkspaces({ root, log = () => {} }) {
     const remoteBase = (await run(["rev-parse", "--verify", "-q", `refs/remotes/origin/${base}`], { cwd: tree })).code === 0 ? `origin/${base}` : base;
     const commits = await ahead(tree, remoteBase);
     if (!commits.length) throw new Error(`会话分支相对 ${base} 没有新的提交，没有可推送的`);
-    const r = await withAskpass(args.token, (env) => run([...NO_HELPER, "push", "--porcelain", "origin", `refs/heads/${branch}:refs/heads/${branch}`], { cwd: tree, env, timeout: 5 * 60_000 }));
+    // The model can change its worktree's .git/config. Never hand a token to a Git process
+    // using that config (pushurl, insteadOf, helpers and pre-push hooks are executable).
+    let r, pushedHead;
+    if (args.token) {
+      const url = String(args.url || "");
+      if (!/^https?:\/\/[^\s/@]+\/[A-Za-z0-9._/-]+\.git$/.test(url)) throw new Error("服务器没有提供可信 Git 仓库地址，请更新服务器和节点。");
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "chisabot-publish-"));
+      try {
+        const init = await run(["clone", "--bare", "--no-hardlinks", "--single-branch", "--branch", branch, "--", tree, dir], { timeout: 120_000 });
+        if (init.code !== 0) throw new Error("无法准备独立推送仓库。");
+        pushedHead = await head(dir);
+        r = await withAskpass(args.token, (env) => run([...NO_HELPER, "-c", "core.hooksPath=", "-c", "http.followRedirects=false", "push", "--porcelain", url, `refs/heads/${branch}:refs/heads/${branch}`], { cwd: dir, env, timeout: 5 * 60_000 }));
+      } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    } else {
+      // Credential-free local test repositories.
+      pushedHead = await head(tree);
+      r = await run([...NO_HELPER, "push", "--porcelain", "origin", `refs/heads/${branch}:refs/heads/${branch}`], { cwd: tree, timeout: 5 * 60_000 });
+    }
     if (r.code !== 0) {
       const tail = scrub(`${r.stderr}\n${r.stdout}`, args.token);
       if (/non-fast-forward|fetch first|rejected/i.test(tail)) throw new Error(`GitHub 上的 ${branch} 已经有别的提交，推不上去。让 Claude 先 rebase，或者新开一个会话。`);
@@ -337,7 +359,7 @@ function createGitWorkspaces({ root, log = () => {} }) {
       throw new Error(`推送失败：${tail.split("\n").filter(Boolean).slice(-2).join(" ")}`);
     }
     // 远端跟踪分支更新一下，下次「相对 main」才准
-    return { branch, base, head: await head(tree), commits, committed };
+    return { branch, base, head: pushedHead, commits, committed };
   }
 
   /** 「相对 main」：会话目录（含没提交、没跟踪的文件）和 main 的分叉点比。用临时 index，不动会话的 index。 */

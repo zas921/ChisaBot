@@ -1,5 +1,5 @@
 {
   "serverUrl": "",
-  "updateFeed": "",
-  "githubRepo": ""
+  "updateFeed": "https://github.com/zas921/ChisaBot/releases/latest/download/",
+  "githubRepo": "zas921/ChisaBot"
 }

@@ -15,6 +15,8 @@ import type { Database } from "../db/client";
 import { type GrantedTool, REFUSAL_MARKER } from "../plugins/tools";
 import { markUntrusted } from "../untrusted-content";
 import type { Vault } from "../vault/service";
+import { NO_GIT_AUTHORIZATION, permitsGit, type GitAuthorization } from "../../../shared/git-authorization";
+import { gitAuthorizationSchema } from "./git-authorization";
 
 /**
  * GitHub 账号连接（DESIGN.md §53，docs/github.md）。
@@ -146,6 +148,11 @@ export function createGithub(database: Database, options: { vault: Vault; fetch?
         decided_at timestamptz
       );
       CREATE INDEX IF NOT EXISTS chisabot_github_actions_owner ON chisabot_github_actions (owner_user_id, created_at DESC);
+      CREATE TABLE IF NOT EXISTS chisabot_github_git_access (
+        owner_user_id text PRIMARY KEY,
+        policy jsonb NOT NULL,
+        updated_at timestamptz NOT NULL DEFAULT now()
+      );
     `);
   }
 
@@ -264,6 +271,7 @@ export function createGithub(database: Database, options: { vault: Vault; fetch?
   async function disconnect(owner: string) {
     await options.vault.internal.remove(owner, GITHUB_SECRET);
     recent.delete(owner);
+    await sql.unsafe("DELETE FROM chisabot_github_git_access WHERE owner_user_id = $1", [owner]);
     await sql.unsafe("DELETE FROM chisabot_github_connections WHERE owner_user_id = $1", [owner]);
     await sql.unsafe("UPDATE chisabot_github_actions SET status = 'expired', decided_at = now() WHERE owner_user_id = $1 AND status = 'pending'", [owner]);
   }
@@ -586,6 +594,8 @@ export function createGithub(database: Database, options: { vault: Vault; fetch?
       return c.json({ connection: await connect(c.var.actor.id, body.token) });
     });
     app.post("/check", async (c) => c.json({ connection: await check(c.var.actor.id) }));
+    app.get("/git-authorization", async (c) => c.json({ authorization: await gitAuthorization(c.var.actor.id) }));
+    app.put("/git-authorization", async (c) => c.json({ authorization: await configureGitAuthorization(c.var.actor.id, await c.req.json()) }));
     app.delete("/", async (c) => {
       await disconnect(c.var.actor.id);
       return c.body(null, 204);
@@ -618,7 +628,27 @@ export function createGithub(database: Database, options: { vault: Vault; fetch?
    * 克隆 / 推送那一次要下发给云端节点的令牌（节点只放在那一个 git 进程的环境变量里，用完就没了）。
    * 只给云端 Claude Code 服务用；不进日志、不进数据库。
    */
-  async function gitCredential(owner: string) {
+  async function gitAuthorization(owner: string): Promise<GitAuthorization> {
+    const [row] = await sql.unsafe<{ policy: unknown }[]>("SELECT policy FROM chisabot_github_git_access WHERE owner_user_id = $1", [owner]);
+    const parsed = gitAuthorizationSchema.safeParse(json(row?.policy, NO_GIT_AUTHORIZATION));
+    return parsed.success ? parsed.data : NO_GIT_AUTHORIZATION;
+  }
+
+  async function configureGitAuthorization(owner: string, input: unknown) {
+    const policy = gitAuthorizationSchema.parse(input);
+    // Verify account and repository visibility before storing a new grant. Never return a token.
+    if (policy.access !== "disabled") {
+      await token(owner);
+      for (const repo of policy.repositories) await repoInfo(owner, repo);
+    }
+    await sql.unsafe(`INSERT INTO chisabot_github_git_access (owner_user_id, policy) VALUES ($1, $2::jsonb)
+      ON CONFLICT (owner_user_id) DO UPDATE SET policy = EXCLUDED.policy, updated_at = now()`, [owner, JSON.stringify(policy)]);
+    return policy;
+  }
+
+  async function gitCredential(owner: string, repo: string, operation: "read" | "write" = "read") {
+    if (!permitsGit(await gitAuthorization(owner), repo, operation))
+      throw new GithubError("此仓库没有云端 Git 授权。请到 设置 → 账号连接 → GitHub 配置仓库和读写权限。");
     const row = await connectionRow(owner);
     if (!row) throw new GithubError("还没有连接 GitHub。去 设置 → 账号连接 连接 GitHub。");
     if (row.status === "invalid") throw new GithubError("GitHub 令牌已失效，去 设置 → 账号连接 更换。");
@@ -661,6 +691,6 @@ export function createGithub(database: Database, options: { vault: Vault; fetch?
     throw new GithubError(explain(response.status, response.data, `仓库 ${repo}`));
   }
 
-  return { ensure, status, connect, check, disconnect, tools, routes, guidance, decide, actionById, gitCredential, repoInfo, listRepos, openPullRequest, apiBase: base };
+  return { ensure, status, connect, check, disconnect, tools, routes, guidance, decide, actionById, gitCredential, gitAuthorization, configureGitAuthorization, repoInfo, listRepos, openPullRequest, apiBase: base };
 }
 export type Github = ReturnType<typeof createGithub>;

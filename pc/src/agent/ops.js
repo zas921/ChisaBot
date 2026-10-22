@@ -11,6 +11,7 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 const { createCodeOps } = require("./code-ops");
 const { classifyOpenTarget } = require("./open-target");
+const { createRepairValidation } = require("./repair-validation");
 
 const OUTPUT_CAP = 64 * 1024;
 const LIST_CAP = 500;
@@ -251,6 +252,7 @@ function createOps(options = {}) {
   const P = pathApi(platform);
   let memoryClipboard = "";
   const code = createCodeOps({ platform, resolveInRoots });
+  const repair = createRepairValidation({ resolveInRoots: (p, roots) => resolveInRoots(p, roots, platform) });
 
   /** 完全访问模式（ctx.fullAccess）：任意绝对路径；相对路径相对于第一个允许的文件夹或主目录。 */
   async function resolvePath(requested, ctx) {
@@ -494,6 +496,7 @@ function createOps(options = {}) {
   }
 
   const table = {
+    ...repair.table,
     system_info: systemInfo,
     shell,
     list_files: listFiles,
@@ -511,7 +514,7 @@ function createOps(options = {}) {
     platform,
     /** 这个客户端支持的全部操作（hello.features），服务器据此判断旧客户端缺哪些。 */
     features: Object.keys(table),
-    stopAll: (reason) => code.stopAll(reason),
+    stopAll: (reason) => { code.stopAll(reason); repair.stopAll(); },
     async run(operation, args, ctx = {}) {
       const fn = table[operation];
       if (!fn) throw new OpError(`不支持的操作：${operation}`);

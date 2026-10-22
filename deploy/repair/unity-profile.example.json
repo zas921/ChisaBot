@@ -1,0 +1,8 @@
+{
+  "repository": "your-account/your-project",
+  "workspaceRoot": "D:/ChisaBotAcceptance",
+  "adapter": "unity",
+  "unityCli": "D:/Tools/UnityCLI/unity.exe",
+  "editorPath": "D:/Unity/2022.3.62f2/Editor/Unity.exe",
+  "timeoutMs": 1800000
+}

@@ -1,0 +1,85 @@
+diff --git a/.github/workflows/chisabot.yml b/.github/workflows/chisabot.yml
+index ade52e1d..261da199 100644
+--- a/.github/workflows/chisabot.yml
++++ b/.github/workflows/chisabot.yml
+@@ -37,6 +37,8 @@ jobs:
+       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+         with:
+           bun-version: 1.3.14
++      - name: Proxy TLS and fresh friend deployment regressions
++        run: node --test pc/test/proxy-tls.check.js deploy/friend-up.check.cjs
+       # Hoisted, like the image (Dockerfile): shared/ is not a workspace and imports zod / @json-render
+       # from the app and server trees; under the isolated linker those don't resolve from shared/.
+       - run: bun install --frozen-lockfile --linker hoisted
+diff --git a/.github/workflows/release.yml b/.github/workflows/release.yml
+index 70b06674..c042b34e 100644
+--- a/.github/workflows/release.yml
++++ b/.github/workflows/release.yml
+@@ -7,7 +7,7 @@ name: Client release
+ # 仓库变量 CHISABOT_SERVER_URL / CHISABOT_UPDATE_FEED / CHISABOT_ANDROID_UPDATE_FEED（或手动运行时的同名输入）
+ # 存在时，再多打一份「自建版」作为工作流产物（pc-custom、android-custom），由发布者放到自己的更新目录。
+ # Android 签名：Secrets ANDROID_KEYSTORE_BASE64 / ANDROID_KEYSTORE_PASSWORD / ANDROID_KEY_ALIAS / ANDROID_KEY_PASSWORD；
+-# 没有配置时产出 -unsigned.apk。
++# 没有配置时只产出供离线签名的中间 APK；未签名 APK 不得进入 Release。
+ on:
+   push:
+     tags: ["v*"]
+@@ -241,6 +241,8 @@ jobs:
+           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
++          # 仅允许生成离线签名中间产物；release job 会验证最终 APK 的签名和包名。
++          CHISABOT_ALLOW_UNSIGNED: "1"
+         run: |
+           if [ "$FLAVOR" = custom ]; then
+             export CHISABOT_SERVER_URL="$SERVER_URL" CHISABOT_ANDROID_UPDATE_FEED="$ANDROID_FEED"
+@@ -263,6 +265,10 @@ jobs:
+           else
+             apk="ChisaBot-Android-$VERSION-unsigned.apk"; cp "$dir/app-release-unsigned.apk" "out/$apk"
+           fi
++          "$ANDROID_HOME"/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -n 1)/aapt2 dump badging "out/$apk" > /tmp/android-badging
++          grep -q "^package: name='cn.ayase.chisabot'" /tmp/android-badging
++          grep -q "versionCode='$VERSION_CODE'" /tmp/android-badging
++          grep -q "versionName='$VERSION'" /tmp/android-badging
+           sha=$(sha256sum "out/$apk" | cut -d' ' -f1)
+           if [ "$FLAVOR" = custom ]; then url="$apk"; json=latest.json
+           else url="https://github.com/$REPO/releases/download/${TAG:-v$VERSION}/$apk"; json=chisabot-android.json; fi
+@@ -315,6 +321,7 @@ jobs:
+           grep -qE "certificate (DN|SHA-256)" /tmp/sig
+           "$bt/aapt2" dump badging "/tmp/$apk" > /tmp/badging 2>&1 || { cat /tmp/badging; exit 1; }
+           grep -m1 "^package:" /tmp/badging
++          grep -q "^package: name='cn.ayase.chisabot'" /tmp/badging
+           grep -q "versionCode='$VERSION_CODE'" /tmp/badging && grep -q "versionName='$VERSION'" /tmp/badging
+           rm -f release-assets/*-unsigned.apk
+           mv "/tmp/$apk" release-assets/
+@@ -327,6 +334,30 @@ jobs:
+           json.dump(d, open(p, "w"), ensure_ascii=False, indent=2)
+           print(json.dumps(d, ensure_ascii=False))
+           PY
++      - name: Require installable Android release
++        env:
++          VERSION: ${{ needs.config.outputs.version }}
++          VERSION_CODE: ${{ needs.config.outputs.version_code }}
++        run: |
++          apk="release-assets/ChisaBot-Android-$VERSION.apk"
++          if [ ! -f "$apk" ]; then
++            echo "::error::没有已签名 APK，拒绝发布不可安装的安卓包。配置 ANDROID_KEYSTORE_* Secrets 或提供离线签名 APK。"
++            exit 1
++          fi
++          sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
++          bt="$sdk/build-tools/$(ls "$sdk/build-tools" | sort -V | tail -n 1)"
++          "$bt/apksigner" verify --verbose "$apk"
++          "$bt/aapt2" dump badging "$apk" > /tmp/release-badging
++          grep -q "^package: name='cn.ayase.chisabot'" /tmp/release-badging
++          grep -q "versionCode='$VERSION_CODE'" /tmp/release-badging
++          grep -q "versionName='$VERSION'" /tmp/release-badging
++          python3 - "$apk" <<'PY'
++          import hashlib, json, pathlib, sys
++          apk = pathlib.Path(sys.argv[1])
++          feed = json.loads(pathlib.Path("release-assets/chisabot-android.json").read_text())
++          assert feed["url"].endswith("/" + apk.name), "更新源指向的不是最终签名 APK"
++          assert feed["sha256"].lower() == hashlib.sha256(apk.read_bytes()).hexdigest(), "更新源校验和与 APK 不一致"
++          PY
+       - name: Create or update release
+         env:
+           GH_TOKEN: ${{ github.token }}

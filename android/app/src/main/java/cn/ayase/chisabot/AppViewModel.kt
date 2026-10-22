@@ -20,6 +20,11 @@ import cn.ayase.chisabot.chat.ChatMessage
 import cn.ayase.chisabot.chat.ConfirmCard
 import cn.ayase.chisabot.chat.contentAll
 import cn.ayase.chisabot.chat.withEditedText
+import cn.ayase.chisabot.chat.BotModelState
+import cn.ayase.chisabot.chat.ModelOption
+import cn.ayase.chisabot.chat.modelMissing
+import cn.ayase.chisabot.chat.parseModelOptions
+import cn.ayase.chisabot.chat.parseModelState
 import cn.ayase.chisabot.net.ApiError
 import kotlinx.serialization.json.JsonElement
 import cn.ayase.chisabot.chat.a
@@ -29,6 +34,7 @@ import cn.ayase.chisabot.chat.s
 import cn.ayase.chisabot.net.Api
 import cn.ayase.chisabot.net.Unauthorized
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
@@ -274,6 +280,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     var channelId by mutableStateOf<String?>(null)
     var messages by mutableStateOf<List<ChatMessage>>(emptyList())
     var running by mutableStateOf(false)
+    var turnPreparing by mutableStateOf(false)
+        private set
     var runError by mutableStateOf<String?>(null)
     var chatLoading by mutableStateOf(false)
     var chatLoadError by mutableStateOf<String?>(null)
@@ -284,8 +292,90 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private var watchJob: Job? = null
     private var liveCall: Call? = null
 
+    // Same per-BOT setting as PC/web; the server applies it to every subsequent run.
+    var modelState by mutableStateOf<BotModelState?>(null)
+        private set
+    var modelOptions by mutableStateOf<List<ModelOption>?>(null)
+        private set
+    var modelsLoading by mutableStateOf(false)
+        private set
+    var modelSaving by mutableStateOf(false)
+        private set
+    var modelsError by mutableStateOf<String?>(null)
+        private set
+    var modelsStale by mutableStateOf(false)
+        private set
+    val selectedModelMissing: Boolean get() = modelMissing(modelState, modelOptions)
+    private var modelsJob: Job? = null
+    private var modelEpoch = 0
+
+    fun loadModels(refresh: Boolean = false) {
+        val bot = chatBot ?: return
+        val api = api ?: return
+        if (modelSaving) return
+        modelsJob?.cancel()
+        val epoch = modelEpoch
+        fun current() = epoch == modelEpoch && chatBot?.id == bot.id && origin() == api.origin
+        modelsLoading = true
+        modelsError = null
+        modelsJob = viewModelScope.launch {
+            try {
+                val state = parseModelState(api.get("/api/agents/${Uri.encode(bot.id)}/model"))
+                if (!current()) return@launch
+                modelState = state
+                if (state.available) {
+                    val catalog = api.get("/api/models" + if (refresh) "?refresh=1" else "")
+                    if (!current()) return@launch
+                    modelOptions = parseModelOptions(catalog)
+                    modelsStale = catalog["stale"]?.toString() == "true"
+                }
+            } catch (e: CancellationException) { throw e }
+            catch (_: Unauthorized) { if (current()) expired() }
+            catch (e: Exception) { if (current()) modelsError = e.message ?: "无法加载模型，请重试" }
+            finally { if (current()) modelsLoading = false }
+        }
+    }
+
+    fun selectModel(model: String?) {
+        val bot = chatBot ?: return
+        val api = api ?: return
+        val state = modelState ?: return
+        if (running || turnPreparing || chatLoading || modelSaving || modelsLoading || !state.available || !state.canManage) return
+        if (model != null && modelOptions?.none { it.id == model } != false) return
+        if (model == state.overrideModel) return
+        val epoch = modelEpoch
+        modelSaving = true
+        modelsError = null
+        viewModelScope.launch {
+            try {
+                val saved = parseModelState(api.call("/api/agents/${Uri.encode(bot.id)}/model", "PUT", buildJsonObject {
+                    put("model", model?.let { JsonPrimitive(it) } ?: kotlinx.serialization.json.JsonNull)
+                }) as JsonObject)
+                if (epoch == modelEpoch && origin() == api.origin) {
+                    modelState = saved
+                    notice = "模型已切换为 ${saved.model.substringAfterLast('/')}"
+                }
+            } catch (e: CancellationException) { throw e }
+            catch (_: Unauthorized) { if (epoch == modelEpoch && origin() == api.origin) expired() }
+            catch (e: Exception) {
+                if (epoch == modelEpoch && origin() == api.origin) {
+                    modelsError = e.message ?: "模型没保存上，请重试"
+                    notice = modelsError.orEmpty()
+                }
+            } finally { modelSaving = false }
+        }
+    }
+
+    private fun modelReadyToSend(): Boolean {
+        if (modelSaving) { notice = "模型正在保存，请稍后发送"; return false }
+        if (selectedModelMissing) { notice = "当前模型已不在列表中，请先选择其他模型"; return false }
+        return true
+    }
+
     fun openChat(bot: Bot) {
         stopRun()
+        modelsJob?.cancel(); modelEpoch++
+        modelState = null; modelOptions = null; modelsError = null; modelsLoading = false; modelsStale = false
         chatBot = bot; threadId = null; channelId = null; messages = emptyList(); runError = null; chatLoadError = null
         confirms = emptyMap(); files.clear(); confirmJob?.cancel()
         push(Screen.Chat(bot))
@@ -358,10 +448,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     suspend fun send(text: String): Boolean {
         val bot = chatBot ?: return false
         val api = api ?: return false
-        if (running) return false
+        if (running || turnPreparing) return false
+        if (!modelReadyToSend()) return false
         if (files.any { it.state == "uploading" }) return false
         val ready = files.filter { it.state == "ready" && it.serverId != null }
         if (text.isBlank() && ready.isEmpty()) return false
+        turnPreparing = true
         runError = null
         try {
             val (_, t) = ensureChannel(api, bot)
@@ -387,6 +479,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             return true
         } catch (_: Unauthorized) { expired(); return false }
         catch (e: Exception) { runError = e.message ?: "发送失败"; return false }
+        finally { turnPreparing = false }
     }
 
     private fun startTurn(api: Api, bot: Bot, t: String, userMsg: ChatMessage) {
@@ -482,10 +575,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** 重新生成最后一轮：截掉最后一条用户消息那一轮，原内容（文字 + 附件段）换个新 id 重发。 */
     suspend fun regenerate(): Boolean {
         val bot = chatBot ?: return false; val api = api ?: return false; val t = threadId ?: return false
-        if (running) return false
+        if (running || turnPreparing) return false
+        if (!modelReadyToSend()) return false
         val at = messages.indexOfLast { it.role == "user" && !cn.ayase.chisabot.chat.ServerRows.isServerRow(it.text) }
         if (at < 0) return false
         val last = messages[at]
+        turnPreparing = true
         runError = null
         return try {
             truncate(api, t, last.id, "regenerate")
@@ -494,16 +589,19 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             true
         } catch (_: Unauthorized) { expired(); false }
         catch (e: Exception) { notice = e.message ?: "没能重发"; false }
+        finally { turnPreparing = false }
     }
 
     /** 编辑后重发：从这条起截掉，新文字（附件保留）作为新的一条发出。 */
     suspend fun editAndResend(messageId: String, text: String): Boolean {
         val bot = chatBot ?: return false; val api = api ?: return false; val t = threadId ?: return false
-        if (running) return false
+        if (running || turnPreparing) return false
+        if (!modelReadyToSend()) return false
         val at = messages.indexOfFirst { it.id == messageId }
         if (at < 0) return false
         val old = messages[at]
         val content = withEditedText(old.content ?: JsonPrimitive(old.text), text) ?: return false
+        turnPreparing = true
         runError = null
         return try {
             truncate(api, t, old.id, "edit")
@@ -513,6 +611,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             true
         } catch (_: Unauthorized) { expired(); false }
         catch (e: Exception) { notice = e.message ?: "没能重发"; false }
+        finally { turnPreparing = false }
     }
 
     // ---------- 附件（§56）：选了就传到这段会话（POST /api/channels/<id>/attachments），传好才能发 ----------

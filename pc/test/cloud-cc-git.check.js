@@ -63,7 +63,8 @@ test("克隆 → 工作树 → 合入 → 冲突 → 推送；令牌不落盘", 
   assert.ok(fs.existsSync(path.join(work, "README.md")));
   assert.equal(execFileSync("git", ["config", "remote.origin.url"], { cwd: work }).toString().trim(), `${base}/git/acme/demo.git`);
   assert.deepEqual(grepTree(root, TOKEN), []);
-  assert.equal(fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith("chisabot-git-")).length, 0, "askpass 临时目录应已删除");
+  const helperBase = process.platform === "win32" ? os.tmpdir() : os.homedir();
+  assert.equal(fs.readdirSync(helperBase).filter((n) => n.startsWith("chisabot-git-")).length, 0, "askpass 临时目录应已删除");
 
   // 会话 A：改 README 第一行 → 合入（快进）
   const a = await g.ensureTree(WS, "ccs_a", "cc/readme-a");
@@ -97,8 +98,12 @@ test("克隆 → 工作树 → 合入 → 冲突 → 推送；令牌不落盘", 
   assert.equal(pv.branch, "cc/readme-c");
   assert.equal(pv.uncommitted, 0); // 合入时已经自动提交了
   assert.equal(pv.commits.length, 2); // 工作目录里合入的 A 还没推到远端，所以也算在里面
-  await assert.rejects(g.push({ workspaceId: WS, sessionId: "ccs_c", base: "main", token: "ghp_wrong_wrong_wrong" }), /拒绝/);
-  const p = await g.push({ workspaceId: WS, sessionId: "ccs_c", base: "main", token: TOKEN });
+  await assert.rejects(g.push({ workspaceId: WS, sessionId: "ccs_c", base: "main", token: TOKEN }), /可信 Git/);
+  await assert.rejects(g.push({ workspaceId: WS, sessionId: "ccs_c", base: "main", url: `${base}/git/acme/demo.git`, token: "ghp_wrong_wrong_wrong" }), /拒绝/);
+  // A model-controlled remote/push URL and URL rewrite must not redirect the credential.
+  execFileSync("git", ["config", "remote.origin.pushurl", "http://127.0.0.1:1/steal.git"], { cwd: c });
+  execFileSync("git", ["config", "url.http://127.0.0.1:1/.insteadOf", base], { cwd: c });
+  const p = await g.push({ workspaceId: WS, sessionId: "ccs_c", base: "main", url: `${base}/git/acme/demo.git`, token: TOKEN });
   assert.equal(p.branch, "cc/readme-c");
   const remote = execFileSync("git", ["rev-parse", "refs/heads/cc/readme-c"], { cwd: path.join(repos, "acme", "demo.git") }).toString().trim();
   assert.equal(remote.slice(0, 10), p.head.slice(0, 10));

@@ -34,15 +34,20 @@ Android 客户端（`android/`）是 Kotlin + Jetpack Compose（Material3）原�
 - 附件：`POST /api/channels/<channelId>/attachments`（multipart `file` + `uploadGroup`）→ 消息里的 `image` / `document` 段（`/api/attachments/<id>`）
 - 重新生成 / 编辑：`POST /api/copilotkit/threads/<threadId>/truncate {fromMessageId, mode}`，然后照常发一轮
 - 设置：`GET /api/me`、`GET /api/devices`（只读）
+- 模型：`GET /api/models`（`?refresh=1` 强制刷新）、`GET /api/agents/<编码后的botId>/model`、`PUT …/model {model: "模型ID" | null}`。聊天输入框上方可搜索并选择模型、恢复部署默认；服务端按机器人持久保存，与 PC／网页共用。返回应用时重新读取，外部 BOT／无管理权限只读，回答期间禁止切换；保存中不能发送、重发或编辑后重发。成功读取目录后，已失效模型会阻止发送并提示重新选择。
 
 ## 构建
 
-和以前一样：`cd android && gradle assembleRelease`（JDK 17、Gradle 8.9、AGP 8.5.2、Kotlin 1.9.24、Compose 编译器 1.5.14）。单测 `gradle testDebugUnitTest`。
+`cd android && gradle testDebugUnitTest assembleRelease`（JDK 17、Gradle 8.9、AGP 8.5.2、Kotlin 1.9.24、Compose 编译器 1.5.14）。
+正式包必须配置 `ANDROID_KEYSTORE_FILE`、`ANDROID_KEYSTORE_PASSWORD`、`ANDROID_KEY_ALIAS`、`ANDROID_KEY_PASSWORD`，缺少签名时直接失败。
+Windows 可运行 `./build-release.ps1 -Gradle <gradle.bat路径>`：先测试与构建，再用 `apksigner` 验签、`aapt2` 检查固定包名 `cn.ayase.chisabot` 和版本，输出包含包名的 APK 文件名、SHA-256 和更新 JSON 到 `android/out/`。
+离线签名中间产物才允许显式设置 `CHISABOT_ALLOW_UNSIGNED=1`；未签名 APK 无法安装，不能当成安装包分发。CI 发布前验证最终签名、包名、版本和更新 JSON 的 SHA-256，未签名版本不会进入 Release。
+后续覆盖更新必须沿用同一把签名密钥，并递增 `versionCode`；本地签名版不要指向使用其他密钥的上游更新源。密钥和密码应离线备份，不能提交到仓库。
 调试包允许 `http://10.0.2.2:<端口>`（模拟器连本机开发服务器）。
 
 ## 阶段
 
 1. **核心原生（0.1.13）**：登录、机器人列表、聊天、富卡片、面板只读；其余网页兜底。
 2. **第二轮（0.1.14，DESIGN §86）**：确认卡片 + 上游审批（§58）、附件（照片 / 拍照 / 文件，§56）、停止、重新生成 / 编辑重发（§67）、服务器行（§68.2）、原生设置基础（外观、账号 / 服务器、设备只读）。还没有：回答期间插话（§38 收件箱）、别处正在回答时接上事件流（现在每 1.5 秒读历史）、render_ui 表单组件、聊天文件卡（`⟦chisabot:files⟧`）。
-3. 原生设置其余部分（主机器人、模型、审批偏好）、通知、离线缓存、桌面小组件。
+3. **0.1.53**：原生模型选择、搜索、刷新与部署默认；签名、包名和更新源校验。后续：原生设置其余部分（主机器人、审批偏好）、通知、离线缓存、桌面小组件。
 4. Claude Code 标签页原生化；管理后台继续用网页。

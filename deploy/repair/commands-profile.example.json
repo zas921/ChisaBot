@@ -1,0 +1,9 @@
+{
+  "repository": "your-account/your-project",
+  "workspaceRoot": "/home/validator/acceptance",
+  "adapter": "commands",
+  "timeoutMs": 600000,
+  "checks": [
+    { "id": "tests", "file": "/usr/bin/node", "args": ["--test"] }
+  ]
+}

@@ -10,6 +10,11 @@ docs/superpowers/
 docs/specs/
 docs/plans/
 .env
+android/.gradle/
+android/.signing/
+android/app/build/
+android/local.properties
+android/out/
 .env.*
 !.env.example
 # Per-Bot egress proxies. Carries credentials in the URL, like .env does.

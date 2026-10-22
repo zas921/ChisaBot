@@ -13,6 +13,8 @@ import { Card, ErrorCard, ListRow } from "@/components/ui/skyglass";
 import { toast } from "@/components/ui/toast";
 import { checkGithub, connectGithub, disconnectGithub, githubKeys, githubQueryOptions } from "@/lib/github";
 import { agoText } from "@/lib/im";
+import { gitAuthorizationQueryOptions, saveGitAuthorization } from "@/lib/github";
+import type { GitAuthorization } from "../../../../shared/git-authorization";
 
 const KIND_TEXT: Record<GithubConnectionView["tokenKind"], string> = {
   "fine-grained": "Fine-grained 令牌",
@@ -57,7 +59,7 @@ export function GithubConnectionSection() {
   }
 
   return (
-    <PageSection description="机器人可以读你的仓库、Issue、PR 和文件；建 Issue、评论、建 PR 之前都会在聊天里先问你。" title="GitHub">
+    <PageSection description="配置 GitHub 账号和云端 Git 仓库授权。令牌加密保存在服务器，不读取本机 Git 配置。" title="GitHub">
       <GithubTokenDialog onOpenChange={setOpen} open={open} replacing={Boolean(connection)} />
       {status.isPending ? (
         <PageSkeleton rows={1} />
@@ -158,6 +160,7 @@ export function GithubConnectionSection() {
           </div>
         </Card>
       )}
+      {connection ? <GitAuthorizationSettings /> : null}
     </PageSection>
   );
 }
@@ -186,7 +189,7 @@ function GithubTokenDialog({ open, replacing, onOpenChange }: { open: boolean; r
       <DialogContent className="im-dialog max-w-lg">
         <DialogHeader>
           <DialogTitle>{replacing ? "更换 GitHub 令牌" : "连接 GitHub"}</DialogTitle>
-          <DialogDescription>{"令牌只发往 api.github.com，加密保存；保存后谁也看不到，包括你自己。"}</DialogDescription>
+          <DialogDescription>{"令牌加密保存且不回显。启用云端 Git 后，受信任节点会临时使用令牌连接 GitHub；令牌不作为聊天内容发送给模型。"}</DialogDescription>
         </DialogHeader>
         <form
           autoComplete="off"
@@ -242,4 +245,39 @@ function GithubTokenDialog({ open, replacing, onOpenChange }: { open: boolean; r
       </DialogContent>
     </Dialog>
   );
+}
+
+function GitAuthorizationSettings() {
+  const query = useQuery(gitAuthorizationQueryOptions());
+  const cache = useQueryClient();
+  const [access, setAccess] = useState<GitAuthorization["access"]>("disabled");
+  const [repos, setRepos] = useState("");
+  useEffect(() => {
+    if (query.data) {
+      setAccess(query.data.access);
+      setRepos(query.data.repositories.join("\n"));
+    }
+  }, [query.data]);
+  const save = useAsyncAction(async () => {
+    const authorization = await saveGitAuthorization({ access, repositories: repos.split(/[\n,]+/).map((r) => r.trim()).filter(Boolean) });
+    cache.setQueryData(gitAuthorizationQueryOptions().queryKey, authorization);
+  }, { errorToast: (error) => error.message });
+  if (query.isPending) return <PageSkeleton rows={1} />;
+  if (query.isError) return <ErrorCard title="无法读取云端 Git 授权" description={query.error.message} action={<Button onClick={() => void query.refetch()}>重试</Button>} />;
+  return <Card className="mem-card p-4">
+    <form className="im-form" onSubmit={(e) => { e.preventDefault(); void save.run(); }}>
+      <h3>云端 Git 授权</h3>
+      <label className="im-field" htmlFor="cloud-git-access"><span>访问权限</span>
+        <select id="cloud-git-access" value={access} onChange={(e) => setAccess(e.target.value as GitAuthorization["access"])}>
+          <option value="disabled">关闭</option><option value="read">只读（克隆）</option><option value="write">读写（克隆和推送修复分支）</option>
+        </select>
+      </label>
+      <label className="im-field" htmlFor="cloud-git-repos"><span>允许的 GitHub 仓库，每行一个 owner/name</span>
+        <textarea id="cloud-git-repos" className="font-mono" rows={4} value={repos} onChange={(e) => setRepos(e.target.value)} placeholder="your-account/your-project" />
+      </label>
+      <p className="im-field-h">请同时在 GitHub 的 Fine-grained 令牌中仅选择这些仓库。克隆需要 Contents 读取，推送需要 Contents 读写，创建 PR 还需要 Pull requests 读写。这里的授权不修改 GitHub 令牌权限，也不会上传本机 SSH 密钥、Git 配置或凭据。</p>
+      <p className="im-field-h">关闭授权会阻止后续克隆与推送；已下发的操作和已克隆的代码不会被自动撤回。本地验收单独使用本机 Git 凭据。</p>
+      <Button type="submit" state={save.state} feedback={{ pending: "保存中…", success: "已保存", error: "保存失败" }}>保存 Git 授权</Button>
+    </form>
+  </Card>;
 }

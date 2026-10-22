@@ -301,6 +301,7 @@ import { repeatAfterEach } from "./work/loop";
 import { createWorkerService, type WorkerService } from "./workers/service";
 import { createLocalAgentService, type LocalAgentService } from "./local-agents/service";
 import { createCloudCcService, type CloudCcService } from "./cloud-cc/service";
+import { createRepairService } from "./repair/service";
 import { createCloudSyncService, type CloudSyncService } from "./cloud-cc/sync";
 import { reasonWithoutStatement } from "./db/query-failure";
 import {
@@ -1247,7 +1248,7 @@ const deviceToolsFor = async (
           },
         }
       : undefined;
-    return deviceTools({
+    return [...deviceTools({
       store: deviceStore,
       hub: deviceHub,
       botId,
@@ -1256,7 +1257,7 @@ const deviceToolsFor = async (
       botName,
       ...(initiator ? { initiator } : {}),
       ...(workspace ? { workspace } : {}),
-    });
+    }), ...(repairs?.tools(actorId, botId) ?? [])];
   } catch (error) {
     console.error(
       JSON.stringify({
@@ -2133,6 +2134,7 @@ try {
  * 登录、会话、审批。它的设备扩展排在本地 agent 前面：cc_* 消息自己处理，其余交给本地 agent。
  */
 let cloudCc: CloudCcService | undefined;
+let repairs: ReturnType<typeof createRepairService> | undefined;
 try {
   cloudCc = createCloudCcService({
     database,
@@ -2150,6 +2152,15 @@ try {
 } catch (error) {
   console.warn("cloud claude code unavailable", error);
   cloudCc = undefined;
+}
+if (cloudCc) {
+  try {
+    repairs = createRepairService({ database, cloud: cloudCc, hub: deviceHub, devices: deviceStore });
+    await repairs.ensure();
+  } catch (error) {
+    repairs?.stop(); repairs = undefined;
+    console.warn("project repair unavailable", error instanceof Error ? error.name : "UnknownError");
+  }
 }
 /** 电脑文件夹同步（server/src/cloud-cc/sync.ts，P4）：绑定、租约、隧道。跟着云端 Claude Code 一起有。 */
 let cloudSync: CloudSyncService | undefined;
@@ -3758,6 +3769,7 @@ const app = createApp(
       ["/api/chisa-skills", chisaSkills.routes(requireUser)],
       ["/api/vault", vault.routes(requireUser)],
       ["/api/github", github.routes(requireUser)],
+      ...(repairs ? [["/api/repairs", repairs.routes(requireUser)] satisfies [string, unknown]] : []),
       ["/api/pages", pages.routes(requireUser)],
       // 公开页面：不用登录（沙箱 CSP，见 server/src/pages/service.ts）。
       ["/p", pages.publicRoutes()],

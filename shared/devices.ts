@@ -114,6 +114,9 @@ export const MOBILE_ONLINE_WINDOW_MS = 3 * 60_000;
 
 /** 每个设备操作需要的能力；system_info 为 null（始终可用）。 */
 export const OPERATION_CAPABILITY: Record<DeviceOperation, DeviceCapability | null> = {
+  repair_validate: "shell",
+  repair_status: null,
+  repair_cancel: "shell",
   system_info: null,
   shell: "shell",
   list_files: "files_read",
@@ -171,6 +174,9 @@ export type FullAccessDuration = keyof typeof FULL_ACCESS_DURATIONS;
 export const FULL_ACCESS_FOREVER = "9999-12-31T00:00:00.000Z";
 
 export type DeviceOperation =
+  | "repair_validate"
+  | "repair_status"
+  | "repair_cancel"
   | "system_info"
   | "shell"
   | "list_files"
@@ -198,6 +204,9 @@ export type DeviceOperation =
   | "activity";
 
 export const OPERATION_LABEL: Record<DeviceOperation, string> = {
+  repair_validate: "运行已配置的项目验收",
+  repair_status: "读取项目验收状态",
+  repair_cancel: "取消项目验收",
   system_info: "读取系统信息",
   shell: "运行命令",
   list_files: "列出文件",

@@ -4,8 +4,21 @@ plugins {
     id("org.jetbrains.kotlin.plugin.serialization")
 }
 
-// 签名只从环境变量读（CI 用仓库 Secrets 解出 keystore）；没有就产出未签名的 release APK。
-val ksFile = System.getenv("ANDROID_KEYSTORE_FILE")?.takeIf { it.isNotBlank() && file(it).exists() }
+// 固定 applicationId 保证后续版本可以覆盖更新；release 必须签名才能安装。
+val ksFile = System.getenv("ANDROID_KEYSTORE_FILE")?.takeIf { it.isNotBlank() }
+if (ksFile != null) {
+    require(file(ksFile).isFile) { "ANDROID_KEYSTORE_FILE 指向的密钥库不存在" }
+    for (name in listOf("ANDROID_KEYSTORE_PASSWORD", "ANDROID_KEY_ALIAS", "ANDROID_KEY_PASSWORD")) {
+        require(!System.getenv(name).isNullOrBlank()) { "缺少签名环境变量 $name" }
+    }
+}
+gradle.taskGraph.whenReady {
+    if (allTasks.any { it.project == project && it.name in setOf("assembleRelease", "bundleRelease", "packageRelease") }) {
+        require(ksFile != null || System.getenv("CHISABOT_ALLOW_UNSIGNED") == "1") {
+            "Release APK 必须签名。请设置 ANDROID_KEYSTORE_* / ANDROID_KEY_ALIAS；离线签名中间产物才可显式设置 CHISABOT_ALLOW_UNSIGNED=1。"
+        }
+    }
+}
 
 // 构建期默认值（CI 从仓库变量写入；都为空 = 通用版：首次运行让用户填自己的服务器地址）。
 fun env(name: String) = System.getenv(name)?.trim().orEmpty()
@@ -24,8 +37,8 @@ android {
         applicationId = "cn.ayase.chisabot"
         minSdk = 24
         targetSdk = 34
-        versionCode = 250        // 只增不减（已安装的 Android 按它判断更新）；2026-10-12 版本号重置为 0.1.0 时从 206 接着往上
-        versionName = "0.1.52"
+        versionCode = 254        // 只增不减（已安装的 Android 按它判断更新）；2026-10-12 版本号重置为 0.1.0 时从 206 接着往上
+        versionName = "0.1.56"
         buildConfigField("String", "DEFAULT_SERVER", quoted(defaultServer))
         buildConfigField("String", "UPDATE_FEED", quoted(updateFeed))
         // 只有 debug 包允许 http://10.0.2.2（模拟器连本机预览）；正式包一律 https。

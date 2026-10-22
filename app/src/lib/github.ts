@@ -1,6 +1,14 @@
 import { queryOptions } from "@tanstack/react-query";
 import type { GithubActionView, GithubConnectionView } from "../../../shared/github";
 import { client } from "@/lib/client";
+import type { GitAuthorization } from "../../../shared/git-authorization";
+
+export const gitAuthorizationQueryOptions = () => queryOptions({
+  queryKey: ["github", "git-authorization"],
+  queryFn: ({ signal }): Promise<GitAuthorization> => client("/api/github/git-authorization", "authorization", { signal, fallback: "无法读取 Git 授权" }),
+});
+export const saveGitAuthorization = (body: GitAuthorization): Promise<GitAuthorization> =>
+  client("/api/github/git-authorization", "authorization", { method: "PUT", body, fallback: "保存 Git 授权失败" });
 
 /** GitHub 账号连接（DESIGN.md §53，docs/github.md）。令牌只往服务器送，从不读回来。 */
 export const githubKeys = {

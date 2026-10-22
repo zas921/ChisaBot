@@ -85,6 +85,7 @@ import kotlinx.coroutines.launch
 /** 原生聊天：历史、发送、流式回复、干活卡（§75）、停顿小点（§78.2）、短气泡（§69）、富卡片（render_ui）。 */
 @Composable
 fun ChatScreen(vm: AppViewModel, bot: Bot) {
+    LaunchedEffect(bot.id) { vm.loadModels() }
     val sky = LocalSky.current
     val scope = rememberCoroutineScope()
     var menu by remember { mutableStateOf(false) }
@@ -262,6 +263,7 @@ private fun Composer(vm: AppViewModel, onSent: () -> Unit) {
     val uploading = vm.files.any { it.state == "uploading" }
     val readyFiles = vm.files.count { it.state == "ready" }
     Column(Modifier.fillMaxWidth().background(sky.glass1).navigationBarsPadding()) {
+        ModelPicker(vm)
         AttachmentStrip(vm)
         Row(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp), verticalAlignment = Alignment.Bottom) {
             AttachButton(
@@ -279,7 +281,7 @@ private fun Composer(vm: AppViewModel, onSent: () -> Unit) {
                 )
             }
             Spacer(Modifier.width(8.dp))
-            val canSend = (text.isNotBlank() || readyFiles > 0) && !uploading && !sending
+            val canSend = (text.isNotBlank() || readyFiles > 0) && !uploading && !sending && !vm.turnPreparing && !vm.modelSaving && !vm.selectedModelMissing
             AnimatedContent(vm.running, transitionSpec = { fadeIn(tween(150)) togetherWith fadeOut(tween(150)) }, label = "send") { running ->
                 if (running) {
                     // 停止（§38）：点了原地转圈「停止中」，服务器停下、流断开后变回发送

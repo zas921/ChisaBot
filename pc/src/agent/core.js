@@ -9,6 +9,9 @@ const { EventEmitter } = require("node:events");
 const { gitIsRead } = require("./code-ops");
 
 const OPERATION_CAPABILITY = {
+  repair_validate: "shell",
+  repair_status: null,
+  repair_cancel: "shell",
   system_info: null,
   shell: "shell",
   list_files: "files_read",
