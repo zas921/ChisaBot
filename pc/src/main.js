@@ -51,7 +51,7 @@ const { computeUpdateBounds } = require("./update-placement");
 const windowChrome = require("./window-chrome");
 const buildConfig = require("./build-config");
 const { createSyncManager } = require("./sync/manager");
-const BUILD = buildConfig.load();
+const BUILD = buildConfig.loadEffective();
 const pkg = require("../package.json");
 
 const PARTITION = "persist:chisabot";

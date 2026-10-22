@@ -73,3 +73,5 @@ venv/
 /deploy/rollback-to-*.sh
 /deploy/compose.yaml.before-*
 /deploy/compose.yaml.rolledback-*
+# 私人构建的服务器地址（pc/src/build-config.js loadEffective），仓库是公开的
+pc/src/build-config.local.json

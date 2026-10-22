@@ -22,3 +22,22 @@ test("feed order: local override → build feed → GitHub Releases → none", (
 test("missing file falls back to empty defaults", () => {
   assert.deepStrictEqual(load("/nonexistent/build-config.json"), { serverUrl: "", updateFeed: "", githubRepo: "" });
 });
+
+test("a private build-config.local.json fills in what the committed one leaves empty", () => {
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bc-"));
+  const base = path.join(dir, "build-config.json");
+  const local = path.join(dir, "build-config.local.json");
+  fs.writeFileSync(base, JSON.stringify({ serverUrl: "", updateFeed: "", githubRepo: "me/chisabot" }));
+  const { loadEffective } = require("../src/build-config");
+  assert.deepStrictEqual(loadEffective(base, local), { serverUrl: "", updateFeed: "", githubRepo: "me/chisabot" });
+  fs.writeFileSync(local, JSON.stringify({ serverUrl: "https://chat.example.com" }));
+  assert.deepStrictEqual(loadEffective(base, local), { serverUrl: "https://chat.example.com", updateFeed: "", githubRepo: "me/chisabot" });
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("the private local file is ignored by git", () => {
+  const ignore = require("node:fs").readFileSync(path.join(__dirname, "..", "..", ".gitignore"), "utf8");
+  assert.match(ignore, /^pc\/src\/build-config\.local\.json$/m);
+});

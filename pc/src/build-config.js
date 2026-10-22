@@ -7,6 +7,9 @@
  *  - githubRepo：owner/repo。updateFeed 为空时退回 GitHub Releases：
  *    https://github.com/<owner>/<repo>/releases/latest/download/（仓库须公开）。
  * 本机 config.json 里的 updateFeed（可选）优先于这里，方便自建更新源的人不重新打包就改。
+ *
+ * 私人构建（2026-10-22）：仓库是公开的，服务器地址不进仓库。把自己的地址写进同目录的
+ * build-config.local.json（.gitignore 忽略、打包时随 src/ 一起进 asar），它的非空字段覆盖 build-config.json。
  */
 const fs = require("node:fs");
 const path = require("node:path");
@@ -18,6 +21,18 @@ function load(file = path.join(__dirname, "build-config.json")) {
   } catch {
     return { serverUrl: "", updateFeed: "", githubRepo: "" };
   }
+}
+
+/** 运行时用：build-config.json 再叠上本机私有的 build-config.local.json（没有就只用前者）。 */
+function loadEffective(file = path.join(__dirname, "build-config.json"), localFile = path.join(__dirname, "build-config.local.json")) {
+  const base = load(file);
+  if (!fs.existsSync(localFile)) return base;
+  const local = load(localFile);
+  return {
+    serverUrl: local.serverUrl || base.serverUrl,
+    updateFeed: local.updateFeed || base.updateFeed,
+    githubRepo: local.githubRepo || base.githubRepo,
+  };
 }
 
 function withSlash(url) {
@@ -32,4 +47,4 @@ function resolveFeed(build, local = {}) {
   return "";
 }
 
-module.exports = { load, resolveFeed };
+module.exports = { load, loadEffective, resolveFeed };
