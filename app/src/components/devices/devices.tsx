@@ -990,6 +990,92 @@ const PC_UPDATE_TEXT: Record<PcUpdateState["status"], string> = {
 
 /** 「本机」标签里的客户端更新（docs/online-update.md）：自动更新开关 + 当前状态 + 检查 / 重启安装。 */
 function PcUpdateRows({ local, onLocal }: { local: PcLocalState; onLocal: (next: PcLocalState) => void }) {
+  const update = local.update as PcUpdateState;
+  if (update.upstream) return <PcUpstreamRows local={local} onLocal={onLocal} />;
+  return <PcAutoUpdateRows local={local} onLocal={onLocal} />;
+}
+
+/**
+ * 个人定制版客户端（pc/src/upstream-notice.js，2026-10-22）：没有自动更新，只提示原版发布了新版本。
+ * 「查看原版发布」在系统浏览器里打开发布页；要不要把原版的改动同步进定制版由人决定。
+ */
+function PcUpstreamRows({ local, onLocal }: { local: PcLocalState; onLocal: (next: PcLocalState) => void }) {
+  const bridge = pcBridge();
+  const update = local.update as PcUpdateState;
+  const [busy, setBusy] = useState(false);
+  const check = useAsyncAction(
+    async () => {
+      const next = await bridge?.checkUpdate?.();
+      if (next?.status === "error") throw new Error(next.error || "检查原版更新失败");
+      if (bridge) onLocal(await bridge.state());
+    },
+    { errorToast: (error) => error.message },
+  );
+  const open = useAsyncAction(async () => {
+    await bridge?.installUpdate?.();
+  });
+  const status =
+    update.status === "available"
+      ? `原版有新版本 ${update.version ?? ""}`
+      : update.status === "none"
+        ? "原版没有更新的版本"
+        : update.status === "checking"
+          ? "正在检查…"
+          : update.status === "error"
+            ? update.error || "检查原版更新失败"
+            : "";
+  const detail = [
+    `定制版 ${local.version}`,
+    update.base ? `基于原版 ${update.base}` : "",
+    status,
+    update.checkedAt ? `上次检查 ${new Date(update.checkedAt).toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" })}` : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  return (
+    <>
+      <SettingRow description={`定制版不会自动下载或安装任何版本。开着时启动后和每 12 小时看一次原版（${update.repo || "ChisaAlter/ChisaBot"}）的最新发布，有新版本就在这里、托盘和系统通知里提示。`} title="检查原版更新">
+        <Switch
+          aria-label="检查原版更新"
+          checked={!!local.autoUpdate && update.supported}
+          disabled={busy || !update.supported}
+          onCheckedChange={async (value) => {
+            if (!bridge) return;
+            setBusy(true);
+            try {
+              onLocal(await bridge.setLocal({ autoUpdate: value }));
+            } catch (error) {
+              toast.error(error instanceof Error ? error.message : "修改失败");
+            } finally {
+              setBusy(false);
+            }
+          }}
+        />
+      </SettingRow>
+      <SettingRow description={detail} title="客户端版本">
+        {update.status === "available" ? (
+          <Button onClick={() => void open.run()} size="sm" state={open.state} variant="outline">
+            {"查看原版发布"}
+          </Button>
+        ) : (
+          <Button
+            disabled={!update.supported || update.status === "checking"}
+            feedback={{ pending: "检查中…", success: "已检查", error: "检查失败" }}
+            onClick={() => void check.run()}
+            size="sm"
+            state={check.state}
+            variant="outline"
+          >
+            {"检查原版更新"}
+          </Button>
+        )}
+      </SettingRow>
+    </>
+  );
+}
+
+/** 官方客户端（pc/src/updater.js）：自动更新开关 + 当前状态 + 检查 / 重启安装。 */
+function PcAutoUpdateRows({ local, onLocal }: { local: PcLocalState; onLocal: (next: PcLocalState) => void }) {
   const bridge = pcBridge();
   const update = local.update as PcUpdateState;
   const [busy, setBusy] = useState(false);

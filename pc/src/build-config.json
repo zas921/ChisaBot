@@ -1,5 +1,7 @@
 {
   "serverUrl": "",
   "updateFeed": "",
-  "githubRepo": "zas921/ChisaBot"
+  "githubRepo": "zas921/ChisaBot",
+  "upstreamRepo": "ChisaAlter/ChisaBot",
+  "upstreamBase": "0.1.55"
 }

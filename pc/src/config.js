@@ -21,8 +21,10 @@ const DEFAULTS = {
   forceLocalApproval: true,
   localPaused: false,
   startHidden: false,
-  /** 在线更新（updater.js）：开着时启动后和每 4 小时自动检查并在后台下载。 */
+  /** 检查原版更新（upstream-notice.js）：开着时启动后和每 12 小时看一次原版的最新发布，只提示、不下载。 */
   autoUpdate: true,
+  /** 已经弹过系统通知的原版版本号（每个版本只通知一次）。 */
+  upstreamNotified: "",
   /** 上次刷新快捷方式 / 图标缓存时的外壳指纹（src/shell-refresh.js）；和当前版本不同就再刷新一次。 */
   shellHash: "",
   /** 主窗口里网页的外观（深色 / 时间天空），本机窗口跟着它走；dark 为 null 时跟随系统。 */

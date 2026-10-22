@@ -44,6 +44,14 @@ export type PcUpdateState = {
   percent?: number;
   checkedAt?: string;
   error?: string;
+  /**
+   * 个人定制版客户端（upstream-notice.js，2026-10-22）：不自动更新，只提示原版（repo）发布了比定制版所基于的原版
+   * （base）更新的版本。这时 version 是原版的版本号，status available = 原版有新版本，releaseUrl 是发布页。
+   */
+  upstream?: boolean;
+  repo?: string;
+  base?: string;
+  releaseUrl?: string;
 };
 
 export type PcLocalPatch = Partial<

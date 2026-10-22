@@ -20,7 +20,7 @@ test("feed order: local override → build feed → GitHub Releases → none", (
 });
 
 test("missing file falls back to empty defaults", () => {
-  assert.deepStrictEqual(load("/nonexistent/build-config.json"), { serverUrl: "", updateFeed: "", githubRepo: "" });
+  assert.deepStrictEqual(load("/nonexistent/build-config.json"), { serverUrl: "", updateFeed: "", githubRepo: "", upstreamRepo: "", upstreamBase: "" });
 });
 
 test("a private build-config.local.json fills in what the committed one leaves empty", () => {
@@ -31,13 +31,19 @@ test("a private build-config.local.json fills in what the committed one leaves e
   const local = path.join(dir, "build-config.local.json");
   fs.writeFileSync(base, JSON.stringify({ serverUrl: "", updateFeed: "", githubRepo: "me/chisabot" }));
   const { loadEffective } = require("../src/build-config");
-  assert.deepStrictEqual(loadEffective(base, local), { serverUrl: "", updateFeed: "", githubRepo: "me/chisabot" });
+  assert.deepStrictEqual(loadEffective(base, local), { serverUrl: "", updateFeed: "", githubRepo: "me/chisabot", upstreamRepo: "", upstreamBase: "" });
   fs.writeFileSync(local, JSON.stringify({ serverUrl: "https://chat.example.com" }));
-  assert.deepStrictEqual(loadEffective(base, local), { serverUrl: "https://chat.example.com", updateFeed: "", githubRepo: "me/chisabot" });
+  assert.deepStrictEqual(loadEffective(base, local), { serverUrl: "https://chat.example.com", updateFeed: "", githubRepo: "me/chisabot", upstreamRepo: "", upstreamBase: "" });
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
 test("the private local file is ignored by git", () => {
   const ignore = require("node:fs").readFileSync(path.join(__dirname, "..", "..", ".gitignore"), "utf8");
   assert.match(ignore, /^pc\/src\/build-config\.local\.json$/m);
+});
+
+test("committed config names the upstream and the upstream version this build is based on", () => {
+  const c = load(path.join(__dirname, "..", "src", "build-config.json"));
+  assert.strictEqual(c.upstreamRepo, "ChisaAlter/ChisaBot");
+  assert.match(c.upstreamBase, /^\d+\.\d+\.\d+$/);
 });

@@ -12,7 +12,8 @@
  *  - 本机窗口（设置向导、审批弹窗、本机确认、离线页）用网页同一套 Skyglass 令牌（ui/skyglass-tokens.css）
  *  - 托盘：在线 / 离线 / 紧急停止三种图标；菜单含紧急停止
  *  - 节点：agent/core.js 出站 WebSocket；审批弹窗；本机审计日志
- *  - 在线更新（updater.js）：后台下载，下载好后本机窗口「新版本已下载，重启以安装」
+ *  - 原版更新提示（upstream-notice.js，个人定制版 2026-10-22）：不再自动下载安装；原版发布新版本时托盘和网页提示，
+ *    附发布页链接。旧的 updater.js（electron-updater 后台下载 + 静默安装）不再接入。
  */
 const path = require("node:path");
 const os = require("node:os");
@@ -44,7 +45,7 @@ const { createOps } = require("./agent/ops");
 const { attachAgentRuntime } = require("./agent-runtime/attach");
 const auth = require("./agent/auth");
 const { ensureEnrolled } = require("./agent/enrollment");
-const { createUpdater } = require("./updater");
+const { createUpstreamNotice } = require("./upstream-notice");
 const shellRefresh = require("./shell-refresh");
 const { createCompactController } = require("./compact-window");
 const { computeUpdateBounds } = require("./update-placement");
@@ -463,8 +464,8 @@ function refreshTray() {
             { label: "本机设置…", click: () => void openDeviceSettings("local") },
           ]
         : []),
-      ...(updater?.state.status === "downloaded"
-        ? [{ label: `重启以安装 ${updater.state.version || "新版本"}…`, click: () => openUpdateWindow() }]
+      ...(updater?.state.status === "available"
+        ? [{ label: `原版有新版本 ${updater.state.version || ""}…`, click: () => updater.install() }]
         : []),
       { type: "separator" },
       ...(agent?.fullAccess
@@ -926,33 +927,38 @@ function updateLogger() {
   return { info: () => {}, debug: () => {}, warn: write("warn"), error: write("error") };
 }
 
+/**
+ * 原版更新提示（upstream-notice.js）：只看原版在 GitHub 上的最新正式发布，比定制版所基于的原版新就提示。
+ * 不下载、不安装（安装程序升级时会清空安装目录，定制版也不该被原版覆盖）。用 Chromium 的 net.fetch，走系统代理。
+ * 「检查原版更新」开关沿用 autoUpdate；每个新版本只弹一次系统通知，托盘菜单和网页「本机」标签一直显示。
+ */
 function startUpdater() {
-  let autoUpdater = null;
-  if (app.isPackaged) {
-    try {
-      ({ autoUpdater } = require("electron-updater"));
-    } catch {
-      autoUpdater = null;
-    }
-  }
-  updater = createUpdater({
-    autoUpdater,
-    feedUrl: buildConfig.resolveFeed(BUILD, config.get()),
-    isPackaged: app.isPackaged,
-    platform: process.platform,
-    execPath: process.execPath,
-    productName: pkg.productName || "ChisaBot PC",
-    shellHash: SHELL_HASH,
-    getAutoUpdate: () => config.get().autoUpdate !== false,
-    logger: updateLogger(),
+  updater = createUpstreamNotice({
+    repo: BUILD.upstreamRepo,
+    base: BUILD.upstreamBase,
+    currentVersion: pkg.version,
+    fetchJson: async (url) => {
+      const response = await net.fetch(url, { headers: { accept: "application/vnd.github+json", "user-agent": "ChisaBot-PC-upstream-notice" } });
+      if (!response.ok) throw new Error(`GitHub 返回 HTTP ${response.status}`);
+      return response.json();
+    },
+    getEnabled: () => config.get().autoUpdate !== false,
+    openUrl: (url) => {
+      if (/^https:\/\/github\.com\//.test(url)) void shell.openExternal(url);
+    },
     onState: () => {
       refreshTray();
+      broadcast("update");
     },
-    onDownloaded: (version) => {
-      config.appendAudit({ at: new Date().toISOString(), actor: "本机", operation: "update_downloaded", outcome: "succeeded", summary: `新版本 ${version || ""} 已下载` });
-      if (Notification.isSupported())
-        new Notification({ title: "ChisaBot PC", body: `新版本 ${version || ""} 已下载，重启以安装。` }).show();
-      openUpdateWindow();
+    onNewVersion: (version, url) => {
+      if (config.get().upstreamNotified === version) return;
+      config.set({ upstreamNotified: version });
+      config.appendAudit({ at: new Date().toISOString(), actor: "本机", operation: "upstream_update_available", outcome: "succeeded", summary: `原版有新版本 ${version}（定制版基于原版 ${BUILD.upstreamBase}）` });
+      if (Notification.isSupported()) {
+        const note = new Notification({ title: "ChisaBot PC", body: `原版 ChisaBot 发布了 ${version}（当前定制版基于原版 ${BUILD.upstreamBase}）。点这里查看。` });
+        note.on("click", () => void shell.openExternal(url));
+        note.show();
+      }
     },
   });
   updater.schedule();
@@ -1434,8 +1440,8 @@ function registerIpc() {
     return { status: "reconnecting", message: "正在重新连接…", state: webLocalState() };
   });
   handleWeb("pc:check-update", async () => (updater ? updater.check() : { supported: false, status: "idle" }));
-  // 网页只能把「新版本已下载」的本机窗口叫出来；立即重启要在那个窗口里由本人点。
-  handleWeb("pc:install-update", () => openUpdateWindow());
+  // 定制版没有「下载好的安装包」：网页的按钮打开原版的发布页（upstream-notice.js install）。
+  handleWeb("pc:install-update", () => (updater ? updater.install() : false));
   handleWeb("pc:appearance", (value) => {
     const next = { dark: typeof value?.dark === "boolean" ? value.dark : null, sky: value?.sky !== false };
     const prev = config.get().appearance || {};
