@@ -92,9 +92,17 @@ import {
   useLastSentAt,
   useStoppedTurnIds,
 } from "@/lib/copilot/turn-compaction";
+import {
+  forgetTurnOutcome,
+  hasUnansweredToolCall,
+  rememberTurnOutcome,
+  STALLED_RELAY_REASON,
+  turnOutcomeFor,
+} from "@/lib/copilot/turn-outcome";
 import { useConversationSync } from "@/lib/copilot/use-conversation-sync";
 import { useThreadInbox } from "@/lib/copilot/use-thread-inbox";
 import { readImageDims } from "@/lib/image-dims";
+import { useKeptHeld, useMarkChatWorking } from "@/lib/kept-visible";
 import { useModelSelectionSaving } from "@/lib/model-selection/hooks";
 import { assertModelSelectionNotSaving } from "@/lib/model-selection/mutations";
 import { agentModelQueryOptions, modelCatalogQueryOptions } from "@/lib/model-selection/queries";
@@ -111,6 +119,9 @@ import { newId } from "../../lib/new-id";
  * next message sent.
  */
 const JOIN_DEADLINE_MS = 1500;
+
+/** 服务器说在回答、事件序号却这么久没动、最后一步还没有结果：当成没人在执行那一步（DESIGN.md §109）。 */
+const STALLED_RELAY_MS = 30_000;
 
 /**
  * Backstop for a message typed before the runtime agent exists; it must not be discarded.
@@ -817,8 +828,24 @@ export function ChannelChat({
     };
   }, [channel.id, channel.threadId, joinGatePromise, runtimeAgentId]);
 
+  /*
+   * 换机器人时这一页还在回答、被外壳留着等它答完（DESIGN.md §109）：另一段对话在主区里，这一页不再声明
+   * 「现在看着的机器人」，也不收右栏的「问一句」、不写计算机状态行。它自己的工具调用照样按 bindAgentBot 认机器人。
+   */
+  const held = useKeptHeld();
+  const heldRef = useRef(held);
+  heldRef.current = held;
+  /** 卸载之后还在跑的那一轮（`deliver` 的 await 不随卸载停下）据此知道组件已经不在了。 */
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
   // Tool calls from this conversation act on this coworker's own computer.
-  useActiveBot(runtimeAgentId);
+  useActiveBot(runtimeAgentId, !held);
 
   const skillCommands = useSkillCommands(runtimeAgentId);
   /*
@@ -851,6 +878,8 @@ export function ChannelChat({
 
   // Run failures arrive as events and are reported only for turns started in this mount.
   const [runError, setRunError] = useState<string | null>(null);
+  /** 服务器说这一轮还在、却停在一步没人执行的浏览器操作上（§109）：给「停止」，并说清原因。 */
+  const [relayStalled, setRelayStalled] = useState(false);
   const awaitingReply = useRef(false);
   /**
    * 这一轮最后一次「确实动了」的时刻（DESIGN.md §100 / DOG-01）。
@@ -1000,6 +1029,8 @@ export function ChannelChat({
     );
 
     setRunError(null);
+    setRelayStalled(false);
+    forgetTurnOutcome(channel.threadId);
     turnFailure.current = null;
     connectionDropped.current = false;
     assistantMessagesBeforeRun.current = new Set(
@@ -1059,6 +1090,25 @@ export function ChannelChat({
     }
 
     setRunsInFlight((count) => count + 1);
+    /*
+     * 看门狗的「有进展」挂在这一轮真正在跑的 agent 上，跟着这一轮走、不跟着组件走（DESIGN.md §109）。
+     * 组件里那份订阅（下面 failRef 那个 effect）在换机器人卸载聊天时就撤了，之后模型明明在写，看门狗只看得见
+     * 浏览器工具：命令一结束、模型再写十几秒就被当成挂住停掉（2026-10-22 生产两次「莫名停止」，都是
+     * 命令结束后整 12 秒发出 stop）。组件已经不在时出的错也在这里记下原因，切回来能看到为什么停。
+     */
+    const runWatch = target.subscribe({
+      onEvent: () => noteRunProgress.current(),
+      onRunStartedEvent: () => noteRunProgress.current(),
+      onRunErrorEvent: ({ event }) => {
+        if (!mountedRef.current) failRef.current(stoppedReason(event?.message));
+      },
+      onRunFailed: ({ error }) => {
+        if (mountedRef.current) return;
+        if (pausedForApproval() && isAbortFailure(error)) return;
+        if (stopRequestedRef.current) return;
+        failRef.current(stoppedReason(error));
+      },
+    });
     try {
       /*
        * DOG-01 实机 FAIL（v0.1.18）：sync 仍通时 connection-drop 的 10s unreachable 不会触发；
@@ -1085,11 +1135,11 @@ export function ChannelChat({
         lastProgressAt,
       });
       if (race === "timeout") {
-        try {
-          copilotkit.stopAgent({ agent: target });
-        } catch {
-          /* stop best-effort */
-        }
+        /*
+         * 先查这条消息有没有进服务器，再决定停不停（DESIGN.md §109）。以前是先 stopAgent 再查：消息早已落库、
+         * 服务器正在回答时，这一步就把正在写的回答掐断了，后面「再多等一会儿」等的是一轮已经被停掉的回答。
+         * 只有没落库（真的挂住了）才停。
+         */
         const stored = await readThreadMessages(
           channel.threadId,
           runtimeAgentId,
@@ -1104,6 +1154,11 @@ export function ChannelChat({
           persisted,
         });
         if (first.kind === "hang") {
+          try {
+            copilotkit.stopAgent({ agent: target });
+          } catch {
+            /* stop best-effort */
+          }
           reportBudgetEvent(first.budget);
           forceUnlockThread(channel.threadId);
           failRef.current(first.reason);
@@ -1140,6 +1195,7 @@ export function ChannelChat({
         await runPromise;
       }
     } finally {
+      runWatch.unsubscribe();
       setRunsInFlight((count) => Math.max(0, count - 1));
     }
     if (!stopRequestedRef.current) await persistFailedFrontendResults(channel.threadId, target.messages);
@@ -1327,6 +1383,9 @@ export function ChannelChat({
       // so the draft behind the turn is restored rather than counted as sent. See `turnFailure`.
       turnFailure.current = message;
       setRunError(message);
+      // 组件卸载后（换机器人）才出的事，重新挂上的聊天从这里读回原因（DESIGN.md §109）。
+      const lastUser = [...agentRef.current.messages].reverse().find((item) => item.role === "user");
+      rememberTurnOutcome(channel.threadId, lastUser?.id ?? null, message);
     };
     failRef.current = fail;
     const subscription = agent.subscribe?.({
@@ -1382,7 +1441,7 @@ export function ChannelChat({
       },
     });
     return () => subscription?.unsubscribe();
-  }, [agent, runtimeAgentId]);
+  }, [agent, runtimeAgentId, channel.threadId]);
 
   /** Stable reference for effects and component callbacks. */
   const sayRef = useRef(say);
@@ -1438,12 +1497,57 @@ export function ChannelChat({
     sendInFlightRef.current = false;
     void setChannelBusy({ channelId: channel.id, busy: false });
     forceUnlockThread(channel.threadId);
+    if (relayStalled) {
+      setRelayStalled(false);
+      setRunError((previous) => (previous === STALLED_RELAY_REASON ? null : previous));
+    }
     try {
       copilotkit.stopAgent({ agent });
     } catch {
       /* stop best-effort */
     }
   };
+
+  /*
+   * 切回来（或刷新后）重新挂上的聊天：上一轮在这页不在时没正常结束，把记下的原因画出来（DESIGN.md §109）。
+   * 只在恢复完历史之后读一次，而且那一轮还得是最后一轮。
+   */
+  useEffect(() => {
+    if (restoring) return;
+    const remembered = turnOutcomeFor(channel.threadId, agentRef.current.messages);
+    if (remembered) setRunError((previous) => previous ?? remembered);
+  }, [restoring, channel.threadId]);
+
+  /*
+   * 这一轮停在一步浏览器操作上，却没有人在执行它（§109）：服务器还在等那一步的结果（最长 25 分钟都算「在回答」），
+   * 可执行它的页面已经刷新 / 关掉了。以前这里只会一直转（切回来时还每 2 秒重接一次，图标来回跳）。
+   * 服务器说在回答、这一页自己没在跑、事件序号 30 秒没动、最后一条是还没有结果的工具调用：说清楚，并给「停止」。
+   * 序号一动（那一步在别处做完了、接着往下写）就收回。
+   */
+  useEffect(() => {
+    let since: { seq: string; at: number } | null = null;
+    const clear = () => {
+      setRelayStalled(false);
+      setRunError((previous) => (previous === STALLED_RELAY_REASON ? null : previous));
+    };
+    return onJoinedActivity((value) => {
+      const local = turnsRef.current > 0 || agentRef.current.isRunning;
+      if (!value.running || local) {
+        if (since) clear();
+        since = null;
+        return;
+      }
+      if (!since || since.seq !== value.seq) {
+        if (since) clear();
+        since = { seq: value.seq, at: Date.now() };
+        return;
+      }
+      if (Date.now() - since.at < STALLED_RELAY_MS) return;
+      if (!hasUnansweredToolCall(agentRef.current.messages)) return;
+      setRelayStalled(true);
+      setRunError((previous) => previous ?? STALLED_RELAY_REASON);
+    });
+  }, [onJoinedActivity]);
 
   /*
    * 重新生成 / 编辑后重发（DESIGN.md §67，CB-042）：服务器先从那条用户消息起截掉（只认本人的对话、没在回答），
@@ -1582,6 +1686,8 @@ export function ChannelChat({
   // 右栏面板（不在这棵组件树里）里的「问一句」发 chisabot-ask 事件（DESIGN.md §29）：发到当前对话。
   useEffect(() => {
     const on = (event: Event) => {
+      // 留着等它答完的那段不是「当前对话」（§109）。
+      if (heldRef.current) return;
       const text = (event as CustomEvent<unknown>).detail;
       if (typeof text === "string") askFromComponent(text);
     };
@@ -1613,9 +1719,12 @@ export function ChannelChat({
   // 计算机状态行在两步之间不退回空闲提示（use-status.ts）。
   const chatBusy = agent.isRunning || turnsInFlight > 0;
   useEffect(() => {
+    if (held) return;
     reportChatRunning(chatBusy);
     return () => reportChatRunning(false);
-  }, [chatBusy]);
+  }, [chatBusy, held]);
+  // 这一轮还没结束：外壳换对话时把这页留着，等它答完再放（DESIGN.md §109）。
+  useMarkChatWorking(channel.id, chatBusy);
   const canResend = !chatBusy && channel.active && !restoring && !modelSaving;
   const messageActions = useMemo(
     () => ({ canAct: canResend, regenerate, edit: editAndResend }),
@@ -1767,7 +1876,10 @@ export function ChannelChat({
                * 不能干等 watchdog。Stop 在无 abortController 时仍清 awaitingReply + stopAgent（best-effort）。
                */
               stoppable={
-                agent.isRunning || runsInFlight > 0 || turnsInFlight > 0
+                agent.isRunning ||
+                runsInFlight > 0 ||
+                turnsInFlight > 0 ||
+                relayStalled
               }
               /*
                * At the END OF THE TRANSCRIPT rather than above the composer, which is where this used to

@@ -10,6 +10,7 @@ import { SettingsSidebar } from "@/components/settings/settings-sidebar";
 import { type LeftMode, modeOfPath } from "@/lib/left-mode";
 import { CHANNEL_ROUTE_ID, ChannelPage } from "@/components/channels/channel-page";
 import { useLanding } from "@/lib/agents/landing";
+import { useWorkingChats } from "@/lib/kept-visible";
 
 /**
  * 登录之后的那一个外壳（DESIGN.md §98）。
@@ -87,6 +88,8 @@ function useChatAddress(): ChatAddress | null {
 
 const sameAddress = (a: ChatAddress, b: ChatAddress) =>
   a.channelId === b.channelId && a.settings === b.settings && a.watch === b.watch;
+/** 同一段对话（设置窗格开关、`?watch` 不算换对话）。 */
+const chatKey = (address: ChatAddress) => address.channelId;
 
 /** 主区：留着的聊天 + 当前路由（`KeepAliveStage`，DESIGN.md §98）。`/` 正在跳到聊天时，留着的聊天照样露着。 */
 function ChatStage({ pathname }: { pathname: string }) {
@@ -95,10 +98,14 @@ function ChatStage({ pathname }: { pathname: string }) {
   const landing = useLanding();
   const landingChannel =
     landing.state === "ready" && landing.target.to === "/channel/$channelId" ? landing.target.params.channelId : null;
+  // 换机器人时，还在回答的那段对话留着等它答完（DESIGN.md §109），不在切走的那一刻把这一轮掐断。
+  const working = useWorkingChats();
   return (
     <KeepAliveStage
       address={address}
       idleVisible={(kept) => pathname === "/" && landingChannel === kept.channelId}
+      keyOf={chatKey}
+      working={working}
       renderKept={(kept, { visible, epoch }) => (
         <ChannelPage
           channelId={kept.channelId}

@@ -94,12 +94,16 @@ export function ActiveBotProvider({ children }: { children: ReactNode }) {
  *
  * Restores what it found on unmount, so leaving a channel does not leave its Bot addressed by
  * whatever mounts next.
+ *
+ * `enabled` false: 这一页还挂着但不是看着的那段（换机器人时它还在回答、被留着等它答完，DESIGN.md §109），
+ * 不声明——否则它最后卸载时会把「现在看着的机器人」还原成它挂上之前的那个。它自己的工具调用照样按
+ * `bindAgentBot` 认机器人，不靠这里。
  */
-export function useActiveBot(botId: string | undefined): void {
+export function useActiveBot(botId: string | undefined, enabled = true): void {
   const holder = useContext(ActiveBotContext);
   const value = useContext(ActiveBotValueContext);
   useEffect(() => {
-    if (!holder) return;
+    if (!holder || !enabled) return;
     const previous = holder instanceof RunScopedHolder ? holder.base : holder.current;
     holder.current = botId ?? DEFAULT_BOT_ID;
     value?.announce(botId ?? DEFAULT_BOT_ID);
@@ -107,7 +111,7 @@ export function useActiveBot(botId: string | undefined): void {
       holder.current = previous;
       value?.announce(previous);
     };
-  }, [holder, value, botId]);
+  }, [holder, value, botId, enabled]);
 }
 
 /** The holder itself, to be read inside a handler at the moment it runs. */

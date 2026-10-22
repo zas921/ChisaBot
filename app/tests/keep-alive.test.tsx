@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { type ReactNode, useEffect, useState } from "react";
 import { KeepAliveStage, type KeptState } from "@/components/layout/keep-alive";
-import { KeptVisibleContext, useBotOnScreen, useKeptVisible, useMarkBotHidden } from "@/lib/kept-visible";
+import { KeptVisibleContext, useBotOnScreen, useKeptHeld, useKeptVisible, useMarkBotHidden } from "@/lib/kept-visible";
 import { useComputerControl } from "@/lib/computers/use-control";
 import { settleReactWork } from "./settle-react-work";
 
@@ -170,6 +170,141 @@ test("接线：聊天路由自己不画东西，外壳只有一个，设置 / �
   expect(page).toContain("if (unseen && visible)");
   // 2026-10-20：JSX 被格式化成了多行，断言改成允许换行（同一件事：藏起来时不登记）。
   expect(page).toMatch(/\{visible \?\s*\(\s*<RegisterBotChat/);
+});
+
+/** 换机器人时，正在回答的那段留着等它答完（DESIGN.md §109）。 */
+function workingStage(
+  Page: (p: { id: string; state: KeptState }) => ReactNode,
+  address: Addr | null,
+  working: ReadonlySet<string>,
+  other?: string,
+) {
+  return (
+    <KeepAliveStage
+      address={address}
+      keyOf={(kept) => kept.id}
+      renderKept={(kept, state) => <Page id={kept.id} state={state} />}
+      same={same}
+      working={working}
+    >
+      {other ? <section data-testid="other">{other}</section> : null}
+    </KeepAliveStage>
+  );
+}
+
+test("换机器人时离开的那段还在回答：不卸载，藏着留下；切回来还是同一个实例", () => {
+  const { log, Page } = counterPage();
+  const busy = new Set(["c1"]);
+  const view = render(workingStage(Page, { id: "c1" }, busy));
+  const first = view.getByText("c1").getAttribute("data-instance");
+
+  view.rerender(workingStage(Page, { id: "c2" }, busy));
+  expect(log.unmounts).toBe(0);
+  expect(log.mounts).toBe(2);
+  const pages = view.getAllByTestId("kept-page");
+  expect(pages).toHaveLength(2);
+  const heldPage = pages.find((page) => page.textContent === "c1")!;
+  expect(heldPage.getAttribute("data-held")).toBe("true");
+  expect(heldPage.getAttribute("data-visible")).toBe("false");
+  expect(heldPage.hasAttribute("inert")).toBe(true);
+  // 叠在主区里，不占位置。
+  expect(heldPage.style.position).toBe("absolute");
+  expect(pages.find((page) => page.textContent === "c2")!.getAttribute("data-visible")).toBe("true");
+
+  // 切回来：c1 还是原来那个（c2 没在回答，放掉）。
+  view.rerender(workingStage(Page, { id: "c1" }, busy));
+  expect(view.getAllByTestId("kept-page")).toHaveLength(1);
+  expect(view.getByText("c1").getAttribute("data-instance")).toBe(first);
+  expect(log.unmounts).toBe(1);
+  expect(log.states.filter((s) => s.id === "c1").at(-1)).toMatchObject({ visible: true });
+});
+
+test("留着的那段答完了：放掉；当前那段不受影响", async () => {
+  const { log, Page } = counterPage();
+  const view = render(workingStage(Page, { id: "c1" }, new Set(["c1"])));
+  view.rerender(workingStage(Page, { id: "c2" }, new Set(["c1"])));
+  expect(view.getAllByTestId("kept-page")).toHaveLength(2);
+  const current = view.getByText("c2").getAttribute("data-instance");
+
+  await act(async () => {
+    view.rerender(workingStage(Page, { id: "c2" }, new Set()));
+  });
+  expect(view.getAllByTestId("kept-page")).toHaveLength(1);
+  expect(view.getByText("c2").getAttribute("data-instance")).toBe(current);
+  expect(log.unmounts).toBe(1);
+});
+
+test("离开的那段没在回答：照旧让出位置（新对话复用它，不多挂一页）", () => {
+  const { log, Page } = counterPage();
+  const view = render(workingStage(Page, { id: "c1" }, new Set()));
+  view.rerender(workingStage(Page, { id: "c2" }, new Set()));
+  expect(view.getAllByTestId("kept-page")).toHaveLength(1);
+  expect(log.mounts).toBe(1);
+  expect(view.getByTestId("page").textContent).toBe("c2");
+});
+
+test("两段都在回答，来回切：两页都留着，DOM 里的先后不变（挪节点会丢滚动位置）", () => {
+  const { Page } = counterPage();
+  const busy = new Set(["c1", "c2"]);
+  const view = render(workingStage(Page, { id: "c1" }, busy));
+  view.rerender(workingStage(Page, { id: "c2" }, busy));
+  const order = () => view.getAllByTestId("kept-page").map((page) => page.textContent);
+  expect(order()).toEqual(["c1", "c2"]);
+  view.rerender(workingStage(Page, { id: "c1" }, busy));
+  expect(order()).toEqual(["c1", "c2"]);
+  expect(view.getAllByTestId("kept-page").find((p) => p.textContent === "c2")!.getAttribute("data-held")).toBe("true");
+});
+
+test("留着的那段读到 held（不声明当前机器人、不收「问一句」），当前那段不是", () => {
+  const seen = new Map<string, boolean>();
+  function Probe({ id }: { id: string }) {
+    seen.set(id, useKeptHeld());
+    return <i>{id}</i>;
+  }
+  const make = (address: Addr) => (
+    <KeepAliveStage
+      address={address}
+      keyOf={(kept) => kept.id}
+      renderKept={(kept) => <Probe id={kept.id} />}
+      same={same}
+      working={new Set(["c1"])}
+    >
+      {null}
+    </KeepAliveStage>
+  );
+  const view = render(make({ id: "c1" }));
+  expect(seen.get("c1")).toBe(false);
+  view.rerender(make({ id: "c2" }));
+  expect(seen.get("c1")).toBe(true);
+  expect(seen.get("c2")).toBe(false);
+});
+
+test("藏在设置后面、还在回答的那段：藏够时间也不放，答完才开始计时", async () => {
+  const { log, Page } = counterPage();
+  const make = (address: Addr | null, working: ReadonlySet<string>) => (
+    <KeepAliveStage
+      address={address}
+      keyOf={(kept) => kept.id}
+      renderKept={(kept, state) => <Page id={kept.id} state={state} />}
+      same={same}
+      ttlMs={30}
+      working={working}
+    >
+      <section>设置</section>
+    </KeepAliveStage>
+  );
+  const view = render(make({ id: "c1" }, new Set(["c1"])));
+  view.rerender(make(null, new Set(["c1"])));
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 80));
+  });
+  expect(view.queryByTestId("kept-page")).not.toBeNull();
+  view.rerender(make(null, new Set()));
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 80));
+  });
+  expect(view.queryByTestId("kept-page")).toBeNull();
+  expect(log.unmounts).toBe(1);
 });
 
 test("藏着的聊天读到「不在屏幕上」（轮询 / 画面据此停下），回来变回在", () => {

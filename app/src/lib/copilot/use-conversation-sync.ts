@@ -62,6 +62,29 @@ export function userOrderDiffers(local: readonly string[], server: readonly stri
 type Connect = (options: { agent: AbstractAgent }) => Promise<unknown>;
 
 /**
+ * 变化戳之间的状态：
+ * - `initial`：刚打开、或本机刚跑完一轮——下一次戳只记基线；服务器在回答而这台没在跟就接上。
+ * - `afterJoin`：刚接完一次——下一次戳只记基线，**不再因为「服务器在回答」接第二次**。
+ * - `steady`：平时。
+ */
+export type SyncPhase = "initial" | "afterJoin" | "steady";
+
+/**
+ * 这次戳要不要（合并式）接上服务器（DESIGN.md §64 / §109）。
+ *
+ * 服务器的「在回答」也包括：上一段 run 以浏览器工具调用结束，正在等浏览器把结果交回来（接力，最长 25 分钟）。
+ * 这时没有在跑的 run，接入一回放完马上结束；以前接完下一次戳又看到「在回答」就再接一次，每 2 秒一回，
+ * 每回都先清空这一轮再按回放重建（2026-10-22 生产：切回来后 07:57:22 / :24 / :26 / :28 各一次 145 KB 的接入，
+ * 「思考中」和停顿小点来回跳）。现在接完之后只在有新东西时再接：事件序号变了（那一步在别处做完、接着往下写了），
+ * 或者服务器从「没在回答」变成「在回答」。
+ */
+export function shouldJoin(phase: SyncPhase, previous: ThreadActivity | null, activity: ThreadActivity): boolean {
+  if (phase === "afterJoin") return false;
+  if (phase === "initial" || !previous) return activity.running;
+  return activity.seq !== previous.seq || (activity.running && !previous.running);
+}
+
+/**
  * 本机自己截断（重新生成 / 编辑后重发，DESIGN.md §67）后服务器回的对话版本。本机已经截好了，同步看到这个
  * 版本时不再重建；别的版本（别的设备截的）才重建。
  */
@@ -203,8 +226,8 @@ export function useConversationSync(
     if (!threadId) return;
     let alive = true;
     let last: ThreadActivity | null = null;
-    /** 下一次同步只记基线（刚打开 / 本机刚跑完一轮或刚接完）。 */
-    let rebase = true;
+    /** 下一次同步只记基线（刚打开 / 本机刚跑完一轮：`initial`；刚接完：`afterJoin`）。 */
+    let phase: SyncPhase = "initial";
     let connecting = false;
     /** 合并式接入时，接入前这台已经有的消息 / 工具调用（回放里它们的内容不再追加一遍）。 */
     let merge: { messages: Set<string>; toolCalls: Set<string> } | null = null;
@@ -228,7 +251,7 @@ export function useConversationSync(
           connecting = false;
           merge = null;
           tail = null;
-          rebase = true;
+          phase = "afterJoin";
         });
     };
     /*
@@ -281,11 +304,12 @@ export function useConversationSync(
         return;
       },
       onRunFinalized: () => {
-        rebase = true;
-        if (!connecting) reconcile();
+        if (connecting) return;
+        phase = "initial";
+        reconcile();
       },
       onRunFailed: () => {
-        rebase = true;
+        if (!connecting) phase = "initial";
       },
     });
     const off = onActivity((activity) => {
@@ -296,27 +320,29 @@ export function useConversationSync(
         // 别的设备重新生成 / 编辑重发截断了这段对话：清空，按服务器回放重建（截掉的气泡、卡片一起消失）。
         rebuildPending = false;
         last = activity;
-        rebase = false;
+        phase = "steady";
         join("rebuild");
         return;
       }
-      if (agent.isRunning || connecting || suppressConnect?.()) {
-        // 本机在跑 / 正在接 / 本机刚点了发送：它收到的就是最新的，等它结束再记基线。
-        rebase = true;
+      if (connecting) return; // 接完会记成 afterJoin
+      if (agent.isRunning || suppressConnect?.()) {
+        // 本机在跑 / 本机刚点了发送：它收到的就是最新的，等它结束再记基线。
+        phase = "initial";
         return;
       }
       const previous = last;
       last = activity;
-      if (rebase || !previous) {
-        rebase = false;
-        // 服务器在回答、这台却没在跟（刚回到前台、刚打开时那一轮还没开始）：接上。
-        if (activity.running) join("merge", true);
+      const current = phase;
+      phase = "steady";
+      if (current !== "steady" || !previous) {
+        // 服务器在回答、这台却没在跟（刚回到前台、刚打开时那一轮还没开始）：接上。刚接完的不再接（§109）。
+        if (shouldJoin(current, previous, activity)) join("merge", true);
         return;
       }
       if (activity.workers !== previous.workers)
         void queryClient.invalidateQueries({ queryKey: workerKeys.thread(threadId) });
       if (activity.inbox !== previous.inbox) void restoreQueue(threadId);
-      if (activity.seq !== previous.seq || activity.running) join("merge", activity.running);
+      if (shouldJoin(current, previous, activity)) join("merge", activity.running);
     });
     return () => {
       alive = false;
