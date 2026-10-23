@@ -12,6 +12,25 @@ import type { AuditInitiator } from "../audit";
 import { HeadlessToolSuspension } from "../computer/headless-tools";
 import { withApprovalContext } from "./types";
 
+/**
+ * 服务端工具执行前要等它的 `TOOL_CALL_END` 先走过 AG-UI 这条线（审批续跑要从消息里找到这次调用）。
+ *
+ * 以前是固定等 2 秒，等不到就报「The native tool call was not emitted through AG-UI.」（2026-10-22）：AI SDK 在模型这一步
+ * 结束后立刻执行工具，而事件要先经 AG-UI 逐条应用（每条都克隆整段消息）才到这里——对话一长、参数事件一多（面板 spec、
+ * 写文件的长内容），事件排队就超过 2 秒，工具被判失败，模型重试照样排队照样失败，面板和工具调用因此「经常失败」。
+ * 现在按「事件停止流动」计时：只要这条线上还有事件在到达，就一直等；静默超过这个时长才算这次调用真的没有发出。
+ */
+export let NATIVE_CALL_IDLE_MS = (() => {
+  const value = Number(process.env.CHISABOT_NATIVE_CALL_IDLE_MS);
+  return Number.isFinite(value) && value >= 1_000 ? Math.floor(value) : 30_000;
+})();
+/** 测试用：缩短静默时限；返回之前的值。 */
+export function setNativeCallIdleMs(ms: number): number {
+  const previous = NATIVE_CALL_IDLE_MS;
+  NATIVE_CALL_IDLE_MS = ms;
+  return previous;
+}
+
 type NativeRun = {
   input: RunAgentInput;
   messages: Message[];
@@ -90,6 +109,7 @@ class NativeApprovalMiddleware extends Middleware {
         {
           resolve(): void;
           reject(error: Error): void;
+          expire(): void;
           timer: ReturnType<typeof setTimeout>;
         }
       >();
@@ -100,15 +120,20 @@ class NativeApprovalMiddleware extends Middleware {
         waitForCall(id) {
           if (captured.has(id)) return Promise.resolve();
           return new Promise<void>((resolve, reject) => {
-            const timer = setTimeout(() => {
+            const expire = () => {
               awaiting.delete(id);
               reject(
                 new Error(
                   "The native tool call was not emitted through AG-UI.",
                 ),
               );
-            }, 2_000);
-            awaiting.set(id, { resolve, reject, timer });
+            };
+            awaiting.set(id, {
+              resolve,
+              reject,
+              expire,
+              timer: setTimeout(expire, NATIVE_CALL_IDLE_MS),
+            });
           });
         },
         suspend(error) {
@@ -167,6 +192,11 @@ class NativeApprovalMiddleware extends Middleware {
                 awaiting.delete(event.toolCallId);
                 pending.resolve();
               }
+            }
+            // 这条线上还有事件在到达：还在排队处理，不是没发出——别的等待者的计时从现在重新算。
+            for (const pending of awaiting.values()) {
+              clearTimeout(pending.timer);
+              pending.timer = setTimeout(pending.expire, NATIVE_CALL_IDLE_MS);
             }
           },
           error: (error) => subscriber.error(error),

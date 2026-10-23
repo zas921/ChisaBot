@@ -2527,12 +2527,15 @@ Stop、失败、重启后，未完成补话在服务端持久暂停。刷新、�
 ### 110.1 查到的
 - **忙闲不一致（网关访问日志）**：同一个对话里，一台设备连着 6 次「重新生成」（`POST /threads/:id/truncate`）收到 409「机器人正在回答」，而这台设备的输入框是空闲的；`/inbox` 回包在 `running:true` 和 `false` 之间隔很久才变。服务器说在回答的有两种：① 有一段运行在写；② 模型段已结束，**前端工具接力**（§107）在等某个页面里的浏览器工具交结果，最长 25 分钟。②时接入（connect）一回放完就结束，这一页没有任何东西在跑，按「空闲」画；执行工具的那一页刷新 / 关掉 / 睡着之后结果永远不会来，别的设备一直看到「在回答」，发消息被塞进收件箱排队（「有任务在跑」），重新生成直接 409。§109 的「接完只在序号变了才再接」又让①里一段没有新事件的长工具调用期间，断掉的接入补不回来。
 - **手机端**：安卓原生客户端只在打开对话时问一次 `/inbox`，之后不再同步：电脑上发起的一轮看不到；自己的 SSE 流因为读超时关掉（一轮可能几分钟没有字节），切网 / 锁屏后半开的连接不会自己报错，手机一直转圈而服务器早已结束；`watch()` 遇到一次网络抖动就整个退出。
-- **做面板 / 调工具失败**：ChisaBot 经 Magpie 用 **OpenAI 兼容协议**连 DeepSeek 一类模型，`connectionLanguageModel` 只在 Anthropic 线路上补输出上限（`outputLimitLanguageModel`），OpenAI 线路不带 `max_tokens`，上游默认只给 4096：面板 spec / 写文件的长内容被截在工具调用参数中间，参数不是完整 JSON，工具拿到空参数或「Invalid input」，模型重试照样被同一个上限截断。服务器日志里 `[CopilotKit] Failed to parse tool arguments` 48 小时 39 次，对得上。另外面板草稿工具（`proposePanelDraft` / `revisePanelDraft`）要求 9 个键一个不能少、多一个也不行，校验失败只回一个裸的错误码（`invalid_definition` / `unsafe_css`……），模型不知道错在哪，12 步都耗在盲改上。服务器日志里以前看不到任何工具失败和输出截断。
-- 没有查到的：数据库里的具体工具错误文本（生产库只读查询被拒，没有绕过），所以上面第三条是由代码 + 日志推出的，不是逐条核对对话得到的；部署后新增的日志（见下）会留下证据。
+- **做面板 / 调工具失败（主因，部署后新增的 `tool-failed` 日志当场抓到）**：反复出现的报错是 `The native tool call was not emitted through AG-UI.`——模型把它转述成「通道报错」，面板的 `panel_create` / `panel_update` 一次一次失败。来源是 `approvals/native-context.ts`：服务端工具执行前要等它的 `TOOL_CALL_END` 先走过 AG-UI，**固定只等 2 秒**。AI SDK 6 在模型这一步结束后立刻执行工具，而事件要先经 AG-UI 的 `runNextWithState`（每个事件都对整段消息和状态做一次深拷贝，再等一次定时器，事件在 `concatMap` 里排队）才到这里：对话一长、推理 / 参数增量一多（思考型模型的推理增量、面板 spec、写文件的长内容），`TOOL_CALL_END` 就远远晚于 2 秒，工具被判失败；模型重试照样排队照样失败（连试三次都不过）。日志里同一时刻 `panel_create` 和 `panel_update` 一起失败（同一步的两个并行调用，计时同时到期），对得上。
+- **另一个会让长参数失败的原因**：`connectionLanguageModel` 只在 Anthropic 线路上补输出上限，OpenAI 兼容线路（ChisaBot → Magpie → DeepSeek）不带 `max_tokens`，上游默认只给 4096，面板 spec / 写文件的长内容可能被截在 JSON 中间。服务器日志里 `[CopilotKit] Failed to parse tool arguments` 48 小时 39 次与此一致（部署后没有再见到 `model-step-abnormal-finish`，所以这条是预防，不是主因）。
+- 面板草稿工具（`proposePanelDraft` / `revisePanelDraft`）要求 9 个键一个不能少、多一个也不行，校验失败只回裸错误码（`invalid_definition` / `unsafe_css`……），模型不知道错在哪，步数都耗在盲改上。
+- 生产库里具体工具错误文本的只读查询被拒（没有绕过）；上面的结论来自代码、网关日志和部署后新增的日志。
 
 ### 110.2 现在
 - **服务器**
   - OpenAI 兼容线路也补输出上限：目录里有就用目录的（封顶 `CHISABOT_MAX_OUTPUT_TOKENS`，默认 32000），没有就用 8192（`CHISABOT_DEFAULT_MAX_OUTPUT_TOKENS`，0 关掉）；claude-* 在这条线路上同样补。上游 400 拒绝我们带的上限时，从报错里读出它说的上限重发一次，读不出就不带重发，并记住——兜底值不会把原本能用的模型弄坏。
+  - **等工具调用的 AG-UI 事件改成按「事件停止流动」计时**（`NATIVE_CALL_IDLE_MS`，默认 30 秒，`CHISABOT_NATIVE_CALL_IDLE_MS` 可调，≥1000）：这条线上还有事件在到达就一直等，静默超过时限才算真的没发出。以前固定 2 秒。
   - 日志：`model-step-abnormal-finish`（`finish=length` 等不是正常收尾）、`tool-failed`（工具名 + 一句原因，不记参数）、`output-limit-rejected`、`frontend-relay-stale`。
   - 前端工具接力的存活判断（`RELAY_STALE_MS` = 150 秒，`CHISABOT_RELAY_STALE_SECONDS` 可调，最小 30）：页面有一轮在进行时每 20 秒 `POST /threads/:id/relay-alive`；报过平安的接力静默超时就放开（收件箱里这一轮读进去的记为「欠着」），长命令不受影响（心跳一直在）；从没报过平安的接力（旧页面）仍按原来的 25 分钟上限。每 30 秒扫一次。
   - `/sync` 和 `/inbox` 回包新增 `live`（服务器上有一段运行在写）/ `waiting`（只剩接力在等浏览器）。`truncate`（重新生成 / 编辑重发）遇到只剩接力时先放开它（等同点停止），不再 409；真有运行在写仍然 409。
@@ -2545,4 +2548,4 @@ Stop、失败、重启后，未完成补话在服务端持久暂停。刷新、�
 - 没动：PC 外壳（`pc/`）没有改动，不需要重打 exe。
 
 ### 110.3 回归
-`server/tests/output-limit.test.ts`（目录上限 / 兜底 / claude 补 / 400 读出上限重发并记住 / 不相关错误不重发）、`server/tests/relay-liveness.test.ts`（接力放开的时限、报平安续命、旧页面不按静默放开）、`server/tests/bot-threads.test.ts`（`live` / `waiting`）、`app/tests/relay-sync.test.ts`（`shouldRejoin`、`pingRelayAlive`）。
+`server/tests/native-call-wait.test.ts`（事件排队总时长超过时限也能等到、事件已走过立刻执行、一直没有事件才报错）、`server/tests/output-limit.test.ts`（目录上限 / 兜底 / claude 补 / 400 读出上限重发并记住 / 不相关错误不重发）、`server/tests/relay-liveness.test.ts`（接力放开的时限、报平安续命、旧页面不按静默放开）、`server/tests/bot-threads.test.ts`（`live` / `waiting`）、`app/tests/relay-sync.test.ts`（`shouldRejoin`、`pingRelayAlive`）。
