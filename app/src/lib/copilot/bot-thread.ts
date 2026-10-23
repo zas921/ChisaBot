@@ -17,6 +17,13 @@ export type ThreadActivity = {
   threadId: string;
   seq: string;
   running: boolean;
+  /**
+   * running 里是哪一种（旧服务器没有这两个字段）：
+   * live = 服务器上有一段运行正在写，接上就能看见；
+   * waiting = 模型段已结束，服务器在等某个页面里的浏览器工具交结果，接上看不到任何东西。
+   */
+  live?: boolean;
+  waiting?: boolean;
   workers: string | null;
   inbox: string | null;
   /** 对话版本（截断过几次，DESIGN.md §67）；旧服务器没有这个字段。 */

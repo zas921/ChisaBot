@@ -84,6 +84,20 @@ export function shouldJoin(phase: SyncPhase, previous: ThreadActivity | null, ac
   return activity.seq !== previous.seq || (activity.running && !previous.running);
 }
 
+/** 接入结束后，服务器上那一段运行还在写、这台却没在跟：至少隔这么久再补接一次。 */
+export const REJOIN_AFTER_MS = 4_000;
+
+/**
+ * 接入断了（网络抖了一下 / 切后台 / 代理断流）而服务器那一段运行还在写：补接上。
+ *
+ * 只认服务器明确说「有一段运行在写」（`live`）：只剩「等浏览器交工具结果」（`waiting`）时接上也看不到任何东西，
+ * 回放一结束马上又断，反复接就是 §109 修掉的那种每 2 秒一次的大回放；旧服务器没有这个字段，当作不知道、不补接。
+ * 以前接完之后只在事件序号变了才再接，一段没有新事件的长工具调用里，这台一直显示「空闲」，而手机上还在转圈。
+ */
+export function shouldRejoin(activity: ThreadActivity, sinceJoinEndedMs: number): boolean {
+  return activity.running && activity.live === true && sinceJoinEndedMs >= REJOIN_AFTER_MS;
+}
+
 /**
  * 本机自己截断（重新生成 / 编辑后重发，DESIGN.md §67）后服务器回的对话版本。本机已经截好了，同步看到这个
  * 版本时不再重建；别的版本（别的设备截的）才重建。
@@ -229,6 +243,8 @@ export function useConversationSync(
     /** 下一次同步只记基线（刚打开 / 本机刚跑完一轮：`initial`；刚接完：`afterJoin`）。 */
     let phase: SyncPhase = "initial";
     let connecting = false;
+    /** 上一次接入结束的时刻（毫秒）；0 = 这次挂载里还没接过。 */
+    let joinEndedAt = 0;
     /** 合并式接入时，接入前这台已经有的消息 / 工具调用（回放里它们的内容不再追加一遍）。 */
     let merge: { messages: Set<string>; toolCalls: Set<string> } | null = null;
     /** liveTail 接入时要按回放重建的那几条（§90.3）。 */
@@ -252,6 +268,7 @@ export function useConversationSync(
           merge = null;
           tail = null;
           phase = "afterJoin";
+          joinEndedAt = Date.now();
         });
     };
     /*
@@ -334,15 +351,17 @@ export function useConversationSync(
       last = activity;
       const current = phase;
       phase = "steady";
+      const rejoin = shouldRejoin(activity, Date.now() - joinEndedAt);
       if (current !== "steady" || !previous) {
-        // 服务器在回答、这台却没在跟（刚回到前台、刚打开时那一轮还没开始）：接上。刚接完的不再接（§109）。
-        if (shouldJoin(current, previous, activity)) join("merge", true);
+        // 服务器在回答、这台却没在跟（刚回到前台、刚打开时那一轮还没开始）：接上。刚接完的不再接（§109），
+        // 除非接入是断掉的、服务器那一段运行还在写（shouldRejoin）。
+        if (shouldJoin(current, previous, activity) || rejoin) join("merge", true);
         return;
       }
       if (activity.workers !== previous.workers)
         void queryClient.invalidateQueries({ queryKey: workerKeys.thread(threadId) });
       if (activity.inbox !== previous.inbox) void restoreQueue(threadId);
-      if (shouldJoin(current, previous, activity)) join("merge", activity.running);
+      if (shouldJoin(current, previous, activity) || rejoin) join("merge", activity.running);
     });
     return () => {
       alive = false;

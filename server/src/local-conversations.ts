@@ -621,7 +621,24 @@ type FrontendRelay = {
   callIds: string[];
   timer: ReturnType<typeof setTimeout>;
   closing?: Promise<void>;
+  /** 执行这些前端工具的页面最近一次报平安的时刻（毫秒）。 */
+  aliveAt: number;
+  /** 这一轮的页面报过平安：之后静默超过 RELAY_STALE_MS 就当它没了（刷新 / 关掉 / 手机锁屏），不干等满 25 分钟。 */
+  watched: boolean;
 };
+
+/**
+ * 浏览器侧工具的接力，执行它的页面多久没报平安就放开（2026-10-22）。
+ *
+ * 前端工具由浏览器执行：模型段结束后服务器保留接力（`frontend`），等页面把工具结果交回来，最长 25 分钟，
+ * 这期间同步接口一直说「在回答」。执行它的页面刷新 / 关掉 / 睡着之后，结果永远不会来：另一台设备看到
+ * 「在回答」却没有任何东西在动（电脑空闲、手机转圈），发消息只会被塞进收件箱排队，重新生成直接 409。
+ * 页面有一轮在进行时每 20 秒 `POST /threads/:id/relay-alive` 一次；静默这么久就放开接力。
+ */
+export const RELAY_STALE_MS = (() => {
+  const seconds = Number(process.env.CHISABOT_RELAY_STALE_SECONDS);
+  return Number.isFinite(seconds) && seconds >= 30 ? Math.floor(seconds * 1000) : 150_000;
+})();
 type LiveEvent = { sequence: bigint; event: BaseEvent };
 type ActiveRun = {
   runId: string;
@@ -662,7 +679,7 @@ const EMPTY_THREAD_READS: Record<string, unknown> = {
 };
 
 /** Public OSS runner with our own PostgreSQL transcript and per-thread lease. */
-class PostgresAgentRunner extends AgentRunner {
+export class PostgresAgentRunner extends AgentRunner {
   private readonly active = new Map<string, ActiveRun>();
   /** Kept between wire runs, until all dispatched frontend results arrive or the turn is stopped. */
   private readonly frontend = new Map<string, FrontendRelay>();
@@ -714,6 +731,50 @@ class PostgresAgentRunner extends AgentRunner {
   /** Includes browser tools running between two server requests in the same logical turn. */
   isActive(threadId: string): boolean {
     return this.active.has(threadId) || this.frontend.has(threadId);
+  }
+
+  /** 服务器上有一段模型 / 服务端工具的运行正在写（不是只在等浏览器交工具结果）。 */
+  isLive(threadId: string): boolean {
+    return this.active.has(threadId);
+  }
+
+  /** 只剩接力：模型段已经结束，服务器在等某个页面里的浏览器工具交结果。 */
+  isRelay(threadId: string): boolean {
+    return !this.active.has(threadId) && this.frontend.has(threadId);
+  }
+
+  /** 每个对话最近一次页面报平安的时刻（接力还没出现时先记着，出现时据此判断有没有人守着）。 */
+  private readonly beats = new Map<string, number>();
+
+  /** 页面有一轮在进行：报平安。返回此刻是否有接力在等（页面据此知道服务器还在等它）。 */
+  touchRelay(threadId: string, now = Date.now()): boolean {
+    this.beats.set(threadId, now);
+    const relay = this.frontend.get(threadId);
+    if (!relay) return false;
+    relay.aliveAt = now;
+    relay.watched = true;
+    return true;
+  }
+
+  /** 页面最近报过平安吗（新出现的接力据此决定要不要按静默时限放开）。 */
+  private heard(threadId: string, now = Date.now()): number | undefined {
+    const at = this.beats.get(threadId);
+    return at !== undefined && now - at <= RELAY_STALE_MS ? at : undefined;
+  }
+
+  /** 放开没有页面守着的接力。返回放开的个数。 */
+  sweepRelays(now = Date.now()): number {
+    let closed = 0;
+    for (const [threadId, relay] of this.frontend) {
+      if (relay.closing || !relay.watched || now - relay.aliveAt <= RELAY_STALE_MS) continue;
+      closed += 1;
+      console.warn(
+        JSON.stringify({ type: "frontend-relay-stale", thread: threadId, silentMs: now - relay.aliveAt }),
+      );
+      void this.closeFrontend(threadId, relay, "owed").catch(() => {});
+    }
+    for (const [threadId, at] of this.beats) if (now - at > 10 * 60_000 && !this.frontend.has(threadId)) this.beats.delete(threadId);
+    return closed;
   }
 
   /** 在进程内旁听一个对话的事件（后台任务卡片读它的步骤）。返回取消函数。 */
@@ -1274,10 +1335,13 @@ class PostgresAgentRunner extends AgentRunner {
             ? this.pendingFrontend(entry, input.tools)
             : [];
           if (callIds.length) {
+            const heardAt = this.heard(threadId);
             const relay: FrontendRelay = {
               runId: entry.runId,
               inboxRunIds: entry.inboxRunIds,
               callIds,
+              aliveAt: heardAt ?? Date.now(),
+              watched: heardAt !== undefined,
               timer: setTimeout(() => {
                 if (this.frontend.get(threadId) !== relay) return;
                 void this.closeFrontend(threadId, relay, "owed").catch(() => {});
@@ -1485,6 +1549,10 @@ export type ThreadWorkerRoutes = {
 /** 进程内能直接问运行器的事（后台任务用）。 */
 export type LocalRunControl = {
   isActive(threadId: string): boolean;
+  /** 服务器上有一段运行正在写（不只是在等浏览器工具的结果）。 */
+  isLive(threadId: string): boolean;
+  /** 只剩「等浏览器交工具结果」的接力。 */
+  isRelay(threadId: string): boolean;
   observe(threadId: string, listener: (event: BaseEvent) => void): () => void;
   stop(request: AgentRunnerStopRequest): Promise<boolean>;
 };
@@ -1726,6 +1794,15 @@ export async function createLocalConversations(
   };
   const runner = new PostgresAgentRunner(store, client, inbox);
   let workers: ThreadWorkerRoutes | undefined;
+  // 没有页面守着的浏览器工具接力（页面刷新 / 关掉 / 睡着）：静默超过 RELAY_STALE_MS 就放开，别让别的设备一直看到「在回答」。
+  const relayTimer = setInterval(() => {
+    try {
+      runner.sweepRelays();
+    } catch (error) {
+      console.warn("sweeping stale frontend relays failed", error);
+    }
+  }, 30_000);
+  relayTimer.unref?.();
 
   const handle = async (
     request: Request,
@@ -1808,7 +1885,7 @@ export async function createLocalConversations(
         if (!identity) return Response.json(EMPTY_THREAD_READS.inbox);
         const requestedAgent = url.searchParams.get("agentId");
         if (requestedAgent && requestedAgent !== identity.agent_id) throw new LocalConversationError("Thread not found", 404);
-        return Response.json({ running: runner.isActive(threadId), paused: await inbox.isPaused(threadId), items: await inbox.list(threadId) });
+        return Response.json({ running: runner.isActive(threadId), waiting: runner.isRelay(threadId), paused: await inbox.isPaused(threadId), items: await inbox.list(threadId) });
       }
       const row = await store.owned({ threadId, userId: actorId });
       const requestedAgent = url.searchParams.get("agentId");
@@ -1846,6 +1923,7 @@ export async function createLocalConversations(
         if (operation === "inbox")
           return Response.json({
             running: runner.isActive(threadId),
+            waiting: runner.isRelay(threadId),
             paused: await inbox.isPaused(threadId),
             items: await inbox.list(threadId),
           });
@@ -1854,6 +1932,10 @@ export async function createLocalConversations(
             workers: workers ? await workers.list(threadId, actorId) : [],
           });
         if (!operation) return Response.json({ thread: record(row) });
+      }
+      if (operation === "relay-alive" && request.method === "POST") {
+        // 页面有一轮在进行时的心跳（见 RELAY_STALE_MS）：只更新内存里的时刻，不碰数据库。
+        return Response.json({ alive: runner.touchRelay(threadId), live: runner.isLive(threadId) });
       }
       if (operation === "truncate" && request.method === "POST") {
         // 重新生成 / 编辑后重发（DESIGN.md §67，CB-042）：从这条用户消息起截掉，客户端随后照常发新的一轮。
@@ -1869,6 +1951,9 @@ export async function createLocalConversations(
           body.mode === "regenerate" || body.mode === "edit"
             ? body.mode
             : "resend";
+        // 只剩「等浏览器交工具结果」的接力：用户明确要重来，就放开它（和点停止一样），不再 409。
+        // 以前执行工具的页面没了之后，这里会一直 409 到接力满 25 分钟，而界面上看着是空闲的。
+        if (runner.isRelay(threadId)) await runner.stop({ threadId }).catch(() => false);
         if (runner.isActive(threadId))
           throw new LocalConversationError(
             "机器人正在回答，等它说完（或先停止）再重发",
@@ -2093,6 +2178,8 @@ export async function createLocalConversations(
   };
   const control: LocalRunControl = {
     isActive: (threadId) => runner.isActive(threadId),
+    isLive: (threadId) => runner.isLive(threadId),
+    isRelay: (threadId) => runner.isRelay(threadId),
     observe: (threadId, listener) => runner.observe(threadId, listener),
     stop: (request) => runner.stop(request),
   };

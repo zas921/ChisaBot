@@ -225,7 +225,10 @@ export function connectionLanguageModel(
   return thinkTagLanguageModel(
     model.provider === "anthropic"
       ? outputLimitLanguageModel(createAnthropic(options)(model.defaultModel), model.defaultModel)
-      : openAiLanguageModel(options, model.defaultModel),
+      : outputLimitLanguageModel(openAiLanguageModel(options, model.defaultModel), model.defaultModel, {
+          includeClaude: true,
+          fallback: DEFAULT_OUTPUT_TOKENS,
+        }),
   );
 }
 
@@ -279,6 +282,43 @@ export function fallbackConnectionModel(model: RuntimeModel, apiKey: string | nu
  * 目录里没有就不动，照旧由 SDK 决定。认得的 Claude 型号 SDK 自己会再压到它的真实上限。
  */
 export const MAX_OUTPUT_CAP = Number(process.env.CHISABOT_MAX_OUTPUT_TOKENS) || 32_000;
+/**
+ * 目录里查不到这个模型的输出上限时，OpenAI 兼容线路也要自己带一个 max_tokens（2026-10-22）。
+ *
+ * 不带的话由上游自己定：DeepSeek 一类的接口默认只给 4096，面板的 spec / 要写进文件的长内容 / 一次说很多话，
+ * 写到一半就被截断（finish=length）。截在一段工具调用的参数中间，参数不是完整 JSON，工具拿到的是空参数或
+ * 「Invalid input」——表现就是「做面板、调工具经常失败」，而且模型换个说法重试照样被同一个上限截断。
+ * 8192 是几乎所有当前对话模型都接受的值；CHISABOT_DEFAULT_MAX_OUTPUT_TOKENS=0 可以关掉这个兜底。
+ */
+export const DEFAULT_OUTPUT_TOKENS = (() => {
+  const raw = process.env.CHISABOT_DEFAULT_MAX_OUTPUT_TOKENS;
+  if (raw === undefined || raw.trim() === "") return 8192;
+  const value = Number(raw);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+})();
+/** 上游 400 说过「max_tokens 最大 N」的模型 → N；说过却读不出 N 的 → null（以后不带）。进程内记着。 */
+const learnedOutputLimits = new Map<string, number | null>();
+export function resetLearnedOutputLimits(): void {
+  learnedOutputLimits.clear();
+}
+/** 上游是不是因为我们带的 max_tokens 拒绝了这次请求（HTTP 400 且报错里提到了输出上限）。 */
+export function rejectedOutputLimit(error: unknown): boolean {
+  const status = (error as { statusCode?: unknown; status?: unknown } | null)?.statusCode ?? (error as { status?: unknown } | null)?.status;
+  if (status !== 400 && status !== 422) return false;
+  return /max[_ ]?(completion[_ ])?tokens|max[_ ]?output|output tokens|maximum.{0,20}(tokens|output)|valid range/i.test(describeError(error));
+}
+/** 从 400 的报错里读出上游允许的上限：取比我们带的小、又像上限的最大数字（如 "valid range of max_tokens is [1, 8192]" → 8192）。 */
+export function allowedOutputLimit(error: unknown, sent: number): number | undefined {
+  const numbers = [...describeError(error).matchAll(/\d[\d,]{2,8}/g)]
+    .map((match) => Number(match[0].replace(/,/g, "")))
+    .filter((value) => Number.isSafeInteger(value) && value >= 1024 && value < sent);
+  return numbers.length ? Math.max(...numbers) : undefined;
+}
+function describeError(error: unknown): string {
+  if (!error || typeof error !== "object") return String(error ?? "");
+  const record = error as { message?: unknown; responseBody?: unknown };
+  return `${typeof record.message === "string" ? record.message : ""} ${typeof record.responseBody === "string" ? record.responseBody : ""}`;
+}
 type OutputLimitResolver = (modelId: string) => Promise<number | undefined>;
 let outputLimitFor: OutputLimitResolver = async () => undefined;
 /** index.ts 接上模型目录。 */
@@ -296,20 +336,49 @@ export async function resolveOutputLimit(modelId: string): Promise<number | unde
     return undefined;
   }
 }
-export function outputLimitLanguageModel<T>(model: T, modelId: string): T {
-  if (!model || typeof model !== "object" || /^claude-/i.test(modelId)) return model;
+export function outputLimitLanguageModel<T>(
+  model: T,
+  modelId: string,
+  options: {
+    /** 线路不认识 Claude 型号（OpenAI 兼容网关后面的 claude-*）时，没有 SDK 替它压上限，同样要补。 */
+    includeClaude?: boolean;
+    /** 目录里没有时的兜底（OpenAI 兼容线路用 DEFAULT_OUTPUT_TOKENS）。 */
+    fallback?: number;
+  } = {},
+): T {
+  if (!model || typeof model !== "object" || (!options.includeClaude && /^claude-/i.test(modelId))) return model;
   const target = model as unknown as Record<string, unknown>;
-  const fill = async (options: unknown) => {
-    const call = options as { maxOutputTokens?: number } | undefined;
-    if (!call || call.maxOutputTokens != null) return options;
-    const limit = await resolveOutputLimit(modelId);
-    return limit ? { ...call, maxOutputTokens: limit } : options;
+  const fill = async (callOptions: unknown) => {
+    const call = callOptions as { maxOutputTokens?: number } | undefined;
+    if (!call || call.maxOutputTokens != null) return callOptions;
+    const learned = learnedOutputLimits.get(modelId);
+    if (learned === null) return callOptions; // 上游拒绝过任何 max_tokens：不再带
+    const limit = learned ?? (await resolveOutputLimit(modelId)) ?? (options.fallback && options.fallback > 0 ? options.fallback : undefined);
+    return limit ? { ...call, maxOutputTokens: limit } : callOptions;
   };
   return new Proxy(model as unknown as object, {
     get(object, property) {
       if ((property === "doStream" || property === "doGenerate") && typeof target[property] === "function") {
         const method = target[property] as (options: unknown) => Promise<unknown>;
-        return async (options: unknown) => method.call(object, await fill(options));
+        return async (callOptions: unknown) => {
+          const filled = await fill(callOptions);
+          try {
+            return await method.call(object, filled);
+          } catch (error) {
+            // 带了我们补的上限却被上游 400 拒绝（上限比这个模型实际允许的大）：从报错里读出它说的上限重发一次，
+            // 读不出来就不带 max_tokens 重发，并记住，不让兜底值把原本能用的模型弄坏。
+            const sent = (filled as { maxOutputTokens?: number } | undefined)?.maxOutputTokens;
+            const original = (callOptions as { maxOutputTokens?: number } | undefined)?.maxOutputTokens;
+            if (sent == null || original != null || !rejectedOutputLimit(error)) throw error;
+            const allowed = allowedOutputLimit(error, sent);
+            learnedOutputLimits.set(modelId, allowed ?? null);
+            console.warn(
+              JSON.stringify({ type: "output-limit-rejected", model: modelId, sent, retryWith: allowed ?? "none" }),
+            );
+            const retry = allowed ? { ...(callOptions as object), maxOutputTokens: allowed } : callOptions;
+            return method.call(object, retry);
+          }
+        };
       }
       // 不传 receiver：模型类的私有字段只认它自己（同 meterLanguageModel）。
       const value = Reflect.get(object, property);
@@ -604,15 +673,22 @@ export function builtInAgentConfiguration(
                 return withStepBudgetNote(`${REFUSAL_MARKER} ${TOOL_STOPPED_ZH}`);
               }
               // 确认卡片要画在这条工具调用下面：把 toolCallId 带给 server/src/confirmations。
-              const result = await withConfirmToolCall(execution?.toolCallId, tool.name, () =>
-                executeNativeApprovalTool(
-                  tool.name,
-                  args,
-                  execution?.toolCallId,
-                  tools.find((granted) => granted.name === tool.name)?.initiator,
-                  () => tool.execute(args, signal ? { signal } : undefined),
-                ),
-              );
+              let result: Awaited<ReturnType<typeof tool.execute>>;
+              try {
+                result = await withConfirmToolCall(execution?.toolCallId, tool.name, () =>
+                  executeNativeApprovalTool(
+                    tool.name,
+                    args,
+                    execution?.toolCallId,
+                    tools.find((granted) => granted.name === tool.name)?.initiator,
+                    () => tool.execute(args, signal ? { signal } : undefined),
+                  ),
+                );
+              } catch (error) {
+                noteToolFailure(tool.name, error);
+                throw error;
+              }
+              if (typeof result === "string" && result.startsWith(REFUSAL_MARKER)) noteToolFailure(tool.name, result);
               // 步数快用完时提醒收尾（§101）；面板还没交上去时提醒的是「马上 panel_update」（2026-10-21）。
               return withStepBudgetNote(result, undefined, { tool: tool.name, panelRefresh: panelRefreshRun });
             },
@@ -621,6 +697,18 @@ export function builtInAgentConfiguration(
         }
       : {}),
   };
+}
+
+/**
+ * 工具这一步没成（抛错，或交回了「没有执行 / 被拒」的话）：留一行日志，只有工具名和一句原因，不记参数。
+ * 以前服务器日志里看不到任何工具失败，只能靠对话里模型转述（「又遇到了那个报错」）去猜。
+ */
+export function noteToolFailure(tool: string, failure: unknown): void {
+  const text = (failure instanceof Error ? failure.message : String(failure))
+    .replace(REFUSAL_MARKER, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  console.warn(JSON.stringify({ type: "tool-failed", tool, reason: text.slice(0, 200) }));
 }
 
 /**

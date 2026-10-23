@@ -53,6 +53,8 @@ import {
   SEND_WATCHDOG_MS,
   settleDroppedTurn,
   storedTurnAnswered,
+  pingRelayAlive,
+  RELAY_ALIVE_INTERVAL_MS,
 } from "@/lib/copilot/connection-drop";
 import { ConversationProvider } from "@/lib/copilot/conversation";
 import { frontendToolProgressAt } from "@/lib/copilot/frontend-tool-activity";
@@ -880,6 +882,13 @@ export function ChannelChat({
   const [runError, setRunError] = useState<string | null>(null);
   /** 服务器说这一轮还在、却停在一步没人执行的浏览器操作上（§109）：给「停止」，并说清原因。 */
   const [relayStalled, setRelayStalled] = useState(false);
+  /**
+   * 服务器说这一轮还在进行、而这一页自己没在跑（别的设备发的、或执行浏览器工具的页面不是这一页）。
+   * 以前这时输入框显示「空闲」：手机上还在转圈、电脑看着可以发，发出去被塞进收件箱排队，
+   * 「重新生成」直接 409（2026-10-22 手机和电脑忙闲不一致）。现在这一页也显示在回答中，可以停止。
+   * `waiting`：服务器只是在等别处的浏览器工具交结果（接上也看不到东西）。
+   */
+  const [remoteBusy, setRemoteBusy] = useState<{ waiting: boolean } | null>(null);
   const awaitingReply = useRef(false);
   /**
    * 这一轮最后一次「确实动了」的时刻（DESIGN.md §100 / DOG-01）。
@@ -1497,6 +1506,7 @@ export function ChannelChat({
     sendInFlightRef.current = false;
     void setChannelBusy({ channelId: channel.id, busy: false });
     forceUnlockThread(channel.threadId);
+    setRemoteBusy(null);
     if (relayStalled) {
       setRelayStalled(false);
       setRunError((previous) => (previous === STALLED_RELAY_REASON ? null : previous));
@@ -1548,6 +1558,40 @@ export function ChannelChat({
       setRunError((previous) => previous ?? STALLED_RELAY_REASON);
     });
   }, [onJoinedActivity]);
+
+  /*
+   * 服务器说在进行、这一页没在跑：显示「回答中」。连续两次戳都这样才算（本机一轮刚结束时服务器还在收尾的
+   * 那一两秒、接入刚断到补接上之间，不闪一下）。接入还在往下写时 `agent.isRunning` 本来就是真的，这里不插手。
+   */
+  useEffect(() => {
+    let seen = 0;
+    setRemoteBusy(null);
+    return onJoinedActivity((value) => {
+      const local = turnsRef.current > 0 || agentRef.current.isRunning;
+      if (!value.running || local) {
+        seen = 0;
+        setRemoteBusy((previous) => (previous ? null : previous));
+        return;
+      }
+      seen += 1;
+      if (seen < 2) return;
+      const waiting = value.waiting === true;
+      setRemoteBusy((previous) => (previous?.waiting === waiting ? previous : { waiting }));
+    });
+  }, [onJoinedActivity]);
+
+  /*
+   * 这一页有一轮在进行（包括浏览器工具在跑）：每 20 秒向服务器报一次平安。服务器在两段模型运行之间保留
+   * 「等浏览器工具交结果」的接力；执行工具的这一页刷新 / 关掉 / 睡着之后，结果永远不会来，没有这个心跳就要干等满
+   * 25 分钟，期间别的设备一直看到「在回答」。报过平安的接力，静默 150 秒服务器就放开。
+   */
+  const turnActive = turnsInFlight > 0;
+  useEffect(() => {
+    if (!turnActive) return;
+    pingRelayAlive(channel.threadId);
+    const timer = setInterval(() => pingRelayAlive(channel.threadId), RELAY_ALIVE_INTERVAL_MS);
+    return () => clearInterval(timer);
+  }, [turnActive, channel.threadId]);
 
   /*
    * 重新生成 / 编辑后重发（DESIGN.md §67，CB-042）：服务器先从那条用户消息起截掉（只认本人的对话、没在回答），
@@ -1718,6 +1762,8 @@ export function ChannelChat({
   useReportBusy(`chat:${channel.id}`, agent.isRunning || turnsInFlight > 0);
   // 计算机状态行在两步之间不退回空闲提示（use-status.ts）。
   const chatBusy = agent.isRunning || turnsInFlight > 0;
+  // 这一页自己没在跑、服务器说在进行：输入框也是「回答中」，可以停止、重新生成 / 编辑不可用（不然只会撞 409）。
+  const anyBusy = chatBusy || remoteBusy !== null;
   useEffect(() => {
     if (held) return;
     reportChatRunning(chatBusy);
@@ -1725,7 +1771,7 @@ export function ChannelChat({
   }, [chatBusy, held]);
   // 这一轮还没结束：外壳换对话时把这页留着，等它答完再放（DESIGN.md §109）。
   useMarkChatWorking(channel.id, chatBusy);
-  const canResend = !chatBusy && channel.active && !restoring && !modelSaving;
+  const canResend = !anyBusy && channel.active && !restoring && !modelSaving;
   const messageActions = useMemo(
     () => ({ canAct: canResend, regenerate, edit: editAndResend }),
     [canResend, regenerate, editAndResend],
@@ -1758,7 +1804,7 @@ export function ChannelChat({
               contextControl={
                 <ContextMeter
                   agentId={runtimeAgentId}
-                  running={agent.isRunning || turnsInFlight > 0}
+                  running={anyBusy}
                   threadId={channel.threadId}
                 />
               }
@@ -1772,7 +1818,7 @@ export function ChannelChat({
                * and `agent.isRunning` alone leaves that gap unmarked — which is the one moment the
                * "Thinking" line exists for. Same value as `pending`, deliberately.
                */
-              busy={agent.isRunning || turnsInFlight > 0}
+              busy={anyBusy}
               // The `/` menu exposes only skills granted to this Bot.
               commands={skillCommands}
               // Readiness is handled by `say`; deletion is the only disabled-chat state.
@@ -1822,6 +1868,14 @@ export function ChannelChat({
                       {"这个机器人已被删除。对话还能看，但它不会再回复。"}
                     </p>
                   )}
+                  {remoteBusy?.waiting && !chatBusy ? (
+                    <p
+                      className="pb-2 text-sm text-muted-foreground"
+                      role="status"
+                    >
+                      {"这一轮在等另一处（比如另一台设备上的浏览器操作）把结果交回来。太久没动静会自动放开，也可以点「停止」。"}
+                    </p>
+                  ) : null}
                 </>
               }
               onSubmit={async (draft) => {
@@ -1846,7 +1900,7 @@ export function ChannelChat({
 
                 // §94.7：提交这一刻机器人还在回答 → 这一句是接着聊，不翻页。busy 在按下发送的同时就变 true，
                 // 等这条消息落地、出现在列表里时它已经是 true 了，那时候再判会把每一次发送都当成「回答中」。
-                noteSendWhileBusy(agent.isRunning || turnsInFlight > 0);
+                noteSendWhileBusy(anyBusy);
                 await say(draft.text, skillInstructions, draft.attachments);
               }}
               /**
@@ -1860,7 +1914,7 @@ export function ChannelChat({
                * middle of an answer: a second turn racing the first on one thread, with a fabricated
                * result stitched over a tool call that is still executing.
                */
-              pending={agent.isRunning || turnsInFlight > 0}
+              pending={anyBusy}
               /*
                * A channel outlives its turns, so it is the screen where waiting is worth offering. A
                * correction typed mid-answer is held here, in this tab, and runs as one follow-up turn the
@@ -1879,6 +1933,7 @@ export function ChannelChat({
                 agent.isRunning ||
                 runsInFlight > 0 ||
                 turnsInFlight > 0 ||
+                remoteBusy !== null ||
                 relayStalled
               }
               /*

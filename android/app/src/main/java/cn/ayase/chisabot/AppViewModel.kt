@@ -231,7 +231,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun back(): Boolean {
         if (stack.size <= 1) return false
         val top = stack.removeAt(stack.lastIndex)
-        if (top is Screen.Chat) stopWatching()
+        if (top is Screen.Chat) { stopWatching(); stopSync() }
+        // 从设置 / 面板等页面回到聊天：重新开始看服务器上这一轮的忙闲
+        (stack.lastOrNull() as? Screen.Chat)?.let { startSync(it.bot) }
         return true
     }
 
@@ -380,6 +382,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         confirms = emptyMap(); files.clear(); confirmJob?.cancel()
         push(Screen.Chat(bot))
         loadChat(bot)
+        startSync(bot)
     }
 
     fun loadChat(bot: Bot) {
@@ -418,20 +421,67 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             val api = api ?: return@launch
             running = true
             kickConfirms()
+            // 网络抖一下（手机切网 / 锁屏回来）不算这一轮结束：连续失败 4 次才放弃，之后由 startSync 再接上
+            var failures = 0
             try {
                 while (true) {
                     delay(1500)
                     if (chatBot?.id != bot.id || threadId != t) break
-                    val hist = api.get("/api/copilotkit/threads/$t/messages").a("messages") ?: break
-                    messages = parseHistory(hist)
-                    val inbox = api.get("/api/copilotkit/threads/$t/inbox")
-                    if (inbox["running"]?.toString() != "true") break
+                    try {
+                        val hist = api.get("/api/copilotkit/threads/$t/messages").a("messages") ?: break
+                        messages = parseHistory(hist)
+                        val inbox = api.get("/api/copilotkit/threads/$t/inbox")
+                        if (inbox["running"]?.toString() != "true") break
+                        failures = 0
+                    } catch (e: CancellationException) { throw e }
+                    catch (_: Exception) { if (++failures >= 4) break }
                 }
             } catch (_: Exception) { } finally { running = false }
         }
     }
 
     private fun stopWatching() { watchJob?.cancel(); watchJob = null }
+
+    private var syncJob: Job? = null
+    /** 本机自己这一轮是从什么时候开始的（毫秒）；给「流卡死了」的判断留出服务器还没记上锁的头几秒。 */
+    private var turnStartedAt = 0L
+
+    private fun stopSync() { syncJob?.cancel(); syncJob = null }
+
+    /**
+     * 聊天页开着时每 3 秒问服务器这段对话是不是在回答，让手机和电脑的忙闲对得上：
+     *  - 本机空闲、服务器在回答（电脑上发的 / 刚才断线了）：接上旁观（watch），按钮变「停止」，不会再点发送撞上「还有任务在跑」；
+     *  - 本机以为自己在跑（流还开着）、服务器连续 3 次说没有：那条流其实早就断了（切网 / 锁屏后半开的连接，
+     *    读超时是关掉的，不会自己报错），手机上一直转圈而电脑已经空闲。主动断开、把服务器存下的对话读回来。
+     */
+    private fun startSync(bot: Bot) {
+        stopSync()
+        syncJob = viewModelScope.launch {
+            var idleWhileRunning = 0
+            while (chatBot?.id == bot.id && screen is Screen.Chat) {
+                delay(3000)
+                val api = api ?: break
+                val t = threadId ?: continue
+                val inbox = runCatching { api.get("/api/copilotkit/threads/$t/inbox") }.getOrNull() ?: continue
+                val serverRunning = inbox["running"]?.toString() == "true"
+                if (watchJob?.isActive == true) { idleWhileRunning = 0; continue }
+                if (!running) {
+                    idleWhileRunning = 0
+                    if (serverRunning && !turnPreparing && chatBot?.id == bot.id && threadId == t) watch(bot, t)
+                } else if (serverRunning || stopping) {
+                    idleWhileRunning = 0
+                } else if (System.currentTimeMillis() - turnStartedAt >= 12_000 && ++idleWhileRunning >= 3) {
+                    idleWhileRunning = 0
+                    liveCall?.cancel()
+                    runJob?.cancel()
+                    running = false
+                    runCatching { api.get("/api/copilotkit/threads/$t/messages").a("messages") }.getOrNull()?.let {
+                        if (threadId == t) messages = parseHistory(it)
+                    }
+                }
+            }
+        }
+    }
 
     /** 这段对话的会话（频道）：没有就先建一个一对一的（POST /api/channels）。附件要先有会话才能上传。 */
     private suspend fun ensureChannel(api: Api, bot: Bot): Pair<String, String> {
@@ -486,6 +536,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         messages = messages + userMsg
         running = true
         stopping = false
+        turnStartedAt = System.currentTimeMillis()
         runJob = viewModelScope.launch { runTurn(api, bot, t, userMsg) }
         kickConfirms()
     }
@@ -818,7 +869,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         workStarted.clear(); workEnded.clear(); confirms = emptyMap(); files.clear()
     }
 
-    private fun stopRun() { liveCall?.cancel(); runJob?.cancel(); stopWatching(); running = false }
+    private fun stopRun() { liveCall?.cancel(); runJob?.cancel(); stopWatching(); stopSync(); running = false }
 
     // ---------- 设置（原生基础部分）：外观、账号、服务器、设备（只读） ----------
 

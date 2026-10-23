@@ -73,7 +73,37 @@ function record(usage: unknown, model: string | undefined, attribution: UsageAtt
   if (meter) meter.last = { ...step, ...(model ? { model } : {}) };
 }
 
-type StreamResult = { stream: ReadableStream<unknown> } & Record<string, unknown>;
+/** AI SDK 两代的 finishReason：字符串，或 `{ unified, raw }`。 */
+export function finishReasonOf(value: unknown): string | undefined {
+  if (typeof value === "string") return value;
+  if (value && typeof value === "object") {
+    const unified = (value as { unified?: unknown }).unified;
+    if (typeof unified === "string") return unified;
+  }
+  return undefined;
+}
+
+/**
+ * 这一步不是正常说完 / 正常发起工具调用就收尾：留一行日志（2026-10-22）。
+ *
+ * 最要紧的是 `length`：输出被上限截断。截在工具调用的参数中间，参数不是完整 JSON，工具调用就「失败」，
+ * 面板、写文件这类长参数最容易遇到。以前这件事在日志里没有任何痕迹，只能从用户的抱怨里倒推。
+ */
+export function noteAbnormalFinish(reason: unknown, usage: unknown, model: string | undefined): void {
+  const finish = finishReasonOf(reason);
+  if (!finish || finish === "stop" || finish === "tool-calls" || finish === "tool_calls") return;
+  const step = readStepUsage(usage);
+  console.warn(
+    JSON.stringify({
+      type: "model-step-abnormal-finish",
+      finish,
+      ...(model ? { model } : {}),
+      ...(step ? { inputTokens: step.inputTokens, outputTokens: step.outputTokens } : {}),
+    }),
+  );
+}
+
+type StreamResult ={ stream: ReadableStream<unknown> } & Record<string, unknown>;
 type MeterableModel = {
   modelId?: string;
   doStream?: (options: unknown) => PromiseLike<StreamResult>;
@@ -97,10 +127,13 @@ export function meterLanguageModel<T>(model: T, attribution?: UsageAttribution):
           const stream = result.stream.pipeThrough(
             new TransformStream<unknown, unknown>({
               transform(part, controller) {
-                const chunk = part as { type?: string; usage?: unknown; modelId?: unknown };
+                const chunk = part as { type?: string; usage?: unknown; modelId?: unknown; finishReason?: unknown };
                 if (chunk?.type === "response-metadata" && typeof chunk.modelId === "string")
                   responseModel = chunk.modelId;
-                if (chunk?.type === "finish") record(chunk.usage, responseModel ?? target.modelId, attribution);
+                if (chunk?.type === "finish") {
+                  record(chunk.usage, responseModel ?? target.modelId, attribution);
+                  noteAbnormalFinish(chunk.finishReason, chunk.usage, responseModel ?? target.modelId);
+                }
                 controller.enqueue(part);
               },
             }),

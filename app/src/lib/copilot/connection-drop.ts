@@ -300,6 +300,29 @@ export function reportBudgetEvent(
   }
 }
 
+/** 页面有一轮在进行时多久向服务器报一次平安（服务器静默 150 秒就放开等不到结果的浏览器工具接力）。 */
+export const RELAY_ALIVE_INTERVAL_MS = 20_000;
+
+/**
+ * 报平安：「这个对话在这一页上有一轮正在进行（包括浏览器工具在跑）」。
+ *
+ * 浏览器工具由这一页执行，服务器在两段模型运行之间保留接力等它交结果；这一页刷新 / 关掉 / 睡着之后，
+ * 结果永远不会来，别的设备会一直看到「在回答」，重新生成直接 409（2026-10-22 手机和电脑忙闲不一致）。
+ * 报了平安的接力，服务器静默超过时限才放开；一直报就一直留着，长命令不受影响。失败忽略。
+ */
+export function pingRelayAlive(threadId: string, fetchImpl: typeof fetch = fetch): void {
+  if (!threadId) return;
+  try {
+    void fetchImpl(`/api/copilotkit/threads/${encodeURIComponent(threadId)}/relay-alive`, {
+      method: "POST",
+      credentials: "include",
+      keepalive: true,
+    }).catch(() => {});
+  } catch {
+    /* ignore */
+  }
+}
+
 /**
  * Track B：看门狗超时或用户点停止后，确保服务器端锁也放下。
  * CopilotKit stopAgent 管本进程 active run；这条补「无内存条目却仍占锁」的孤儿，

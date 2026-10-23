@@ -174,8 +174,10 @@ export class PanelError extends Error {
   constructor(
     public readonly code: string,
     public readonly status = 409,
+    /** 给模型 / 日志看的具体原因；只进 message，`code` 不变（接口和界面都按 code 认）。 */
+    detail?: string,
   ) {
-    super(code);
+    super(detail ? `${code}（${detail}）` : code);
     this.name = "PanelError";
   }
 }

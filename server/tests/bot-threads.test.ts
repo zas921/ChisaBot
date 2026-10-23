@@ -114,6 +114,20 @@ describe("bot thread pointer", () => {
     expect(reply.thread).toEqual({ threadId: "t1", seq: "42", running: true, workers: null, inbox: null, revision: "3" });
   });
 
+  test("sync 说明在回答的是哪一种：服务器在写（live），还是只在等浏览器交工具结果（waiting）", async () => {
+    const database = fakeDatabase({ t1: { owner_user_id: "u1", agent_id: "bot-a" }, t2: { owner_user_id: "u1", agent_id: "bot-a" } }, { t1: 5, t2: 6 });
+    const threads = await createBotThreads(database, {
+      isActive: (id) => id === "t1" || id === "t2",
+      isLive: (id) => id === "t1",
+      isRelay: (id) => id === "t2",
+    });
+    const routes = threads.routes(asUser("u1"));
+    const live = (await (await routes.request("/bot-a/sync?threadId=t1")).json()).thread;
+    expect(live).toMatchObject({ running: true, live: true, waiting: false });
+    const waiting = (await (await routes.request("/bot-a/sync?threadId=t2")).json()).thread;
+    expect(waiting).toMatchObject({ running: true, live: false, waiting: true });
+  });
+
   test("sync on a brand-new thread (no row yet) is an empty, idle conversation", async () => {
     const routes = await app(fakeDatabase());
     const reply = await (await routes.request("/bot-a/sync?threadId=t-fresh")).json();

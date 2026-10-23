@@ -176,7 +176,7 @@ export class HeadlessToolsMiddleware extends Middleware {
           if (subscriber.closed || failed) return;
           if (!terminal)
             throw new Error(
-              "The headless agent ended without a terminal event.",
+              "The headless agent ended without a terminal event (the model connection closed before the turn finished).",
             );
           const answered = new Set(
             messages.flatMap((message) =>

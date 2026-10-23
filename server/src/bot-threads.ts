@@ -27,13 +27,28 @@ import type { Database } from "./db/client";
 const THREAD_ID = /^[A-Za-z0-9_.:-]{1,200}$/;
 const AGENT_ID = /^[A-Za-z0-9_.:-]{1,200}$/;
 
-export type BotThreadRunControl = { isActive(threadId: string): boolean };
+export type BotThreadRunControl = {
+  isActive(threadId: string): boolean;
+  /** 服务器上有一段运行正在写。旧的控制对象没有这个，当作「不知道」。 */
+  isLive?(threadId: string): boolean;
+  /** 只剩「等浏览器交工具结果」的接力。 */
+  isRelay?(threadId: string): boolean;
+};
 
 export type BotThreadActivity = {
   threadId: string;
   /** 这条对话最后一个已存事件的序号（字符串，bigint）。"0" = 还没有事件。 */
   seq: string;
   running: boolean;
+  /**
+   * running 里是哪一种（2026-10-22，手机和电脑「忙闲不一致」）：
+   * live = 服务器上有一段运行正在写，别的设备接上它就能看见；
+   * waiting = 模型段已经结束，服务器在等某个页面里的浏览器工具交结果，这时接上看不到任何东西，
+   * 只能等执行它的页面交结果（页面没了就由服务器放开）或者点停止。
+   * 两个都是 false 而 running 为 true：只剩数据库里还没过期的锁。
+   */
+  live?: boolean;
+  waiting?: boolean;
   /** 后台任务卡片最后一次变化（ISO），没有任务为 null。 */
   workers: string | null;
   /** 收件箱（排队消息）最后一次变化（ISO），没有为 null。 */
@@ -157,7 +172,16 @@ export async function createBotThreads(database: Database, control?: BotThreadRu
     } catch {
       // 截断没启用（没有这张表）。
     }
-    return { threadId, seq, running: Boolean(control?.isActive(threadId)) || locked, workers, inbox, revision };
+    return {
+      threadId,
+      seq,
+      running: Boolean(control?.isActive(threadId)) || locked,
+      ...(control?.isLive ? { live: Boolean(control.isLive(threadId)) } : {}),
+      ...(control?.isRelay ? { waiting: Boolean(control.isRelay(threadId)) } : {}),
+      workers,
+      inbox,
+      revision,
+    };
   }
 
   /** 「历史对话」（DESIGN.md §42.6）：最近 30 条有消息的对话，新的在前。 */
