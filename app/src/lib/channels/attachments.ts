@@ -8,6 +8,8 @@
 export {
   ACCEPTED_IMAGE_MIME,
   ACCEPTED_TEXT_MIME,
+  ACCEPTED_FILE_MIME,
+  COMMON_FILE_EXTENSIONS,
   type AttachmentKind,
   type AttachmentPart,
   type AttachmentSource,
@@ -16,9 +18,11 @@ export {
   MAX_ATTACHMENTS_PER_MESSAGE,
   MAX_EXTRACTED_CHARACTERS,
   MAX_FILE_BYTES,
+  MAX_DOCUMENT_BYTES,
   MAX_IMAGE_BYTES,
   mayBeTruncatedForModel,
   mediaTypeOf,
+  mimeForFilename,
   namesNoFormat,
   shouldClaimPaste,
 } from "../../../../shared/attachments";

@@ -3,6 +3,9 @@ import {
   ACCEPTED_TEXT_MIME,
   mediaTypeOf,
   namesNoFormat,
+  ACCEPTED_FILE_MIME,
+  isTextMime,
+  mimeForFilename,
 } from "../../../shared/attachments";
 
 /**
@@ -127,7 +130,11 @@ function isValidUtf8(bytes: Uint8Array): boolean {
  * composer screens against the same one, and `MIME_BY_LOWER_CLAIM`, at the top
  * of this file.
  */
-export function sniffMimeType(bytes: Uint8Array, claimed: string): string {
+export function sniffMimeType(
+  bytes: Uint8Array,
+  claimed: string,
+  filename = "",
+): string {
   /*
    * A file with no bytes corroborates nothing, and every accepted answer
    * below is earned from content: an image signature, or bytes that decode
@@ -165,6 +172,49 @@ export function sniffMimeType(bytes: Uint8Array, claimed: string): string {
    * idempotent.
    */
   const normalizedClaim = mediaTypeOf(claimed);
+  const hint = mimeForFilename(filename);
+  const binaryType =
+    (hint && ACCEPTED_FILE_MIME.includes(hint) ? hint : undefined) ??
+    normalizedClaim;
+  const signature = Buffer.from(bytes.subarray(0, 512));
+  if (signature.subarray(0, 5).toString("ascii") === "%PDF-")
+    return "application/pdf";
+  if (
+    hasSignature(bytes, [0x50, 0x4b, 0x03, 0x04]) ||
+    hasSignature(bytes, [0x50, 0x4b, 0x05, 0x06])
+  ) {
+    return ACCEPTED_FILE_MIME.includes(binaryType) &&
+      /(?:openxmlformats|macroenabled|opendocument)/.test(binaryType)
+      ? binaryType
+      : "application/zip";
+  }
+  if (hasSignature(bytes, [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1])) {
+    if (/(?:openxmlformats|macroenabled)/.test(binaryType)) return binaryType;
+    return [
+      "application/msword",
+      "application/vnd.ms-excel",
+      "application/vnd.ms-powerpoint",
+    ].includes(binaryType)
+      ? binaryType
+      : "application/octet-stream";
+  }
+  if (signature.subarray(0, 5).toString("ascii") === "{\\rtf")
+    return "application/rtf";
+  if (hasSignature(bytes, [0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c]))
+    return "application/x-7z-compressed";
+  if (signature.subarray(0, 4).toString("ascii") === "Rar!")
+    return "application/vnd.rar";
+  if (hasSignature(bytes, [0x1f, 0x8b])) return "application/gzip";
+  if (signature.subarray(257, 262).toString("ascii") === "ustar")
+    return "application/x-tar";
+  if (signature.subarray(0, 3).toString("ascii") === "BZh")
+    return "application/x-bzip2";
+  if (hasSignature(bytes, [0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00]))
+    return "application/x-xz";
+  if (binaryType.startsWith("audio/") || binaryType.startsWith("video/"))
+    return binaryType;
+  if (ACCEPTED_FILE_MIME.includes(binaryType))
+    return "application/octet-stream";
 
   /*
    * A text claim this app accepts is corroborated the only way text can be:
@@ -183,7 +233,7 @@ export function sniffMimeType(bytes: Uint8Array, claimed: string): string {
    * does and for the same reason: falling through to the guesses further
    * down would let a refused claim try its luck under a different name.
    */
-  if (MIME_BY_LOWER_CLAIM.has(normalizedClaim)) {
+  if (MIME_BY_LOWER_CLAIM.has(normalizedClaim) || isTextMime(normalizedClaim)) {
     return isValidUtf8(bytes) ? normalizedClaim : "application/octet-stream";
   }
 
@@ -226,6 +276,7 @@ export function sniffMimeType(bytes: Uint8Array, claimed: string): string {
   // asks the identical one before it refuses a pick: a list kept twice is a
   // list that drifts, and the drift here is a file one side takes and the
   // other turns away.
+  if (hint === "text/plain" && isValidUtf8(bytes)) return "text/plain";
   if (!namesNoFormat(normalizedClaim)) {
     return normalizedClaim;
   }

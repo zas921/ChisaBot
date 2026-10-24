@@ -4,7 +4,7 @@ import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { serveStatic } from "hono/bun";
 import { compress } from "hono/compress";
-import { MAX_IMAGE_BYTES } from "../../shared/attachments";
+import { MAX_DOCUMENT_BYTES } from "../../shared/attachments";
 import type { PanelServices } from "./panels/service";
 import {
   authoriseAgentCall,
@@ -147,7 +147,7 @@ const MULTIPART_FRAMING_ALLOWANCE = 64 * 1024;
  * door exists to stop is the 2GB body, and it still does.
  */
 export const UPLOAD_BODY_LIMIT_BYTES =
-  MAX_IMAGE_BYTES + MULTIPART_FRAMING_ALLOWANCE;
+  MAX_DOCUMENT_BYTES + MULTIPART_FRAMING_ALLOWANCE;
 
 /**
  * One row for something an administrator did to somebody's access.
@@ -1265,7 +1265,7 @@ export function createApp(
             {
               // The same rounding as `megabytes` in channels/attachments.ts, so the door and the
               // handler name one limit in one voice.
-              error: `That upload is larger than the ${(MAX_IMAGE_BYTES / (1024 * 1024)).toFixed(0)}MB limit.`,
+              error: `That upload is larger than the ${(MAX_DOCUMENT_BYTES / (1024 * 1024)).toFixed(0)}MB limit.`,
             },
             413,
           ),

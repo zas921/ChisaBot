@@ -40,6 +40,12 @@ jobs:
       # Hoisted, like the image (Dockerfile): shared/ is not a workspace and imports zod / @json-render
       # from the app and server trees; under the isolated linker those don't resolve from shared/.
       - run: bun install --frozen-lockfile --linker hoisted
+      - name: Common document attachment readers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-openpyxl python3-pypdf antiword catdoc p7zip-full
+          python3 server/tests/file-extraction_test.py
+          bun test shared/attachments.test.ts server/tests/attachment-mime.test.ts server/tests/attachment-parts.test.ts server/tests/common-file-attachments.test.ts app/tests/composer-attachments.test.ts
       - run: cp .env.example .env
       - run: node scripts/check-zh-localization.cjs
       - run: bun run --cwd server typecheck

@@ -1140,8 +1140,8 @@ export function Composer({
            */
           mayTruncate:
             attachment.status !== "uploading" &&
-            attachment.size !== undefined &&
-            mayBeTruncatedForModel(attachment.size),
+            (classifyAttachment(attachment.source?.mimeType ?? "") === "file" ||
+              (attachment.size !== undefined && mayBeTruncatedForModel(attachment.size))),
         })),
     [staged],
   );

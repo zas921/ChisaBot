@@ -479,7 +479,7 @@ describe("what a stored attachment becomes is decided by its bytes, not by the p
       partOf("document", "pdf1", "invoice.pdf"),
       loadFrom({
         pdf1: {
-          mimeType: "application/pdf",
+          mimeType: "application/x-unsupported",
           name: "invoice.pdf",
           bytes: Buffer.from("%PDF-1.7", "utf8"),
         },
@@ -488,7 +488,7 @@ describe("what a stored attachment becomes is decided by its bytes, not by the p
 
     expect(result[0]).toEqual({
       type: "text",
-      text: '[attachment "invoice.pdf" is a application/pdf file, which cannot be put in front of the model]',
+      text: '[attachment "invoice.pdf" is a application/x-unsupported file, which cannot be put in front of the model]',
     });
   });
 

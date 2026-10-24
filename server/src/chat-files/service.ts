@@ -14,6 +14,7 @@ import {
   MAX_CHAT_FILE_BYTES,
 } from "../../../shared/chat-files";
 import type { StoredAttachment } from "../channels/attachment-parts";
+import { classifyAttachment, mimeForFilename } from "../../../shared/attachments";
 import type { AuditInitiator } from "../audit";
 import type { AppVariables } from "../auth/guards";
 import type { Database } from "../db/client";
@@ -110,7 +111,7 @@ export function detectMime(bytes: Uint8Array, name: string): string {
   if (image) return image;
   if (bytes.length >= 5 && String.fromCharCode(...bytes.subarray(0, 5)) === "%PDF-") return "application/pdf";
   const ext = name.toLowerCase().split(".").pop() ?? "";
-  return EXT_MIME[ext] ?? "application/octet-stream";
+  return EXT_MIME[ext] ?? mimeForFilename(name) ?? "application/octet-stream";
 }
 
 /** 文件名：去掉目录、控制字符和路径符号，最长 120。 */
@@ -145,8 +146,6 @@ function formatSize(bytes: number) {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
-
-const TEXT_TYPES = new Set(["text/plain", "text/markdown", "text/csv", "application/json"]);
 
 export function createChatFiles(
   database: Database,
@@ -388,8 +387,9 @@ export function createChatFiles(
     const where = found.workspace_path ? `已保存在你的工作区 ${found.workspace_path}` : "没能写进你的工作区";
     const image = sniffImage(bytes);
     if (image) return imageForTurn(owner, found, bytes, image, where);
-    if (TEXT_TYPES.has(found.mime_type) && bytes.length <= 512 * 1024) {
-      return { mimeType: "text/plain", name: found.name, bytes: Buffer.concat([Buffer.from(`（${where}）\n\n`), bytes]) };
+    const readableMime = detectMime(bytes, found.name);
+    if (["text", "file"].includes(classifyAttachment(readableMime))) {
+      return { mimeType: readableMime, name: found.name, bytes };
     }
     const hint =
       found.mime_type === "application/pdf"

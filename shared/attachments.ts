@@ -64,6 +64,85 @@ export const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
  * file is not told — see `MAX_EXTRACTED_CHARACTERS`.
  */
 export const MAX_FILE_BYTES = 1024 * 1024;
+/** Binary documents, archives and media; image/text limits remain separate. */
+export const MAX_DOCUMENT_BYTES = 20 * 1024 * 1024;
+
+export const FILE_MIME_BY_EXTENSION: Readonly<Record<string, string>> = {
+  pdf: "application/pdf",
+  doc: "application/msword",
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  docm: "application/vnd.ms-word.document.macroenabled.12",
+  xls: "application/vnd.ms-excel",
+  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  xlsm: "application/vnd.ms-excel.sheet.macroenabled.12",
+  ppt: "application/vnd.ms-powerpoint",
+  pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  pptm: "application/vnd.ms-powerpoint.presentation.macroenabled.12",
+  odt: "application/vnd.oasis.opendocument.text",
+  ods: "application/vnd.oasis.opendocument.spreadsheet",
+  odp: "application/vnd.oasis.opendocument.presentation",
+  rtf: "application/rtf",
+  zip: "application/zip",
+  "7z": "application/x-7z-compressed",
+  rar: "application/vnd.rar",
+  tar: "application/x-tar",
+  gz: "application/gzip",
+  tgz: "application/gzip",
+  bz2: "application/x-bzip2",
+  xz: "application/x-xz",
+  mp3: "audio/mpeg",
+  wav: "audio/wav",
+  m4a: "audio/mp4",
+  ogg: "audio/ogg",
+  flac: "audio/flac",
+  mp4: "video/mp4",
+  mov: "video/quicktime",
+  webm: "video/webm",
+};
+export const ACCEPTED_FILE_MIME = [
+  ...new Set(Object.values(FILE_MIME_BY_EXTENSION)),
+  "application/x-rar-compressed",
+  "application/x-zip-compressed",
+];
+const TEXT_EXTENSIONS = new Set(
+  "txt md markdown csv tsv json jsonl ndjson yaml yml toml xml html htm css scss js mjs cjs jsx ts tsx vue svelte py java kt kts c cpp h hpp cs go rs rb php swift sql sh bash bat cmd ps1 ini conf cfg log tex ipynb".split(
+    " ",
+  ),
+);
+
+/** A picker hint only. The server still checks the bytes before accepting a text/image claim. */
+export function mimeForFilename(name: string): string | undefined {
+  const extension = name.toLowerCase().split(".").pop() ?? "";
+  return (
+    FILE_MIME_BY_EXTENSION[extension] ??
+    (TEXT_EXTENSIONS.has(extension) ? "text/plain" : undefined)
+  );
+}
+
+export const COMMON_FILE_EXTENSIONS = [
+  ...Object.keys(FILE_MIME_BY_EXTENSION),
+  ...TEXT_EXTENSIONS,
+].map((ext) => `.${ext}`);
+
+export function isTextMime(mime: string): boolean {
+  const type = mediaTypeOf(mime);
+  return (
+    type.startsWith("text/") ||
+    type.endsWith("+json") ||
+    type.endsWith("+xml") ||
+    [
+      "application/json",
+      "application/x-ndjson",
+      "application/xml",
+      "application/yaml",
+      "application/x-yaml",
+      "application/toml",
+      "application/javascript",
+      "application/typescript",
+      "application/sql",
+    ].includes(type)
+  );
+}
 
 /**
  * How much extracted text may reach the model from one file.
@@ -172,6 +251,7 @@ export function namesNoFormat(mimeType: string): boolean {
 export type AttachmentKind =
   | "image"
   | "text"
+  | "file"
   | "unsupported-image"
   | "unsupported";
 
@@ -200,9 +280,15 @@ export function classifyAttachment(mimeType: string): AttachmentKind {
     return "image";
   }
   if (mediaType.startsWith("image/")) return "unsupported-image";
-  if ((ACCEPTED_TEXT_MIME as readonly string[]).includes(mediaType)) {
+  if (isTextMime(mediaType)) {
     return "text";
   }
+  if (
+    ACCEPTED_FILE_MIME.includes(mediaType) ||
+    mediaType.startsWith("audio/") ||
+    mediaType.startsWith("video/")
+  )
+    return "file";
   return "unsupported";
 }
 

@@ -1,5 +1,6 @@
 import { afterAll, afterEach, describe, expect, spyOn, test } from "bun:test";
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { and, eq, isNull, sql } from "drizzle-orm";
 import type { MiddlewareHandler } from "hono";
 import { Hono } from "hono";
@@ -623,16 +624,29 @@ describe("POST /:channelId/attachments", () => {
 
   test("an unsupported non-image type is refused, naming the type", async () => {
     const { app, channelId } = await harness();
-    const file = new File([new Uint8Array([0x50, 0x4b, 0x03, 0x04])], "a.zip", {
-      type: "application/zip",
+    const file = new File([new Uint8Array([0x4d, 0x5a, 0x00, 0xff])], "a.exe", {
+      type: "application/x-msdownload",
     });
 
     const response = await upload(app, channelId, file);
 
     expect(response.status).toBe(415);
     const body = (await response.json()) as { error: string };
-    expect(body.error).toContain("application/zip");
+    expect(body.error).toContain("application/x-msdownload");
   });
+
+  for (const [filename, expected] of [["report.docx", "中文合同"], ["sales.xlsx", "12345"], ["slides.pptx", "发布计划"], ["invoice.pdf", "Quarterly revenue"], ["bundle.zip", "notes.txt"]]) {
+    test(`a ${filename} upload is downloadable and reaches the model as readable content`, async () => {
+      const { app, channelId, memberId, threadId } = await harness();
+      const bytes = readFileSync(new URL(`./fixtures/common-files/${filename}`, import.meta.url));
+      const response = await upload(app, channelId, new File([bytes], filename, { type: "application/octet-stream" }));
+      expect(response.status).toBe(201);
+      const uploaded = await response.json() as { id: string; mimeType: string };
+      const content = [{ type: "document", source: { type: "url", value: attachmentUrl(uploaded.id) } }];
+      const resolved = await resolveAttachmentParts(content, (id) => loadAttachmentForTurn(database, { actorId: memberId, threadId }, id)) as Array<{ text: string }>;
+      expect(resolved[0].text).toContain(expected);
+    });
+  }
 
   test("the ninth staged attachment in one upload group is refused", async () => {
     const { app, database: db, channelId, memberId } = await harness();
@@ -2595,7 +2609,7 @@ describe("the upload route's body limit", () => {
     // The refusal has to be `{ error }` or the composer shows "Could not upload ..." and the person
     // never learns that the file was simply too big.
     const body = (await response.json()) as { error?: string };
-    expect(body.error).toContain("8MB");
+    expect(body.error).toContain("20MB");
     // Scoped to this test's own channel: a global row count would collide with the sweeper test,
     // which deletes across the whole shared database.
     const rows = await db

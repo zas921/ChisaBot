@@ -4,7 +4,7 @@ import {
   FILE_PICKER_ACCEPT,
   uploadToChannel,
 } from "@/components/channels/composer/attachments";
-import { MAX_IMAGE_BYTES } from "@/lib/channels/attachments";
+import { MAX_DOCUMENT_BYTES } from "@/lib/channels/attachments";
 
 /**
  * `uploadToChannel` is the SDK's `onUpload`, called with a raw `File`; `attachmentsConfigFor`
@@ -174,14 +174,14 @@ describe("uploadToChannel", () => {
 });
 
 describe("attachmentsConfigFor", () => {
-  test("maxSize is MAX_IMAGE_BYTES", () => {
+  test("SDK permits documents up to MAX_DOCUMENT_BYTES while the picker applies per-kind limits", () => {
     const config = attachmentsConfigFor(
       "chan_1",
       "group_1",
       () => {},
       () => {},
     );
-    expect(config.maxSize).toBe(MAX_IMAGE_BYTES);
+    expect(config.maxSize).toBe(MAX_DOCUMENT_BYTES);
   });
 
   /**

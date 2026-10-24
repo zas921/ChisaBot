@@ -4,6 +4,7 @@ import {
   MAX_EXTRACTED_CHARACTERS,
 } from "../../../shared/attachments";
 import { CHAT_FILE_URL_PREFIX } from "../../../shared/chat-files";
+import { extractFileText } from "./file-extraction";
 
 /**
  * What `load` hands back for an attachment id: the bytes and the metadata
@@ -485,6 +486,16 @@ async function resolvePart(
     };
   }
 
+  if (kind === "file") {
+    try {
+      const text = await extractFileText(attachment);
+      return { type: "text", text: `Attached file "${attachment.name}":\n\n${extractDocumentText(Buffer.from(text, "utf8"))}` };
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "附件读取失败。";
+      if (onMissing === "note") return { type: "text", text: `[附件 "${attachment.name}" 未能读取：${reason}]` };
+      throw new Error(`无法读取附件 "${attachment.name}"：${reason}`);
+    }
+  }
   if (kind !== "image") return unreadableNote(part, id, attachment.mimeType);
 
   /*

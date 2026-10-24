@@ -3,8 +3,10 @@ import type { AttachmentsConfig } from "@copilotkit/react-core/v2";
 import {
   ACCEPTED_IMAGE_MIME,
   ACCEPTED_TEXT_MIME,
+  ACCEPTED_FILE_MIME,
+  COMMON_FILE_EXTENSIONS,
   attachmentUrl,
-  MAX_IMAGE_BYTES,
+  MAX_DOCUMENT_BYTES,
 } from "@/lib/channels/attachments";
 
 /**
@@ -163,6 +165,8 @@ function isUploadedAttachment(body: unknown): body is UploadedAttachment {
 export const FILE_PICKER_ACCEPT = [
   ...ACCEPTED_IMAGE_MIME,
   ...ACCEPTED_TEXT_MIME,
+  ...ACCEPTED_FILE_MIME,
+  ...COMMON_FILE_EXTENSIONS,
   ".png",
   ".jpg",
   ".jpeg",
@@ -240,7 +244,7 @@ export function attachmentsConfigFor(
   return {
     enabled: true,
     accept: "*/*",
-    maxSize: MAX_IMAGE_BYTES,
+    maxSize: MAX_DOCUMENT_BYTES,
     onUpload: async (file) => {
       const uploaded = await upload(file);
       const rowId = stagedRowId(uploaded);

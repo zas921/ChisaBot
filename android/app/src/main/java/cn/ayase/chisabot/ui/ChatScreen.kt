@@ -269,7 +269,7 @@ private fun Composer(vm: AppViewModel, onSent: () -> Unit) {
             AttachButton(
                 onPhotos = { pickPhotos.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) },
                 onCamera = { runCatching { vm.cameraUri() }.getOrNull()?.let { photoUri = it; runCatching { takePhoto.launch(it) }.onFailure { vm.notice = "这台手机没有可用的相机" } } },
-                onFiles = { pickFiles.launch(arrayOf("image/png", "image/jpeg", "image/gif", "image/webp", "text/*", "application/json")) },
+                onFiles = { pickFiles.launch(arrayOf("*/*")) },
                 enabled = vm.files.size < 8,
             )
             Spacer(Modifier.width(8.dp))

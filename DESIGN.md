@@ -2549,3 +2549,11 @@ Stop、失败、重启后，未完成补话在服务端持久暂停。刷新、�
 
 ### 110.3 回归
 `server/tests/native-call-wait.test.ts`（事件排队总时长超过时限也能等到、事件已走过立刻执行、一直没有事件才报错）、`server/tests/output-limit.test.ts`（目录上限 / 兜底 / claude 补 / 400 读出上限重发并记住 / 不相关错误不重发）、`server/tests/relay-liveness.test.ts`（接力放开的时限、报平安续命、旧页面不按静默放开）、`server/tests/bot-threads.test.ts`（`live` / `waiting`）、`app/tests/relay-sync.test.ts`（`shouldRejoin`、`pingRelayAlive`）。
+
+## 112. Bot 对话支持常见办公文档与文件（2026-10-23，CB-098）
+
+附件入口、网页筛选、服务端字节识别和模型上下文使用同一组格式分类。DOC/DOCX、PDF、XLS/XLSX、PPT/PPTX、RTF、OpenDocument 和常见文本/代码可以作为文件发送；压缩包提供目录，音视频保存原件并说明本次未进行内容理解。非图片不内联执行，下载继续检查账号和会话权限。
+
+办公文件由有时间、内存、解压体积、字符数和并发上限的独立解析进程读取。正文提取最多 120,000 字符，公式不重新计算，不执行宏；扫描 PDF 没有文字层时说明未 OCR，损坏/加密文档给出读取失败原因。历史中坏附件以说明替代，当前提问的附件读取失败则终止该次提问，避免假称已读。
+
+每条最多 8 个附件；图片上限 8 MB，纯文本 1 MB，办公文档、压缩包和音视频 20 MB。输入框继续显示文件名、大小及可能截断提示。Android 原生选择器与校验同步放开，未知大小文件受读取上限约束，首次并发附件共享频道创建。格式矩阵、依赖与测试见 [docs/chat-files.md](docs/chat-files.md)。

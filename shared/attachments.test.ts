@@ -35,8 +35,8 @@ describe("classifyAttachment", () => {
     expect(classifyAttachment("application/json")).toBe("text");
   });
 
-  test("anything else is unsupported", () => {
-    expect(classifyAttachment("application/zip")).toBe("unsupported");
+  test("common archives are files", () => {
+    expect(classifyAttachment("application/zip")).toBe("file");
   });
 
   test("a charset parameter does not defeat the match", () => {
@@ -300,7 +300,7 @@ describe("an unnamed claim is unsupported AND unnamed, which is what defers to t
     // The other half of the branch: the two sides already agree about a claim
     // that names a format, so the composer refuses it itself rather than
     // spending a round trip to be told the same thing.
-    for (const claim of ["application/zip", "text/html"]) {
+    for (const claim of ["application/x-msdownload", "application/x-unknown"]) {
       expect(classifyAttachment(claim)).toBe("unsupported");
       expect(namesNoFormat(claim)).toBe(false);
     }

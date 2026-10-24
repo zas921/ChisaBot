@@ -3,6 +3,7 @@ import {
   MAX_ATTACHMENTS_PER_MESSAGE,
   MAX_FILE_BYTES,
   MAX_IMAGE_BYTES,
+  MAX_DOCUMENT_BYTES,
 } from "@/lib/channels/attachments";
 import { screenPickedFiles } from "./picked-files";
 
@@ -11,6 +12,27 @@ function file(name: string, type: string, size = 3): File {
 }
 
 describe("screenPickedFiles", () => {
+  test("Word, PDF, spreadsheets, slides, archives and source code are staged", () => {
+    const files = [
+      file("合同.doc", "application/msword"),
+      file("报告.DOCX", "application/octet-stream"),
+      file(
+        "数据.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      ),
+      file("演示.pptx", ""),
+      file("资料.pdf", "application/pdf"),
+      file("包.zip", "application/zip"),
+      file("main.py", "text/x-python"),
+    ];
+    expect(screenPickedFiles(files, { alreadyStaged: 0 }).accepted).toEqual(
+      files,
+    );
+    const large = file("large.pdf", "application/pdf", MAX_DOCUMENT_BYTES + 1);
+    expect(
+      screenPickedFiles([large], { alreadyStaged: 0 }).rejected[0].reason,
+    ).toContain("20MB");
+  });
   test("accepts a PNG under the ceiling", () => {
     const png = file("photo.png", "image/png");
     const result = screenPickedFiles([png], { alreadyStaged: 0 });
@@ -58,7 +80,7 @@ describe("screenPickedFiles", () => {
     const result = screenPickedFiles([big], { alreadyStaged: 0 });
 
     expect(result.accepted).toEqual([]);
-    expect(result.rejected[0].reason).toMatch(/too large/);
+    expect(result.rejected[0].reason).toContain("太大");
   });
 
   test("rejects an oversized image", () => {
@@ -66,7 +88,7 @@ describe("screenPickedFiles", () => {
     const result = screenPickedFiles([big], { alreadyStaged: 0 });
 
     expect(result.accepted).toEqual([]);
-    expect(result.rejected[0].reason).toMatch(/too large/);
+    expect(result.rejected[0].reason).toContain("太大");
   });
 
   /**
@@ -99,22 +121,22 @@ describe("screenPickedFiles", () => {
     const result = screenPickedFiles([huge], { alreadyStaged: 0 });
 
     expect(result.accepted).toEqual([]);
-    expect(result.rejected[0].reason).toMatch(/too large|larger than/);
+    expect(result.rejected[0].reason).toContain("太大");
   });
 
-  test("a claim that names a format it does not accept is still refused here", () => {
+  test("a ZIP is staged for server-side verification", () => {
     // The fall-through is only for claims that name NOTHING. `application/zip` names a format, and
     // `sniffMimeType` hands that name straight back for the server to refuse by name, so refusing
     // it at pick time is the two halves agreeing rather than disagreeing.
     const zip = file("archive.zip", "application/zip");
     const result = screenPickedFiles([zip], { alreadyStaged: 0 });
 
-    expect(result.accepted).toEqual([]);
-    expect(result.rejected).toHaveLength(1);
+    expect(result.accepted).toEqual([zip]);
+    expect(result.rejected).toHaveLength(0);
   });
 
   test("rejects an unsupported file type with a reason distinct from the SVG one", () => {
-    const zip = file("archive.zip", "application/zip");
+    const zip = file("program.exe", "application/x-msdownload");
     const result = screenPickedFiles([zip], { alreadyStaged: 0 });
 
     expect(result.accepted).toEqual([]);
@@ -123,12 +145,12 @@ describe("screenPickedFiles", () => {
 
   test("reports one rejection per bad file, each naming its own file", () => {
     const svg = file("a.svg", "image/svg+xml");
-    const zip = file("b.zip", "application/zip");
+    const zip = file("b.exe", "application/x-msdownload");
     const result = screenPickedFiles([svg, zip], { alreadyStaged: 0 });
 
     expect(result.rejected).toHaveLength(2);
     expect(result.rejected[0].name).toBe("a.svg");
-    expect(result.rejected[1].name).toBe("b.zip");
+    expect(result.rejected[1].name).toBe("b.exe");
   });
 
   test("counts the cap after kind and size, against already-staged files", () => {
@@ -184,7 +206,7 @@ describe("screenPickedFiles", () => {
 
     expect(result.accepted).toEqual([]);
     expect(result.rejected).toHaveLength(1);
-    expect(result.rejected[0].reason).toMatch(/too large for an image/);
+    expect(result.rejected[0].reason).toContain("图片太大");
     expect(result.rejected[0].reason).not.toMatch(/at most/);
   });
 

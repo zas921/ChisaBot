@@ -205,7 +205,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Common Office tasks work immediately with the system Python; missing libraries led the Bot to
 # hand-build OOXML and skip real numeric verification in the continuous Web acceptance run.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3 python3-pip python3-venv python-is-python3 python3-openpyxl python3-docx \
+      python3 python3-pip python3-venv python-is-python3 python3-openpyxl python3-docx python3-pypdf antiword catdoc p7zip-full \
   && python -c 'import openpyxl, docx' \
   && rm -rf /var/lib/apt/lists/*
 

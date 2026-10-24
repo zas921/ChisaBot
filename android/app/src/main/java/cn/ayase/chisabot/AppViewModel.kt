@@ -40,6 +40,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -484,14 +486,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** 这段对话的会话（频道）：没有就先建一个一对一的（POST /api/channels）。附件要先有会话才能上传。 */
-    private suspend fun ensureChannel(api: Api, bot: Bot): Pair<String, String> {
+    private val channelCreationMutex = Mutex()
+    private suspend fun ensureChannel(api: Api, bot: Bot): Pair<String, String> = channelCreationMutex.withLock {
+        if (chatBot?.id != bot.id) throw CancellationException("会话已切换")
         val t = threadId; val c = channelId
-        if (t != null && c != null) return c to t
+        if (t != null && c != null) return@withLock c to t
         val created = api.post("/api/channels", buildJsonObject { putJsonArray("agentIds") { add(JsonPrimitive(bot.id)) } })
+        if (chatBot?.id != bot.id) throw CancellationException("会话已切换")
         val nt = created.o("channel")?.s("threadId") ?: throw IllegalStateException("无法开始会话")
         val nc = created.o("channel")?.s("id") ?: throw IllegalStateException("无法开始会话")
         threadId = nt; channelId = nc
-        return nc to nt
+        nc to nt
     }
 
     /** 发一条：没有会话就先建，带上传好的附件（AG-UI image / document 段），然后 POST /api/copilotkit/agent/<bot>/run 读事件流。 */
@@ -670,25 +675,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val files = mutableStateListOf<PendingFile>()
     private var uploadGroup = UUID.randomUUID().toString()
     private val imageMimes = setOf("image/png", "image/jpeg", "image/gif", "image/webp")
-    private val textMimes = setOf("text/plain", "text/markdown", "text/csv", "application/json")
-
-    private fun guessMime(name: String, given: String?): String {
-        val g = given?.lowercase()?.substringBefore(';')?.trim()
-        if (!g.isNullOrBlank() && (g in imageMimes || g in textMimes)) return g
-        // 文件管理器给的别名（text/comma-separated-values、text/x-markdown、text/x-java…）按扩展名再认一次
-        val byExt = when (name.substringAfterLast('.', "").lowercase()) {
-            "png" -> "image/png"; "jpg", "jpeg" -> "image/jpeg"; "gif" -> "image/gif"; "webp" -> "image/webp"
-            "md", "markdown" -> "text/markdown"; "csv" -> "text/csv"; "json" -> "application/json"
-            "txt", "log", "kt", "ts", "js", "py", "java", "xml", "yml", "yaml", "html", "css", "sh" -> "text/plain"
-            else -> null
-        }
-        return byExt ?: when {
-            g == null || g.isBlank() -> "application/octet-stream"
-            g.startsWith("text/") -> "text/plain"
-            g.endsWith("+json") || g.endsWith("/x-json") -> "application/json"
-            else -> g
-        }
-    }
 
     /** 选好的文件 / 照片 → 检查类型和大小 → 逐个上传。 */
     fun addFiles(uris: List<Uri>) {
@@ -706,13 +692,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
             if (uri.scheme == "file") name = uri.lastPathSegment ?: name
-            val mime = guessMime(name, ctx.contentResolver.getType(uri))
+            val mime = AttachmentFormats.guess(name, ctx.contentResolver.getType(uri))
             val image = mime in imageMimes
             val localId = UUID.randomUUID().toString()
             val reject = when {
-                !image && mime !in textMimes -> if (mime.startsWith("image/")) "不支持这种图片格式（可以发 PNG、JPEG、GIF、WebP）" else "不支持这种文件（可以发图片和文本类文件：txt、md、csv、json）"
-                image && size > 8L * 1024 * 1024 -> "图片超过 8 MB"
-                !image && size > 1024L * 1024 -> "文本文件超过 1 MB"
+                !AttachmentFormats.accepts(mime) -> "不支持这种图片或文件格式"
+                size > AttachmentFormats.limit(mime) -> "文件超过 ${AttachmentFormats.limit(mime) / 1024 / 1024} MB"
                 else -> null
             }
             files += PendingFile(localId, uri.toString(), name, mime, image, size, if (reject != null) "failed" else "uploading", error = reject)
@@ -724,7 +709,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         fun update(change: (PendingFile) -> PendingFile) { val i = files.indexOfFirst { it.localId == localId }; if (i >= 0) files[i] = change(files[i]) }
         try {
             val f = files.firstOrNull { it.localId == localId } ?: return
-            val bytes = withContext(Dispatchers.IO) { ctx.contentResolver.openInputStream(uri)?.use { it.readBytes() } } ?: throw IllegalStateException("读不到这个文件")
+            val bytes = withContext(Dispatchers.IO) { ctx.contentResolver.openInputStream(uri)?.use { AttachmentFormats.read(it, AttachmentFormats.limit(f.mime)) } } ?: throw IllegalStateException("读不到这个文件")
             if (f.image && bytes.size > 8 * 1024 * 1024) throw IllegalStateException("图片超过 8 MB")
             val (cid, _) = ensureChannel(api, bot)
             val res = api.upload("/api/channels/$cid/attachments", mapOf("uploadGroup" to uploadGroup), f.name, f.mime, bytes)

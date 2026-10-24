@@ -2,8 +2,10 @@ import {
   classifyAttachment,
   MAX_ATTACHMENTS_PER_MESSAGE,
   MAX_FILE_BYTES,
+  MAX_DOCUMENT_BYTES,
   MAX_IMAGE_BYTES,
   mediaTypeOf,
+  mimeForFilename,
   namesNoFormat,
 } from "@/lib/channels/attachments";
 import { newId } from "@/lib/new-id";
@@ -43,7 +45,11 @@ export function screenPickedFiles(
      * server gives the specific reason for the same file, so the two refusals disagreed.
      */
     const mediaType = mediaTypeOf(file.type);
-    const kind = classifyAttachment(file.type);
+    const hintedMime =
+      classifyAttachment(file.type) === "unsupported"
+        ? mimeForFilename(file.name)
+        : undefined;
+    const kind = classifyAttachment(hintedMime ?? file.type);
 
     if (kind === "unsupported-image") {
       rejected.push(
@@ -104,11 +110,11 @@ export function screenPickedFiles(
     // The LOOSE ceiling for a file nobody has named yet, because this screen does not know which
     // of the two limits applies to it. Guessing the tight one would put back exactly the refusal
     // this branch exists to remove; the server applies the right limit once it has the bytes.
-    if (unnamed && file.size > MAX_IMAGE_BYTES) {
+    if ((unnamed || kind === "file") && file.size > MAX_DOCUMENT_BYTES) {
       rejected.push(
         reject(
           file,
-          `'${file.name}' 超过附件上限 ${formatBytes(MAX_IMAGE_BYTES)}。`,
+          `'${file.name}' 超过附件上限 ${formatBytes(MAX_DOCUMENT_BYTES)}。`,
         ),
       );
       continue;
