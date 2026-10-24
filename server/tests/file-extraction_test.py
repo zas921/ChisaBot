@@ -8,6 +8,10 @@ import sys
 import tempfile
 import unittest
 import zipfile
+import gzip
+import bz2
+import lzma
+import tarfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -125,6 +129,21 @@ class ExtractionTests(unittest.TestCase):
     def test_media_is_not_claimed_as_transcribed(self):
         text = reader.extract(b"ID3example", ".mp3", "audio/mpeg")["text"]
         self.assertIn("未提取", text)
+
+    def test_compressed_text_formats(self):
+        for extension, compress in [(".gz", gzip.compress), (".bz2", bz2.compress), (".xz", lzma.compress)]:
+            result = reader.extract(compress("中文日志12345".encode()), extension, "application/gzip")
+            self.assertIn("中文日志12345", result["text"])
+
+    def test_tar_lists_without_writing_members(self):
+        output = io.BytesIO()
+        with tarfile.open(fileobj=output, mode="w:gz") as archive:
+            entry = tarfile.TarInfo("../outside.txt")
+            entry.size = 6
+            archive.addfile(entry, io.BytesIO(b"secret"))
+        text = reader.extract(output.getvalue(), ".tgz", "application/gzip")["text"]
+        self.assertIn("outside.txt", text)
+        self.assertNotIn("secret", text)
 
 
 if __name__ == "__main__":

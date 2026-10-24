@@ -98,6 +98,24 @@
 | [CB-087](#cb-087) | 聊天可靠性全面修复：滚动、队列恢复、请求与编码 | 成熟度 Maturity | `type: bug` · `area: chat` · `area: computer` · `P1` · `status: done` |
 | [CB-088](#cb-088) | 代理 IP 证书与好友包首次构建修复 | 成熟度 Maturity | `type: bug` · `area: pc` · `area: infra` · `P1` · `status: in-progress` |
 
+| [CB-098](#cb-098) | Bot 对话支持常见办公文档、文本和压缩包 | 成熟度 Maturity | `type: feat` · `area: chat` · `area: android` · `P1` · `status: in-progress` |
+
+## CB-098
+
+**Bot 对话支持常见办公文档、文本和压缩包**
+
+里程碑：成熟度 Maturity · 标签：`type: feat` `area: chat` `area: android` `P1` `status: in-progress`
+
+用户要求支持 DOC，并扩展到常规文件。上传、格式校验、模型读取及 Android 原生入口一起处理，格式矩阵见[聊天文件](chat-files.md)，设计见 DESIGN §112。
+
+#### 验收标准
+
+- [x] 网页/PC 和 Android 支持选择常见办公文件、文本/代码与压缩包，前后端保留类型和体积校验
+- [x] DOCX/PDF/XLSX/PPTX/OpenDocument 提取实际文字，压缩包不执行内容；损坏、截断和未提取情况明确说明
+- [ ] 上传接口、下载权限和模型引用在隔离数据库验证；旧版 DOC/XLS/PPT 在候选运行镜像验证
+- [ ] 前后端类型检查、相关聊天回归和 Android 测试/签名包通过
+- [ ] 服务器备份、部署及上线健康/版本检查完成，记录客户端更新要求
+
 ## CB-088
 
 **代理 IP 证书与好友包首次构建修复**

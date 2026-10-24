@@ -2,6 +2,7 @@
 import gzip
 import bz2
 import lzma
+import codecs
 import io
 import json
 import os
@@ -218,9 +219,10 @@ def extract(data, extension, mime):
             decompressor = {".gz": gzip.GzipFile, ".bz2": bz2.BZ2File, ".xz": lzma.LZMAFile}.get(extension)
             if decompressor is None:
                 raise InvalidFile("压缩文件无法读取。")
-            with decompressor(io.BytesIO(data)) as stream:
+            compressed = gzip.GzipFile(fileobj=io.BytesIO(data)) if extension == ".gz" else decompressor(io.BytesIO(data))
+            with compressed as stream:
                 content = stream.read(MAX_TEXT * 4 + 1)
-            out.add(content.decode("utf-8", errors="strict"))
+            out.add(codecs.getincrementaldecoder("utf-8")("strict").decode(content, final=len(content) <= MAX_TEXT * 4))
     else:
         out.add(f"此附件的类型为 {mime}，原文件可以下载。未提取其音视频或二进制内容，不能声称已听取、观看或读取正文。")
     result = out.result()

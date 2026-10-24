@@ -1,8 +1,9 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { Hono } from "hono";
 import { CHAT_FILES_MARKER, filesFromToolResult, toolResultText } from "../../shared/chat-files";
-import { attachmentIdsIn } from "../src/channels/attachment-parts";
+import { attachmentIdsIn, resolveAttachmentParts } from "../src/channels/attachment-parts";
 import { minimaxEndpoint, openaiBase, probeImageModel, runImageModel } from "../src/chat-files/image-provider";
 import { createChatFiles, detectMime, safeName, sniffImage } from "../src/chat-files/service";
 import { createDatabase } from "../src/db/client";
@@ -171,10 +172,13 @@ describe.skipIf(!url)("chat files service", () => {
     const asImage = await files.loadForTurn(owner, a.id);
     expect(asImage?.mimeType).toBe("image/png");
     expect(await files.loadForTurn(other, a.id)).toBeNull();
-    const pdf = await files.upload(owner, bot, { name: "r.pdf", bytes: Buffer.from("%PDF-1.4 hello") });
+    const pdfBytes = readFileSync(new URL("./fixtures/common-files/invoice.pdf", import.meta.url));
+    const pdf = await files.upload(owner, bot, { name: "r.pdf", bytes: pdfBytes });
     const note = await files.loadForTurn(owner, pdf.id);
-    expect(note?.mimeType).toBe("text/plain");
-    expect(note?.bytes.toString()).toContain("uploads/r.pdf");
+    expect(note?.mimeType).toBe("application/pdf");
+    expect(note?.bytes).toEqual(pdfBytes);
+    const parts = await resolveAttachmentParts([{ type: "document", source: { type: "url", value: `/api/chat-files/${pdf.id}` } }], (id) => files.loadForTurn(owner, id.replace(/^cf:/, ""))) as Array<{ text: string }>;
+    expect(parts[0].text).toContain("Quarterly revenue 12345");
     const csv = await files.upload(owner, bot, { name: "t.csv", bytes: Buffer.from("a,b\n1,2") });
     expect((await files.loadForTurn(owner, csv.id))?.bytes.toString()).toContain("1,2");
   });
