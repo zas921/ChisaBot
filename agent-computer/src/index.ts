@@ -630,6 +630,8 @@ type StreamData = { botId: string; recordingId?: string };
 
 serve<StreamData>({
   port: PORT,
+  // User file transfers may exceed Bun's default request-body ceiling after base64 encoding.
+  maxRequestBodySize: Number.POSITIVE_INFINITY,
   ...(RUNTIME.hostname ? { hostname: RUNTIME.hostname } : {}),
   // HTTP idle (non-WS). /exec disables this per-request; long computer actions must not die at 10s.
   idleTimeout: STREAM_IDLE_TIMEOUT_S,

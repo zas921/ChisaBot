@@ -71,7 +71,7 @@ export type WorkspaceLimits = {
   writeBytes: number;
   /** Most entries a listing describes, so a Bot cannot paste a whole disk into its own context. */
   listEntries: number;
-  /** Most bytes one download may stream, so a large artifact cannot exhaust the connection. */
+  /** Optional download ceiling; the default permits complete user file transfers. */
   downloadBytes: number;
 };
 
@@ -94,7 +94,7 @@ export const DEFAULT_WORKSPACE_LIMITS: WorkspaceLimits = {
   readBytes: 64_000,
   writeBytes: 1_000_000,
   listEntries: 500,
-  downloadBytes: 100 * 1024 * 1024,
+  downloadBytes: Number.POSITIVE_INFINITY,
 };
 
 export function createWorkspace(
@@ -353,13 +353,12 @@ export function createWorkspace(
     },
 
     /**
-     * 原样写入字节（聊天里上传的文件、生成的图片，DESIGN.md §56）。同一套路径约束；上限单独给
-     * （默认 25MB），因为文本写入的 1MB 上限是为模型一次写的笔记定的，不是为一张照片。
+     * 原样写入上传文件，不设默认大小上限；保留路径约束和调用方显式指定的上限。
      */
     async writeBytes(
       requested: string,
       contents: Uint8Array,
-      maxBytes = 25 * 1024 * 1024,
+      maxBytes = Number.POSITIVE_INFINITY,
     ): Promise<{ path: string; bytes: number }> {
       if (!(contents instanceof Uint8Array)) {
         throw new WorkspaceFileError("The contents to write must be bytes.");

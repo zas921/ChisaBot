@@ -10,9 +10,12 @@ import { newInlineBudget, resolveAttachmentParts } from "../src/channels/attachm
 
 describe("common chat files reach the model as actual extracted text", () => {
   test("a document over 32 MiB is extracted and charged for its readable text", async () => {
-    // PDF permits trailing whitespace. Keep a real text page and cross both former size gates.
+    // Add whitespace before xref, retaining a valid EOF and updating its offset.
     const pdf = readFileSync(new URL("./fixtures/common-files/invoice.pdf", import.meta.url));
-    const bytes = Buffer.concat([pdf, Buffer.alloc(33 * 1024 * 1024, 0x20)]);
+    const xref = pdf.indexOf(Buffer.from("xref\n"));
+    const padding = Buffer.alloc(33 * 1024 * 1024, 0x20);
+    const tail = pdf.subarray(xref).toString("utf8").replace(/startxref\n\d+/, `startxref\n${xref + padding.length}`);
+    const bytes = Buffer.concat([pdf.subarray(0, xref), padding, Buffer.from(tail)]);
     const budget = newInlineBudget();
     const parts = await resolveAttachmentParts(
       [{ type: "document", source: { type: "url", value: "/api/attachments/large" } }],

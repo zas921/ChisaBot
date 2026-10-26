@@ -3872,7 +3872,7 @@ const asChannelSocket = (ws: { data: SocketData }) =>
 serve<SocketData>({
   port,
   // Disable Bun's default 128 MiB request-body cap for file transfers.
-  maxRequestBodySize: 0,
+  maxRequestBodySize: Number.POSITIVE_INFINITY,
   async fetch(request, server) {
     const url = new URL(request.url);
     if (request.method === "POST" && (url.pathname === "/api/chat-files" || /^\/api\/channels\/[^/]+\/attachments$/.test(url.pathname))) server.timeout(request, 0);
