@@ -20,6 +20,7 @@ MAX_TEXT = 120_000
 MAX_XML = 8 * 1024 * 1024
 MAX_EXPANDED = 64 * 1024 * 1024
 MAX_ENTRIES = 10_000
+MAX_PACKAGE_MANIFEST = 1024 * 1024
 
 
 class InvalidFile(Exception):
@@ -60,11 +61,35 @@ def xml(data):
 def checked_zip(data):
     archive = zipfile.ZipFile(io.BytesIO(data))
     entries = archive.infolist()
-    if len(entries) > MAX_ENTRIES or sum(i.file_size for i in entries) > MAX_EXPANDED:
-        raise InvalidFile("压缩后的文档展开体积过大，请拆分文件。")
-    if any(i.flag_bits & 1 for i in entries):
-        raise InvalidFile("文件已加密，请先去除密码再上传。")
+    # A directory listing does not expand members. Apply the expansion ceiling only to Office
+    # readers below, which actually open document contents.
+    try:
+        if len(entries) > MAX_ENTRIES:
+            raise InvalidFile("压缩包条目过多，请拆分文件。")
+        if any(i.flag_bits & 1 for i in entries):
+            raise InvalidFile("文件已加密，请先去除密码再上传。")
+    except Exception:
+        archive.close()
+        raise
     return archive
+
+
+def package_manifest(archive, out):
+    """Read only bounded XAPK metadata, never APK/OBB payloads or executable code."""
+    try:
+        if archive.getinfo("manifest.json").file_size > MAX_PACKAGE_MANIFEST:
+            raise ValueError("manifest too large")
+        with archive.open("manifest.json") as stream:
+            data = stream.read(MAX_PACKAGE_MANIFEST + 1)
+        if len(data) > MAX_PACKAGE_MANIFEST:
+            raise ValueError("manifest too large")
+        manifest = json.loads(data)
+        if not isinstance(manifest, dict):
+            raise ValueError("invalid manifest")
+        out.add("[XAPK 安装包清单 manifest.json；以下为包内元数据，未安装、执行或反编译 APK]")
+        out.add(json.dumps(manifest, ensure_ascii=False, indent=2))
+    except (ValueError, UnicodeError, RecursionError, RuntimeError, zipfile.BadZipFile, NotImplementedError, OSError):
+        out.add("[XAPK 的 manifest.json 过大或无法解析；以下仅列出目录，未读取 APK/OBB 内容]")
 
 
 def read_xml(archive, name):
@@ -127,6 +152,13 @@ def extract(data, extension, mime):
     elif data.startswith(b"PK"):
         with checked_zip(data) as archive:
             names = archive.namelist()
+            is_document = (
+                "word/document.xml" in names or "xl/workbook.xml" in names
+                or any(re.fullmatch(r"ppt/slides/slide\d+\.xml", name) for name in names)
+                or "content.xml" in names and "mimetype" in names
+            )
+            if is_document and sum(i.file_size for i in archive.infolist()) > MAX_EXPANDED:
+                raise InvalidFile("压缩后的文档展开体积过大，请拆分文件。")
             if "word/document.xml" in names:
                 document = read_xml(archive, "word/document.xml")
                 body = next((e for e in document if e.tag.endswith("}body")), document)
@@ -188,6 +220,8 @@ def extract(data, extension, mime):
             else:
                 if extension in (".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp"):
                     raise InvalidFile("文件中缺少对应的办公文档内容，请检查文件格式。")
+                if "manifest.json" in names and any(name.lower().endswith(".apk") for name in names):
+                    package_manifest(archive, out)
                 out.add("[压缩包目录；仅列出文件，尚未读取内部文件正文，未执行或释放其中内容]")
                 for item in archive.infolist()[:200]:
                     out.add(f"{item.filename} ({item.file_size} bytes)")

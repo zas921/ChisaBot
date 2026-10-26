@@ -111,9 +111,57 @@ class ExtractionTests(unittest.TestCase):
         reader.MAX_EXPANDED = 8
         try:
             with self.assertRaises(reader.InvalidFile):
-                reader.extract(self.files["bundle.zip"], ".zip", "application/zip")
+                reader.extract(self.files["report.docx"], ".docx", "application/msword")
         finally:
             reader.MAX_EXPANDED = old
+
+    def test_archive_listing_does_not_apply_document_expansion_limit(self):
+        from unittest.mock import patch
+        old = reader.MAX_EXPANDED
+        reader.MAX_EXPANDED = 1
+        try:
+            with patch.object(zipfile.ZipFile, "open", side_effect=AssertionError("must not read members")):
+                text = reader.extract(self.files["bundle.zip"], ".zip", "application/zip")["text"]
+            self.assertIn("notes.txt", text)
+        finally:
+            reader.MAX_EXPANDED = old
+
+    def test_xapk_reads_manifest_but_never_apk_payload(self):
+        from unittest.mock import patch
+        manifest = {"package_name": "com.example.cars", "version_name": "1.3.5", "name": "Car Sort"}
+        data = zipped({"manifest.json": json.dumps(manifest), "base.apk": "not executed", "Android/obb/data.obb": "not opened"})
+        opened = []
+        original = zipfile.ZipFile.open
+        def tracked(archive, name, *args, **kwargs):
+            opened.append(name)
+            return original(archive, name, *args, **kwargs)
+        with patch.object(zipfile.ZipFile, "open", tracked):
+            text = reader.extract(data, ".xapk", "application/zip")["text"]
+        self.assertEqual(opened, ["manifest.json"])
+        for expected in ("com.example.cars", "1.3.5", "base.apk", "未安装、执行或反编译"):
+            self.assertIn(expected, text)
+        self.assertNotIn("not executed", text)
+
+    def test_invalid_or_oversized_xapk_manifest_still_allows_listing(self):
+        old = reader.MAX_PACKAGE_MANIFEST
+        reader.MAX_PACKAGE_MANIFEST = 8
+        try:
+            for value in ("{broken", "x" * 9):
+                data = zipped({"manifest.json": value, "base.apk": "payload"})
+                text = reader.extract(data, ".xapk", "application/zip")["text"]
+                self.assertIn("base.apk", text)
+                self.assertIn("无法解析", text)
+        finally:
+            reader.MAX_PACKAGE_MANIFEST = old
+
+    def test_archive_entry_count_limit_is_retained(self):
+        old = reader.MAX_ENTRIES
+        reader.MAX_ENTRIES = 1
+        try:
+            with self.assertRaises(reader.InvalidFile):
+                reader.extract(self.files["bundle.zip"], ".zip", "application/zip")
+        finally:
+            reader.MAX_ENTRIES = old
 
     def test_truncation_is_explicit(self):
         out = reader.Text()
