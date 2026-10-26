@@ -346,7 +346,7 @@ export function Accordion({ title, summary, open, icon, children }: { title: str
         {summary ? <span className="jr-acc-sum">{summary}</span> : null}
         <IconChevronDown aria-hidden className="jr-acc-chev size-4" />
       </button>
-      <div className="jr-acc-body" id={id} inert={!expanded || undefined}>
+      <div aria-hidden={!expanded} className="jr-acc-body" id={id} inert={!expanded || undefined}>
         <div className="jr-acc-inner">{children}</div>
       </div>
     </div>

@@ -3,6 +3,7 @@ import { GlobalRegistrator } from "@happy-dom/global-registrator";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { createStateStore, JSONUIProvider, Renderer, type Spec } from "@json-render/react";
 import { inspectRenderUiSpec } from "../../shared/json-render/catalog";
+import { RichUiProvider } from "@/lib/copilot/json-render/rich-context";
 import {
   canTween,
   countdownParts,
@@ -113,7 +114,7 @@ describe("rich components render", () => {
   afterEach(() => cleanup());
   afterAll(() => GlobalRegistrator.unregister());
 
-  async function draw(spec: Record<string, unknown>) {
+  async function draw(spec: Record<string, unknown>, surface: "chat" | "panel" = "chat") {
     const { jsonRenderRegistry } = await import("@/lib/copilot/json-render/registry");
     const verdict = inspectRenderUiSpec(JSON.stringify(spec));
     expect(verdict.ok).toBe(true);
@@ -121,12 +122,34 @@ describe("rich components render", () => {
     const store = createStateStore({});
     return render(
       <div className="jr-surface">
+        <RichUiProvider value={{ surface }}>
         <JSONUIProvider handlers={{}} registry={jsonRenderRegistry} store={store}>
           <Renderer registry={jsonRenderRegistry} spec={safe as Spec} />
         </JSONUIProvider>
+        </RichUiProvider>
       </div>,
     );
   }
+
+  test("panel lists keep all twenty rows with a scrollable viewport; short and chat lists flow naturally", async () => {
+    const spec = (length: number) => ({
+      root: "list",
+      elements: { list: { type: "List", props: { items: Array.from({ length }, (_, i) => ({ id: `news-${i}`, title: `新闻 ${i}`, href: `https://news.test/${i}` })) }, children: [] } },
+    });
+    const long = await draw(spec(20), "panel");
+    expect(long.container.querySelectorAll(".jr-list-item")).toHaveLength(20);
+    expect(long.getByRole("list", { name: "列表，共 20 条，可上下滚动" }).tabIndex).toBe(0);
+    expect(long.getByRole("list", { name: "列表，共 20 条，可上下滚动" }).classList.contains("is-scrollable")).toBe(true);
+    expect(long.container.textContent).toContain("共 20 条");
+    long.unmount();
+    const short = await draw(spec(5), "panel");
+    expect(short.container.querySelector(".is-scrollable")).toBeNull();
+    expect(short.container.querySelector(".jr-panel-list-count")).toBeNull();
+    short.unmount();
+    const chat = await draw(spec(20));
+    expect(chat.container.querySelector(".is-scrollable")).toBeNull();
+    expect(chat.container.querySelectorAll(".jr-list-item")).toHaveLength(20);
+  });
 
   test("every new component draws something", async () => {
     const view = await draw({

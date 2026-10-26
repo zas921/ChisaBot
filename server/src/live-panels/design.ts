@@ -24,6 +24,8 @@ export const PANEL_LIMITS = {
   rows: 5,
   /** 用户明确要更多行时的硬上限（检查按这个数退回）。 */
   rowsMax: 7,
+  /** List 的完整数据上限；前端每屏最多显示 5 条，其余在列表内滚动。 */
+  listItems: 50,
   /** 表格单元格（第一列除外）宽度上限。 */
   cell: 8,
   /** 表格最多几列。 */
@@ -75,7 +77,7 @@ const PATTERNS = [
   ],
   [
     "B 新闻 / 文章 / 搜索结果（可点）",
-    "一行淡色说明 + List（≤5 行）：每行 title + 缩略图 image（有真实配图才写）+ 原文链接 href + 发布时间 time（ISO，会显示成「3 分钟前」并自己走）。",
+    "一行淡色说明 + List（每屏最多 5 行，更多条目可上下滑动）：每行 title + 缩略图 image（有真实配图才写）+ 原文链接 href + 发布时间 time（ISO，会显示成「3 分钟前」并自己走）。",
     example({
       root: "r",
       elements: {
@@ -220,13 +222,14 @@ export const PANEL_DESIGN_GUIDE = [
   "硬限制：",
   `- 只有一层外壳：卡片本身就是外壳，规范里不用 Card。最外层用 Stack（gap md），小节标题用 Heading level 3（可带 icon）。从根算起最多 ${L.depth} 层，全部元素不超过 ${L.elements} 个。`,
   "- 不重复标题：卡片头已经显示面板标题，规范里不要再写一遍；需要时间 / 地点说明就用一行 Text（tone muted，size sm），例如「10/13 09:00 · 香港」；时间一律写用户当地时间（不知道就用北京时间），不写 UTC。卡片底部会自己显示「x 分钟前更新」，不要自己写更新时间。",
+  "- 折叠：整张面板可点标题收起到一行。竖向 Stack 里的 Heading 与后续内容会自动组成可独立折叠的小节，默认展开，到下一个同级或更高级 Heading 为止；需要明确分组或默认收起时用 Accordion（title、open），支持嵌套。刷新时保持这些元素的 key 不变，以保留用户的展开状态。",
   `- 一张面板最多 ${L.metrics} 个磁贴 + ${L.bigParts} 个大块（像 Hark 一样一眼看完）。大块最多 ${L.bigParts} 个（Table、List、Chart、Hero、Timeline、KeyValue、Carousel、Products、Gauge、Image、日历 HeatStrip、多段 Ring 各算一块；Tabs 只算最大的那一页）。Hero 最多 1 个。`,
   `- 磁贴（Metric 和单值 Ring 合计）最多 ${L.metrics} 个（2 个一排放进 Grid columns 2）。更多的数放进一张 KeyValue 或 Table（算一块大块），不要排成一墙磁贴。着色磁贴（variant tinted + icon + tone）适合 2 个并排的关键数；平铺 Metric 的 tone 只给涨跌 / 预警。`,
   `- 并排的格子里（Grid 2 列以上）一段 Text 不超过 ${L.cellText} 个汉字宽，一格一件事；「降水 0 mm · 风速 5 km/h」这种多项说明放到 Grid 外面单独一行，或只留一项。`,
   `- 标签要短：Metric 的 label、表头、Badge、Heading、Tabs 的标签不超过 ${L.label} 个汉字（或 ${L.label * 2} 个字母）。`,
   `- 数字带单位：Metric 的 value 写成「数字 + 单位」的短串（26.9℃、73%、2.9 km/h、$81,272、12 天），不超过 ${L.value} 个汉字宽，不要写句子；单位会自动缩小变淡，刷新时数字会从旧值平滑滚到新值。delta + trend 只写「和过去比」的变化（较昨日 +1.2%、24h -3.1%）。`,
   `- 图表：每条线 ≤ ${L.chartPoints} 个点，labels 写短（10/13、09:00），最多 3 条线；height 默认即可（窄卡 100–140）。迷你走势用 Metric 的 spark 或 Sparkline（6–30 个点）。`,
-  `- 列表、表格、时间线默认最多 ${L.rows} 行（用户明确要更多时最多 ${L.rowsMax} 行）；KeyValue ≤ ${L.keyValues} 行；Carousel ≤ ${L.carousel} 张；Products ≤ 4 个（窄卡固定 2 列）；Tabs ≤ ${L.tabs} 页。表格最多 ${L.columns} 列，每格不超过 ${L.cell} 个汉字宽，日期写短，相关的数合并成一列（31°/24°）。`,
+  `- List 每屏最多显示 ${L.rows} 条，其余在列表内上下滑动；按用户要求保留完整条目（最多 ${L.listItems} 条），不要因为一屏只显示 ${L.rows} 条而删掉其余数据。每项提供稳定 id，刷新时保持相同 id。表格、时间线默认最多 ${L.rows} 行（用户明确要更多时最多 ${L.rowsMax} 行）；KeyValue ≤ ${L.keyValues} 行；Carousel ≤ ${L.carousel} 张；Products ≤ 4 个（窄卡固定 2 列）；Tabs ≤ ${L.tabs} 页。表格最多 ${L.columns} 列，每格不超过 ${L.cell} 个汉字宽，日期写短，相关的数合并成一列（31°/24°）。`,
   `- 不写段落：Text 只用来写一行说明（不超过 ${L.text} 个汉字宽），解释、建议说在对话里，不放进面板。`,
   "- 会自己走的时间：倒计时用 Countdown、世界时间用 Clock、发布时间用 List 的 time 或 RelativeTime（都写 ISO 带时区），浏览器里自己更新，不用为它们刷新面板。",
   "- 图片只用工具结果里真实出现过的 https 地址（新闻配图、头像、logo）；没有就不放，Hero 会用 tone 渐变。",
@@ -401,7 +404,7 @@ export function lintPanelSpec(source: string, panelTitle: string): string[] {
       }
       case "List": {
         const items = Array.isArray(p.items) ? (p.items as { title?: unknown; meta?: unknown }[]) : [];
-        if (items.length > L.rowsMax) issues.push(`列表行太多（${items.length} 行，最多 ${L.rowsMax} 行）：只留最重要的 ${L.rows} 行。`);
+        if (items.length > L.listItems) issues.push(`列表条目太多（${items.length} 条，最多 ${L.listItems} 条）：保留最重要的 ${L.listItems} 条，每屏显示 ${L.rows} 条，其余可上下滑动。`);
         if (items.some((item) => tooLong(item.meta, L.value + 3))) issues.push("列表右侧的 meta 太长：只写时间、数量、状态这类短信息，长内容放 description。");
         break;
       }

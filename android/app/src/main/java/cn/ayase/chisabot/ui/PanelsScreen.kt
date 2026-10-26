@@ -27,12 +27,17 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -63,7 +68,7 @@ fun PanelsScreen(vm: AppViewModel, bot: Bot) {
             }
             else -> LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(14.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 items(panels, key = { it.id }) { p ->
-                    PanelCard(p, RenderActions(
+                    PanelCard(p, "${vm.server}:${vm.username}:${bot.id}", RenderActions(
                         ask = { text -> scope.launch { vm.back(); if (vm.chatBot?.id != bot.id) vm.openChat(bot); vm.send(text) } },
                         fallback = { vm.push(Screen.Web("/channel/new?agent=${bot.id}", "面板")) },
                     ))
@@ -74,14 +79,26 @@ fun PanelsScreen(vm: AppViewModel, bot: Bot) {
 }
 
 @Composable
-private fun PanelCard(p: Panel, actions: RenderActions) {
+private fun PanelCard(p: Panel, scope: String, actions: RenderActions) {
     val sky = LocalSky.current
+    val context = LocalContext.current
+    val preferences = remember(context) { context.getSharedPreferences("panel-folds", android.content.Context.MODE_PRIVATE) }
+    val preferenceKey = "$scope:${p.id}"
+    var collapsed by rememberSaveable(preferenceKey) { mutableStateOf(preferences.getBoolean(preferenceKey, false)) }
+    val stateHolder = rememberSaveableStateHolder()
     val stale = p.error != null && p.status != "building"
     Column(Modifier.fillMaxWidth().glass(sky, RoundedCornerShape(18.dp), 2).padding(14.dp).animateContentSize(tween(220))) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
+        Row(Modifier.fillMaxWidth().semantics { stateDescription = if (collapsed) "已折叠" else "已展开" }
+            .clickable(role = Role.Button) {
+                collapsed = !collapsed
+                preferences.edit().putBoolean(preferenceKey, collapsed).apply()
+            }.padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(if (collapsed) "›" else "⌄", color = sky.ink3, modifier = Modifier.padding(end = 6.dp))
             Text(p.title, color = sky.ink1, fontSize = 15.5.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, false))
+            if (p.refreshing || p.status == "building") { Spacer(Modifier.width(8.dp)); CircularProgressIndicator(Modifier.size(12.dp), color = sky.ink3, strokeWidth = 1.5.dp) }
             if (stale) { Spacer(Modifier.width(8.dp)); Pill("可能已过期", sky.warn) }
         }
+        if (!collapsed) stateHolder.SaveableStateProvider(p.id) {
         Spacer(Modifier.height(10.dp))
         when {
             p.status == "building" || p.spec.isNullOrBlank() -> Column {
@@ -92,10 +109,11 @@ private fun PanelCard(p: Panel, actions: RenderActions) {
                     if (p.status != "failed") { Spacer(Modifier.width(6.dp)); Dots(sky.ink3, 4.dp) }
                 }
             }
-            else -> Box(Modifier.alpha(if (stale) 0.6f else 1f)) { JsonRenderView(p.spec, actions, Modifier.fillMaxWidth()) }
+            else -> Box(Modifier.alpha(if (stale) 0.6f else 1f)) { JsonRenderView(p.spec, actions, Modifier.fillMaxWidth(), panelTitle = p.title) }
         }
         Spacer(Modifier.height(10.dp))
         PanelFoot(p)
+        }
     }
 }
 

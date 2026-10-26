@@ -353,16 +353,26 @@ export const { registry: jsonRenderRegistry } = defineRegistry(jsonRenderCatalog
       );
     },
     List: ({ props }) => {
+      const { surface } = useRichActions();
       const Tag = props.ordered ? "ol" : "ul";
       const items = Array.isArray(props.items) ? props.items : [];
       const media = items.some((item) => safeHttps(item?.image));
-      return (
-        <Tag className={cn("jr-list jr-el", props.ordered && "is-ordered", media && "has-media")}>
+      const panel = surface === "panel";
+      const scrolling = panel && items.length > 5;
+      const occurrences = new Map<string, number>();
+      const list = (
+        <Tag
+          aria-label={scrolling ? `列表，共 ${items.length} 条，可上下滚动` : undefined}
+          className={cn("jr-list jr-el", props.ordered && "is-ordered", media && "has-media", scrolling && "is-scrollable")}
+          tabIndex={scrolling ? 0 : undefined}
+        >
           {items.map((item, index) => {
             const linked = Boolean(safeHttp(item.href));
+            const identity = item.id ?? item.href ?? item.title;
+            const occurrence = occurrences.get(identity) ?? 0;
+            occurrences.set(identity, occurrence + 1);
             return (
-              // biome-ignore lint/suspicious/noArrayIndexKey: items carry no identity of their own.
-              <li className={cn("jr-list-item", toneOf(item.tone))} key={index} style={{ "--jr-i": String(index) } as CSSProperties}>
+              <li className={cn("jr-list-item", toneOf(item.tone))} key={`${identity}:${occurrence}`} style={{ "--jr-i": String(index) } as CSSProperties}>
                 <ActionArea affordance="none" className="jr-list-row" item={item} label={item.title}>
                   {props.ordered ? <span className="jr-list-n">{index + 1}</span> : null}
                   {safeHttps(item.image) ? (
@@ -394,6 +404,12 @@ export const { registry: jsonRenderRegistry } = defineRegistry(jsonRenderCatalog
           })}
         </Tag>
       );
+      return panel ? (
+        <div className="jr-panel-list">
+          {list}
+          {scrolling ? <p className="jr-panel-list-count">{`共 ${items.length} 条 · 上下滑动查看更多`}</p> : null}
+        </div>
+      ) : list;
     },
     Badge: ({ props }) => (
       <ActionArea

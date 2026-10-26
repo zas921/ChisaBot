@@ -33,6 +33,8 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -46,6 +48,9 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -78,8 +83,8 @@ fun parseSpec(spec: String): JsonObject? = runCatching { Api.json.parseToJsonEle
     ?.let { o -> if (o["root"] != null && o["elements"] is JsonObject) o else (o.o("spec") ?: o) }
 
 @Composable
-fun JsonRenderView(spec: String, actions: RenderActions, modifier: Modifier = Modifier) {
-    val parsed = remember(spec) { parseSpec(spec) }
+fun JsonRenderView(spec: String, actions: RenderActions, modifier: Modifier = Modifier, panelTitle: String? = null) {
+    val parsed = remember(spec, panelTitle) { parseSpec(spec)?.let { if (panelTitle != null) foldablePanelSpec(it, panelTitle) else it } }
     val elements = parsed?.o("elements")
     val root = parsed?.s("root")
     CompositionLocalProvider(LocalRenderActions provides actions) {
@@ -148,7 +153,7 @@ private fun Element(els: JsonObject, key: String, depth: Int) {
     val sky = LocalSky.current
     val ctx = LocalContext.current
     val gap = when (props.p("gap")) { "sm" -> 6.dp; "lg" -> 16.dp; else -> 10.dp }
-    @Composable fun kids() { children.forEach { Element(els, it, depth + 1) } }
+    @Composable fun kids() { children.forEach { child -> androidx.compose.runtime.key(child) { Element(els, child, depth + 1) } } }
     when (type) {
         "Card" -> Column(Modifier.fillMaxWidth().glass(sky, RoundedCornerShape(16.dp), 2).padding(14.dp), verticalArrangement = Arrangement.spacedBy(gap)) {
             props.p("title")?.let { Text(it, color = sky.ink1, fontSize = 15.5.sp, fontWeight = FontWeight.SemiBold) }
@@ -317,7 +322,7 @@ private fun Element(els: JsonObject, key: String, depth: Int) {
         "Delta" -> DeltaPill(props.p("value") ?: "", props.p("trend"), props.bool("invert"), props.p("label"))
         "Tabs" -> {
             val tabs = props?.a("tabs")?.mapNotNull { it.str() } ?: emptyList()
-            var sel by remember(key) { mutableIntStateOf(0) }
+            var sel by rememberSaveable(key) { mutableIntStateOf(0) }
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Row(Modifier.clip(RoundedCornerShape(12.dp)).background(sky.glass1).padding(3.dp)) {
                     tabs.forEachIndexed { i, t ->
@@ -379,14 +384,15 @@ private fun Element(els: JsonObject, key: String, depth: Int) {
             }
         }
         "Accordion" -> {
-            var open by remember(key) { mutableStateOf(props.bool("open")) }
+            var open by rememberSaveable(key) { mutableStateOf(props.bool("open")) }
+            val stateHolder = rememberSaveableStateHolder()
             Column(Modifier.fillMaxWidth().animateContentSize()) {
-                Row(Modifier.fillMaxWidth().clickable { open = !open }.padding(vertical = 6.dp)) {
+                Row(Modifier.fillMaxWidth().semantics { stateDescription = if (open) "已展开" else "已折叠" }.clickable(role = Role.Button) { open = !open }.padding(vertical = 6.dp)) {
                     Text(props.p("title") ?: "", color = sky.ink1, fontSize = 14.sp, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
                     props.p("summary")?.let { Text(it, color = sky.ink3, fontSize = 12.5.sp) }
                     Text(if (open) " ⌃" else " ⌄", color = sky.ink3)
                 }
-                if (open) Column(verticalArrangement = Arrangement.spacedBy(gap)) { kids() }
+                if (open) stateHolder.SaveableStateProvider(key) { Column(verticalArrangement = Arrangement.spacedBy(gap)) { kids() } }
             }
         }
         "Countdown" -> {

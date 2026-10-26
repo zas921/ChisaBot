@@ -27,9 +27,12 @@ import { toast } from "@/components/ui/toast";
 import { parseRenderUiSpec, sanitizeRenderUiSpec } from "../../../../shared/json-render/catalog";
 import { pruneEmptySections } from "../../../../shared/json-render/empty-sections";
 import { dropDuplicateTitle } from "../../../../shared/json-render/panel-title";
+import { foldablePanelSections } from "../../../../shared/json-render/panel-sections";
 import { client } from "@/lib/client";
 import { isChatRunning } from "@/lib/copilot/computer-activity";
 import { buildStepText, groupSources } from "./panel-meta";
+import { PanelCard } from "./panel-card";
+import { currentUserQueryOptions } from "@/lib/auth/queries";
 import { jsonRenderRegistry } from "@/lib/copilot/json-render/registry";
 import { copyText, openInNewTab, RichUiProvider, useNow } from "@/lib/copilot/json-render/rich-context";
 
@@ -128,7 +131,7 @@ const LiveBody = memo(function LiveBody({ spec: source, title, onRefresh }: { sp
   // 空列表 / 空重复区块不画，免得只剩一个孤零零的小标题（shared/json-render/empty-sections.ts）；
   // 和卡片头同名的标题也不再画第二遍（shared/json-render/panel-title.ts）。
   const spec = useMemo(
-    () => dropDuplicateTitle(pruneEmptySections(sanitizeRenderUiSpec(parseRenderUiSpec(source, false))?.spec ?? null), title),
+    () => foldablePanelSections(dropDuplicateTitle(pruneEmptySections(sanitizeRenderUiSpec(parseRenderUiSpec(source, false))?.spec ?? null), title)),
     [source, title],
   );
   /*
@@ -309,7 +312,7 @@ function UpdatedAgo({ at }: { at: string | null }) {
   return <>{ago(at, now)}</>;
 }
 
-function LivePanelCard({ panel, onRemove }: { panel: LivePanel; onRemove: (p: LivePanel) => void }) {
+function LivePanelCard({ panel, onRemove, userId }: { panel: LivePanel; onRemove: (p: LivePanel) => void; userId: string }) {
   const queryClient = useQueryClient();
   const [problem, setProblem] = useState<string | null>(null);
   const key = livePanelKeys.list(panel.botId);
@@ -360,80 +363,89 @@ function LivePanelCard({ panel, onRemove }: { panel: LivePanel; onRemove: (p: Li
       data-stale={stale || undefined}
       data-status={panel.status}
     >
-      <header className="live-panel-head">
-        <h3 className="live-panel-title">{panel.title}</h3>
-        {stale && !busy ? (
-          <span className="live-panel-stale" title={panel.error ?? undefined}>
+      <PanelCard
+        preferenceKey={`chisabot-panel-card:${userId}:${panel.botId}:${panel.id}`}
+        title={panel.title}
+        status={building || busy ? (
+          <span className="live-panel-compact-status" role="status">
+            <IconRefresh aria-hidden className="live-panel-spin size-3" />
+            {building ? "搭建中" : "刷新中"}
+          </span>
+        ) : panel.error || problem ? (
+          <span className="live-panel-stale" title={problem ?? panel.error ?? undefined}>
             <IconAlertTriangle aria-hidden className="size-3" />
-            {"可能已过期"}
+            {problem ? "操作失败" : stale ? "可能已过期" : "更新失败"}
           </span>
         ) : null}
-        <DropdownMenu>
-          <DropdownMenuTrigger
-            render={<button aria-label={`「${panel.title}」的更多操作`} className="rail-head-icon live-panel-more ml-auto" type="button" />}
-          >
-            <IconDots className="size-4" />
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="glass-pop sg-menu w-[208px]" side="bottom" sideOffset={6}>
-            <DropdownMenuItem className="glass-mi" disabled={busy} onClick={() => refresh.mutate()}>
-              <IconRefresh className={icon} />
-              <span className="min-w-0 flex-1">{busy ? "正在刷新…" : "立即刷新"}</span>
-            </DropdownMenuItem>
-            <DropdownMenuSeparator className="glass-sep" />
-            <DropdownMenuGroup>
-              <DropdownMenuLabel className="glass-mi-label">{"自动刷新"}</DropdownMenuLabel>
-              <DropdownMenuRadioGroup
-                onValueChange={(v) => {
-                  if (v !== "at") setCadence.mutate(v === "off" ? null : Number(v));
-                }}
-                value={panel.refreshAt ? "at" : panel.refreshMinutes == null ? "off" : String(panel.refreshMinutes)}
-              >
-                {(
-                  [
-                    // 机器人按用户说的「每天几点」设的固定时刻；选别的频率就取消它。
-                    ...(panel.refreshAt ? ([["at", `每天 ${panel.refreshAt}`]] as const) : []),
-                    ["60", "每小时"],
-                    ["360", "每 6 小时"],
-                    ["1440", "每天"],
-                    ["off", "不自动刷新"],
-                  ] as const
-                ).map(([value, label]) => (
-                  <DropdownMenuRadioItem className="glass-mi" closeOnClick key={value} value={value}>
-                    {label}
-                  </DropdownMenuRadioItem>
-                ))}
-              </DropdownMenuRadioGroup>
-            </DropdownMenuGroup>
-            <DropdownMenuSeparator className="glass-sep" />
-            {panel.canUndoEdit ? (
-              <DropdownMenuItem className="glass-mi" onClick={() => undoEdit.mutate()}>
-                <IconArrowBackUp className={icon} />
-                <span className="min-w-0 flex-1">{"撤销上次修改"}</span>
+        menu={
+          <DropdownMenu>
+            <DropdownMenuTrigger
+              render={<button aria-label={`「${panel.title}」的更多操作`} className="rail-head-icon live-panel-more ml-auto" type="button" />}
+            >
+              <IconDots className="size-4" />
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="glass-pop sg-menu w-[208px]" side="bottom" sideOffset={6}>
+              <DropdownMenuItem className="glass-mi" disabled={busy} onClick={() => refresh.mutate()}>
+                <IconRefresh className={icon} />
+                <span className="min-w-0 flex-1">{busy ? "正在刷新…" : "立即刷新"}</span>
               </DropdownMenuItem>
-            ) : null}
-            <DropdownMenuItem className="glass-mi is-danger" onClick={() => onRemove(panel)} variant="destructive">
-              <IconTrash className={icon} />
-              <span className="min-w-0 flex-1">{"删除面板"}</span>
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
-      </header>
+              <DropdownMenuSeparator className="glass-sep" />
+              <DropdownMenuGroup>
+                <DropdownMenuLabel className="glass-mi-label">{"自动刷新"}</DropdownMenuLabel>
+                <DropdownMenuRadioGroup
+                  onValueChange={(v) => {
+                    if (v !== "at") setCadence.mutate(v === "off" ? null : Number(v));
+                  }}
+                  value={panel.refreshAt ? "at" : panel.refreshMinutes == null ? "off" : String(panel.refreshMinutes)}
+                >
+                  {(
+                    [
+                      // 机器人按用户说的「每天几点」设的固定时刻；选别的频率就取消它。
+                      ...(panel.refreshAt ? ([["at", `每天 ${panel.refreshAt}`]] as const) : []),
+                      ["60", "每小时"],
+                      ["360", "每 6 小时"],
+                      ["1440", "每天"],
+                      ["off", "不自动刷新"],
+                    ] as const
+                  ).map(([value, label]) => (
+                    <DropdownMenuRadioItem className="glass-mi" closeOnClick key={value} value={value}>
+                      {label}
+                    </DropdownMenuRadioItem>
+                  ))}
+                </DropdownMenuRadioGroup>
+              </DropdownMenuGroup>
+              <DropdownMenuSeparator className="glass-sep" />
+              {panel.canUndoEdit ? (
+                <DropdownMenuItem className="glass-mi" onClick={() => undoEdit.mutate()}>
+                  <IconArrowBackUp className={icon} />
+                  <span className="min-w-0 flex-1">{"撤销上次修改"}</span>
+                </DropdownMenuItem>
+              ) : null}
+              <DropdownMenuItem className="glass-mi is-danger" onClick={() => onRemove(panel)} variant="destructive">
+                <IconTrash className={icon} />
+                <span className="min-w-0 flex-1">{"删除面板"}</span>
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        }
+      >
 
-      {building ? (
-        <BuildingSkeleton />
-      ) : panel.spec ? (
-        <LiveBody onRefresh={() => refresh.mutate()} spec={panel.spec} title={panel.title} />
-      ) : null}
+        {building ? (
+          <BuildingSkeleton />
+        ) : panel.spec ? (
+          <LiveBody onRefresh={() => refresh.mutate()} spec={panel.spec} title={panel.title} />
+        ) : null}
 
-      {panel.error && !building ? (
-        <p className="live-panel-error" role="alert">
-          <IconAlertTriangle className="size-3.5 shrink-0" />
-          <span>{panel.error}</span>
-        </p>
-      ) : null}
-      {problem ? <p className="live-panel-error" role="alert">{problem}</p> : null}
+        {panel.error && !building ? (
+          <p className="live-panel-error" role="alert">
+            <IconAlertTriangle className="size-3.5 shrink-0" />
+            <span>{panel.error}</span>
+          </p>
+        ) : null}
+        {problem ? <p className="live-panel-error" role="alert">{problem}</p> : null}
 
-      {!building ? <PanelFoot busy={busy} panel={panel} /> : null}
+        {!building ? <PanelFoot busy={busy} panel={panel} /> : null}
+      </PanelCard>
     </article>
   );
 }
@@ -444,6 +456,7 @@ function LivePanelCard({ panel, onRemove }: { panel: LivePanel; onRemove: (p: Li
  */
 export function LivePanelList({ botId }: { botId: string }) {
   const list = useLivePanels(botId);
+  const user = useQuery(currentUserQueryOptions());
   const queryClient = useQueryClient();
   const key = livePanelKeys.list(botId);
   // 撤销可能在删除请求回来之前就点了：先等删除落地，再恢复，服务端顺序不会反。
@@ -486,7 +499,7 @@ export function LivePanelList({ botId }: { botId: string }) {
     <PresenceList>
       {(list.data ?? []).map((panel) => (
         <PresenceItem key={panel.id}>
-          <LivePanelCard onRemove={(p) => remove.mutate(p)} panel={panel} />
+          <LivePanelCard key={user.data?.id ?? ""} onRemove={(p) => remove.mutate(p)} panel={panel} userId={user.data?.id ?? ""} />
         </PresenceItem>
       ))}
     </PresenceList>

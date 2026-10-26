@@ -166,6 +166,7 @@ export const jsonRenderCatalog = defineCatalog(schema, {
       props: z.object({
         items: z.array(
           z.object({
+            id: z.string().nullish().describe("条目的稳定标识，刷新时保持不变"),
             title: z.string(),
             description: z.string().nullish(),
             meta: z.string().nullish().describe("右侧的短信息，例如时间、数量"),

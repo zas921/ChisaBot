@@ -4963,6 +4963,16 @@ html[data-phone] .rail-sheet[data-slot="sheet-content"] {
 @keyframes live-panel-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 @media (prefers-reduced-motion: reduce) { .live-panel { animation: none; } }
 .live-panel-head { display: flex; align-items: center; gap: 6px; min-height: 28px; }
+.live-panel-heading { flex: 1; min-width: 0; margin: 0; }
+.live-panel-toggle { display: flex; align-items: center; gap: 6px; width: 100%; min-height: 32px; padding: 0; text-align: left; border-radius: 6px; color: var(--ink-1); cursor: pointer; }
+.live-panel-toggle:hover { color: var(--accent-blue-ink); }
+.live-panel-toggle:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.live-panel-chevron { color: var(--ink-3); transition: transform var(--dur-1); }
+@media (prefers-reduced-motion: reduce) { .live-panel-chevron { transition: none; } }
+.live-panel-toggle[aria-expanded="true"] .live-panel-chevron { transform: rotate(90deg); }
+.live-panel-content { display: flex; flex-direction: column; gap: 8px; }
+.live-panel-content[hidden] { display: none; }
+.live-panel-compact-status { display: inline-flex; align-items: center; gap: 4px; flex: none; font-size: 12px; color: var(--ink-3); white-space: nowrap; }
 .live-panel-title { margin: 0; font-size: 14px; font-weight: 600; color: var(--ink-1); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .live-panel-spin { color: var(--ink-3); animation: live-panel-spin 1s linear infinite; }
 @keyframes live-panel-spin { to { transform: rotate(360deg); } }
@@ -5612,9 +5622,9 @@ a.live-panel-src:hover { color: var(--ink-1); text-decoration: underline; text-u
 .jr-acc-sum { margin-left: auto; flex: none; max-width: 45%; font-size: 13px; color: var(--ink-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .jr-acc-chev { flex: none; color: var(--ink-3); transition: transform var(--dur-2) var(--ease-out); }
 .jr-acc-title + .jr-acc-chev { margin-left: auto; }
-.jr-acc.is-open .jr-acc-chev { transform: rotate(180deg); }
+.jr-acc.is-open > .jr-acc-head > .jr-acc-chev { transform: rotate(180deg); }
 .jr-acc-body { display: grid; grid-template-rows: 0fr; transition: grid-template-rows var(--dur-2) var(--ease-out); }
-.jr-acc.is-open .jr-acc-body { grid-template-rows: 1fr; }
+.jr-acc.is-open > .jr-acc-body { grid-template-rows: 1fr; }
 .jr-acc-inner { min-height: 0; overflow: hidden; display: flex; flex-direction: column; gap: 10px; }
 .jr-acc-inner > :last-child { margin-bottom: 10px; }
 
@@ -5650,6 +5660,16 @@ a.live-panel-src:hover { color: var(--ink-1); text-decoration: underline; text-u
 .jr-list-go { flex: none; width: 14px; height: 14px; color: var(--ink-4); transition: color var(--dur-1), transform var(--dur-1) var(--ease-out); }
 .jr-list-row.jr-action:hover .jr-list-go { color: var(--accent-blue); transform: translate(1px, -1px); }
 .jr-list-row.jr-action { border-radius: 0; }
+/* 面板列表一屏最多 5 条；固定行高避免滑到短条目处突然露出第 6 条。 */
+.jr-panel-list { --panel-list-row: 80px; min-width: 0; }
+.jr-panel-list .jr-list.is-scrollable { max-height: min(calc(5 * var(--panel-list-row)), 60dvh); overflow-y: auto; overflow-x: hidden; scrollbar-width: thin; scrollbar-gutter: stable; touch-action: pan-y; }
+.jr-panel-list .jr-list.is-scrollable:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.jr-panel-list .jr-list.is-scrollable .jr-list-item { height: var(--panel-list-row); box-sizing: border-box; }
+.jr-surface .jr-panel-list .jr-list.is-scrollable .jr-list-row { height: 100%; min-height: 0; box-sizing: border-box; flex-wrap: nowrap; gap: 8px; margin: 0; padding: 8px 0; width: 100%; }
+.jr-panel-list .jr-list-t { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
+.jr-panel-list .jr-list-s { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.jr-panel-list .jr-list-m { max-width: 72px; overflow: hidden; text-overflow: ellipsis; }
+.jr-panel-list-count { margin: 6px 0 0; font-size: 12px; color: var(--ink-3); }
 .jr-surface .jr-list-row.jr-action:hover { background: var(--glass-hover); }
 :is(.jr-card, .live-panel-body) .jr-list-row.jr-action { margin: 0 -8px; padding: 9px 8px; width: calc(100% + 16px); border-radius: var(--r-sm); }
 .jr-alert[class*="jr-tone-"] { background: linear-gradient(135deg, color-mix(in oklch, var(--tone) 15%, transparent), color-mix(in oklch, var(--tone) 5%, transparent)); border-color: color-mix(in oklch, var(--tone) 22%, transparent); }

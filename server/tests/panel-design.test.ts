@@ -7,6 +7,17 @@ import { inspectRenderUiSpec } from "../../shared/json-render/catalog";
 const examples = PANEL_DESIGN_GUIDE.split("\n").filter((line) => line.startsWith('{"root"'));
 
 describe("panel design guide", () => {
+  test("long lists retain all requested data; the five-row viewport is not a data limit", () => {
+    const list = (length: number) => JSON.stringify({
+      root: "list",
+      elements: { list: { type: "List", props: { items: Array.from({ length }, (_, i) => ({ id: String(i), title: `新闻 ${i}` })) }, children: [] } },
+    });
+    expect(lintPanelSpec(list(20), "新闻")).toEqual([]);
+    expect(lintPanelSpec(list(50), "新闻")).toEqual([]);
+    expect(lintPanelSpec(list(51), "新闻").join("\n")).toContain("最多 50 条");
+    expect(inspectRenderUiSpec(list(20)).ok).toBe(true);
+    expect(PANEL_DESIGN_GUIDE).toContain("不要因为一屏只显示 5 条而删掉其余数据");
+  });
   test("has eight pattern examples, each valid and lint-clean (apart from the example.com placeholders)", () => {
     expect(examples.length).toBe(8);
     for (const spec of examples) {
