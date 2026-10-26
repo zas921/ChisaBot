@@ -11,7 +11,7 @@ import {
   IMAGE_PROVIDER_PRESETS,
   type ImageAspect,
   isInlineSafeMime,
-  MAX_CHAT_FILE_BYTES,
+  MAX_IMAGE_DOWNLOAD_BYTES,
 } from "../../../shared/chat-files";
 import type { StoredAttachment } from "../channels/attachment-parts";
 import { classifyAttachment, mimeForFilename } from "../../../shared/attachments";
@@ -180,13 +180,13 @@ export function createChatFiles(
     // guardedFetch 钉死 DNS、逐跳重验，超大截断。
     let response;
     try {
-      response = await guardedFetch(url, { maxBytes: MAX_CHAT_FILE_BYTES + 1, timeoutMs: 60_000 });
+      response = await guardedFetch(url, { maxBytes: MAX_IMAGE_DOWNLOAD_BYTES + 1, timeoutMs: 60_000 });
     } catch (error) {
       if (error instanceof BlockedUrlError) throw new ImageProviderError(error.message);
       throw error;
     }
     if (response.status >= 400) throw new ImageProviderError(`取图片失败（HTTP ${response.status}）。`);
-    if (response.truncated || response.body.length > MAX_CHAT_FILE_BYTES) throw new ImageProviderError("图片太大。");
+    if (response.truncated || response.body.length > MAX_IMAGE_DOWNLOAD_BYTES) throw new ImageProviderError("图片太大。");
     return response.body;
   }
   const download = options.download ?? defaultDownload;
@@ -325,7 +325,6 @@ export function createChatFiles(
   async function upload(owner: string, agentId: string, file: { name: string; bytes: Buffer }): Promise<ChatFileView> {
     if (!(await options.ownsBot(owner, agentId))) throw new ChatFilesError("找不到这个机器人。");
     if (file.bytes.length === 0) throw new ChatFilesError("文件是空的。");
-    if (file.bytes.length > MAX_CHAT_FILE_BYTES) throw new ChatFilesError(`文件超过 ${formatSize(MAX_CHAT_FILE_BYTES)}。`);
     const name = safeName(file.name);
     const mimeType = detectMime(file.bytes, name);
     const workspacePath = await intoWorkspace(owner, agentId, "uploads", name, file.bytes);
@@ -461,7 +460,6 @@ export function createChatFiles(
   async function share(owner: string, agentId: string, path: string, title?: string): Promise<ChatFileView> {
     if (!options.workspace) throw new ChatFilesError("这个部署没有工作区。");
     const file = await options.workspace.read(owner, agentId, path);
-    if (file.bytes.length > MAX_CHAT_FILE_BYTES) throw new ChatFilesError(`文件超过 ${formatSize(MAX_CHAT_FILE_BYTES)}，不能交给用户。`);
     const base = safeName(file.name || path.split("/").pop() || "文件");
     const ext = base.includes(".") ? base.slice(base.lastIndexOf(".")) : "";
     const name = title?.trim() ? safeName(title.trim().endsWith(ext) ? title.trim() : `${title.trim()}${ext}`) : base;
@@ -616,7 +614,6 @@ export function createChatFiles(
     });
     app.post(
       "/",
-      bodyLimit({ maxSize: MAX_CHAT_FILE_BYTES + 512 * 1024, onError: (c) => c.json({ error: `文件超过 ${formatSize(MAX_CHAT_FILE_BYTES)}。` }, 413) }),
       async (c) => {
         const form = await c.req.formData().catch(() => null);
         const file = form?.get("file");

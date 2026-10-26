@@ -8,8 +8,8 @@
 
 export const CHAT_FILE_URL_PREFIX = "/api/chat-files/";
 export const CHAT_FILES_MARKER = "⟦chisabot:files⟧";
-/** 上传 / 交付的单个文件上限。 */
-export const MAX_CHAT_FILE_BYTES = 20 * 1024 * 1024;
+/** Only remote image-provider downloads are bounded; user file transfers have no size cap. */
+export const MAX_IMAGE_DOWNLOAD_BYTES = 20 * 1024 * 1024;
 
 export type ChatFileKind = "upload" | "generated" | "edited" | "shared";
 

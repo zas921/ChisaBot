@@ -16,7 +16,6 @@ import zipfile
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
-MAX_INPUT = 20 * 1024 * 1024
 MAX_TEXT = 120_000
 MAX_XML = 8 * 1024 * 1024
 MAX_EXPANDED = 64 * 1024 * 1024
@@ -239,10 +238,9 @@ def main():
         resource.setrlimit(resource.RLIMIT_FSIZE, (8 * 1024 * 1024, 8 * 1024 * 1024))
     except (ImportError, ValueError, OSError):
         pass
-    data = sys.stdin.buffer.read(MAX_INPUT + 1)
     try:
-        if len(data) > MAX_INPUT:
-            raise InvalidFile("附件超过 20 MB，请拆分后上传。")
+        # Upload size is unrestricted; process memory, CPU, expansion and output remain bounded.
+        data = sys.stdin.buffer.read()
         result = extract(data, sys.argv[1].lower(), sys.argv[2])
     except InvalidFile as error:
         result = {"error": str(error)}

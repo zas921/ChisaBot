@@ -10,7 +10,7 @@ import {
   MAX_FILE_BYTES,
   MAX_IMAGE_BYTES,
 } from "../../shared/attachments";
-import { createApp, UPLOAD_BODY_LIMIT_BYTES } from "../src/app";
+import { createApp } from "../src/app";
 import type { AppVariables } from "../src/auth/guards";
 import { resolveAttachmentParts } from "../src/channels/attachment-parts";
 import {
@@ -2519,32 +2519,7 @@ describe("attachment route composition", () => {
   });
 });
 
-/*
- * THIS TEST USED TO PIN THE BUG IT WAS MEANT TO GUARD.
- *
- * It posted `MAX_IMAGE_BYTES + 1` bytes and asserted, POSITIVELY, that the refusal was NOT JSON —
- * `expect(() => JSON.parse(text)).toThrow()` — using hono's plain-text `Payload Too Large` as the
- * way to tell the door's 413 from the handler's. Both halves of that premise were themselves
- * defects, and the door has since been fixed on both counts (`server/src/app.ts`).
- *
- * The size was wrong because the door measures THE ENVELOPE and every other gate measures THE FILE:
- * `bodyLimit` runs before anything has parsed the body, so the multipart boundary, the part headers
- * and the `uploadGroup` field (~360 bytes as the composer sends them) counted against the file's own
- * ceiling. A file at exactly the published 8MB limit was refused. The door now sits at
- * `UPLOAD_BODY_LIMIT_BYTES`, so `MAX_IMAGE_BYTES + 1` sails through it — and the handler is what
- * refuses that one, naming the file. This test's old size now reaches `requireUser` and answers 503.
- *
- * The shape was wrong because the composer reads `{ error }` off every failure
- * (`app/src/components/channels/composer/attachments.ts`) and falls back to a generic sentence when
- * the body will not parse — so on the one refusal whose reason is both knowable and actionable, the
- * person was told nothing. The door now answers JSON, which is what the assertion below requires.
- *
- * No assertion that lets a file at the ceiling through can also keep the old one: the two sizes
- * differ by one byte and the framing is ~360, so whatever the door's number is, `ceiling + 1` is on
- * the same side of it as the ceiling. The discriminator has to be something other than the shape of
- * the refusal, and it is: a body past the DOOR'S own ceiling can only have been refused by the door.
- */
-describe("the upload route's body limit", () => {
+describe("unrestricted multipart uploads still require authentication", () => {
   /** The app the two tests below share: no auth service, so nothing below the door can answer 2xx. */
   function appWithNoAuth(db: Database) {
     return createApp(
@@ -2595,23 +2570,17 @@ describe("the upload route's body limit", () => {
     );
   }
 
-  test("a POST past the door's own ceiling is refused by the body limit, in a shape the composer can read", async () => {
+  test("a large unauthenticated POST reaches authentication instead of a size refusal", async () => {
     const { database: db, channelId } = await harness();
     const app = appWithNoAuth(db);
 
     const response = await postBytes(
       app,
       channelId,
-      UPLOAD_BODY_LIMIT_BYTES + 1,
+      21 * 1024 * 1024,
     );
 
-    expect(response.status).toBe(413);
-    // The refusal has to be `{ error }` or the composer shows "Could not upload ..." and the person
-    // never learns that the file was simply too big.
-    const body = (await response.json()) as { error?: string };
-    expect(body.error).toContain("20MB");
-    // Scoped to this test's own channel: a global row count would collide with the sweeper test,
-    // which deletes across the whole shared database.
+    expect(response.status).toBe(503);
     const rows = await db
       .select({ id: attachments.id })
       .from(attachments)

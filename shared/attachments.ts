@@ -64,8 +64,8 @@ export const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
  * file is not told — see `MAX_EXTRACTED_CHARACTERS`.
  */
 export const MAX_FILE_BYTES = 1024 * 1024;
-/** Binary documents, archives and media; image/text limits remain separate. */
-export const MAX_DOCUMENT_BYTES = 20 * 1024 * 1024;
+/** Documents, archives and media have no upload size cap; model extraction stays bounded. */
+export const MAX_DOCUMENT_BYTES = Number.POSITIVE_INFINITY;
 
 export const FILE_MIME_BY_EXTENSION: Readonly<Record<string, string>> = {
   pdf: "application/pdf",

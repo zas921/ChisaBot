@@ -1337,10 +1337,6 @@ const chatFiles = createChatFiles(database, {
           },
           read: async (owner: string, bot: string, path: string) => {
             const file = await computerGateway.downloadFile(bot, { id: owner, userId: owner, initiator: PERSON_INITIATOR }, { path });
-            if (file.bytes > 20 * 1024 * 1024) {
-              await file.body.cancel().catch(() => {});
-              throw new Error(`文件 ${path} 超过 20 MB。`);
-            }
             return { bytes: Buffer.from(await new Response(file.body).arrayBuffer()), name: file.name };
           },
         },
@@ -3875,8 +3871,11 @@ const asChannelSocket = (ws: { data: SocketData }) =>
 
 serve<SocketData>({
   port,
+  // Disable Bun's default 128 MiB request-body cap for file transfers.
+  maxRequestBodySize: 0,
   async fetch(request, server) {
     const url = new URL(request.url);
+    if (request.method === "POST" && (url.pathname === "/api/chat-files" || /^\/api\/channels\/[^/]+\/attachments$/.test(url.pathname))) server.timeout(request, 0);
     if (url.pathname === "/api/audio/transcriptions") {
       server.timeout(request, DICTATION_HTTP_IDLE_SECONDS);
     }

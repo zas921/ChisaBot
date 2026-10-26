@@ -10,9 +10,9 @@ class AttachmentFormatsTest {
             assertTrue(name, AttachmentFormats.accepts(AttachmentFormats.guess(name, "application/octet-stream")))
         }
         assertEquals("application/msword", AttachmentFormats.guess("合同.DOC", null))
-        assertEquals(20 * 1024 * 1024, AttachmentFormats.limit("application/pdf"))
-        assertEquals(8 * 1024 * 1024, AttachmentFormats.limit("image/png"))
-        assertEquals(1024 * 1024, AttachmentFormats.limit("text/plain"))
+        assertEquals(Long.MAX_VALUE, AttachmentFormats.limit("application/pdf"))
+        assertEquals(8L * 1024 * 1024, AttachmentFormats.limit("image/png"))
+        assertEquals(1024L * 1024, AttachmentFormats.limit("text/plain"))
         assertFalse(AttachmentFormats.accepts("image/svg+xml"))
     }
     @Test fun unknownSizeStreamsStillHaveABoundedRead() {

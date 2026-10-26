@@ -24,7 +24,6 @@ import {
   classifyAttachment,
   MAX_ATTACHMENTS_PER_MESSAGE,
   MAX_FILE_BYTES,
-  MAX_DOCUMENT_BYTES,
   MAX_IMAGE_BYTES,
   namesNoFormat,
 } from "../../../shared/attachments";
@@ -873,10 +872,6 @@ export function createChannelAttachmentRoutes(
         },
         413,
       );
-    }
-
-    if (kind === "file" && bytes.byteLength > MAX_DOCUMENT_BYTES) {
-      return context.json({ error: `'${name}' 文件太大（上限 20 MB）。` }, 413);
     }
 
     const uploadGroup = uploadGroupOf(formData);

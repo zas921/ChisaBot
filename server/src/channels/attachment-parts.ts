@@ -438,6 +438,23 @@ async function resolvePart(
     );
   }
 
+  // Large documents spend context on their bounded extracted text, not on the original bytes.
+  // Otherwise a successfully uploaded document over 32 MiB could never be read in a turn.
+  const kind = classifyAttachment(attachment.mimeType);
+  let documentText: string | undefined;
+  if (kind === "file") {
+    try {
+      documentText = extractDocumentText(Buffer.from(await extractFileText(attachment), "utf8"));
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "附件读取失败。";
+      if (onMissing === "note") return { type: "text", text: `[附件 "${attachment.name}" 未能读取：${reason}]` };
+      throw new Error(`无法读取附件 "${attachment.name}"：${reason}`);
+    }
+  }
+  const inlineBytes = documentText === undefined
+    ? attachment.bytes.length
+    : Buffer.byteLength(documentText, "utf8");
+
   if (budget) {
     /*
      * The same fork as above, one step later, for the file whose size could not
@@ -447,14 +464,14 @@ async function resolvePart(
      * out of every later part instead of stopping the reads here. On the message
      * being asked about there is nothing to zero, because the turn ends here.
      */
-    if (attachment.bytes.length > budget.remaining) {
+    if (inlineBytes > budget.remaining) {
       if (onMissing === "note") {
         budget.remaining = 0;
         return notIncludedNote(part, id);
       }
       tooMuchToInline(part, id, budget.limit);
     }
-    budget.remaining = Math.max(0, budget.remaining - attachment.bytes.length);
+    budget.remaining = Math.max(0, budget.remaining - inlineBytes);
   }
 
   /*
@@ -476,8 +493,6 @@ async function resolvePart(
    * that let them be stored, and the answer cannot be moved by anything a
    * client writes.
    */
-  const kind = classifyAttachment(attachment.mimeType);
-
   if (kind === "text") {
     const text = extractDocumentText(attachment.bytes);
     return {
@@ -487,14 +502,7 @@ async function resolvePart(
   }
 
   if (kind === "file") {
-    try {
-      const text = await extractFileText(attachment);
-      return { type: "text", text: `Attached file "${attachment.name}":\n\n${extractDocumentText(Buffer.from(text, "utf8"))}` };
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : "附件读取失败。";
-      if (onMissing === "note") return { type: "text", text: `[附件 "${attachment.name}" 未能读取：${reason}]` };
-      throw new Error(`无法读取附件 "${attachment.name}"：${reason}`);
-    }
+    return { type: "text", text: `Attached file "${attachment.name}":\n\n${documentText}` };
   }
   if (kind !== "image") return unreadableNote(part, id, attachment.mimeType);
 

@@ -3,7 +3,6 @@ import {
   MAX_ATTACHMENTS_PER_MESSAGE,
   MAX_FILE_BYTES,
   MAX_IMAGE_BYTES,
-  MAX_DOCUMENT_BYTES,
 } from "@/lib/channels/attachments";
 import { screenPickedFiles } from "./picked-files";
 
@@ -28,10 +27,10 @@ describe("screenPickedFiles", () => {
     expect(screenPickedFiles(files, { alreadyStaged: 0 }).accepted).toEqual(
       files,
     );
-    const large = file("large.pdf", "application/pdf", MAX_DOCUMENT_BYTES + 1);
+    const large = file("large.pdf", "application/pdf", 21 * 1024 * 1024);
     expect(
-      screenPickedFiles([large], { alreadyStaged: 0 }).rejected[0].reason,
-    ).toContain("20MB");
+      screenPickedFiles([large], { alreadyStaged: 0 }).accepted,
+    ).toEqual([large]);
   });
   test("accepts a PNG under the ceiling", () => {
     const png = file("photo.png", "image/png");

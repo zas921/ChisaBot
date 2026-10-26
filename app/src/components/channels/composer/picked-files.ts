@@ -2,7 +2,6 @@ import {
   classifyAttachment,
   MAX_ATTACHMENTS_PER_MESSAGE,
   MAX_FILE_BYTES,
-  MAX_DOCUMENT_BYTES,
   MAX_IMAGE_BYTES,
   mediaTypeOf,
   mimeForFilename,
@@ -102,19 +101,6 @@ export function screenPickedFiles(
         reject(
           file,
           `'${file.name}' 文本附件太大（上限 ${formatBytes(MAX_FILE_BYTES)}）。`,
-        ),
-      );
-      continue;
-    }
-
-    // The LOOSE ceiling for a file nobody has named yet, because this screen does not know which
-    // of the two limits applies to it. Guessing the tight one would put back exactly the refusal
-    // this branch exists to remove; the server applies the right limit once it has the bytes.
-    if ((unnamed || kind === "file") && file.size > MAX_DOCUMENT_BYTES) {
-      rejected.push(
-        reject(
-          file,
-          `'${file.name}' 超过附件上限 ${formatBytes(MAX_DOCUMENT_BYTES)}。`,
         ),
       );
       continue;

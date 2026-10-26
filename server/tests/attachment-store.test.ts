@@ -4,7 +4,7 @@ import { eq, sql } from "drizzle-orm";
 import type { MiddlewareHandler } from "hono";
 import { Hono } from "hono";
 import { MAX_IMAGE_BYTES } from "../../shared/attachments";
-import { createApp, UPLOAD_BODY_LIMIT_BYTES } from "../src/app";
+import { createApp } from "../src/app";
 import type { AppVariables } from "../src/auth/guards";
 import {
   createAttachmentRoutes,
@@ -337,7 +337,7 @@ describe("the body limit in front of the upload route", () => {
     expect(await rowsIn(channelId)).toEqual([]);
   });
 
-  test("refuses a body past the door's own ceiling in that same JSON shape", async () => {
+  test("still refuses an oversized image in JSON without a multipart body ceiling", async () => {
     const { userId, channelId } = await seedMemberChannel();
     const app = appSignedInAs(userId);
 
@@ -347,7 +347,7 @@ describe("the body limit in front of the upload route", () => {
     const response = await uploadRequest(
       app,
       channelId,
-      new File([pngOfSize(UPLOAD_BODY_LIMIT_BYTES + 1)], "enormous.png", {
+      new File([pngOfSize(21 * 1024 * 1024)], "enormous.png", {
         type: "image/png",
       }),
     );

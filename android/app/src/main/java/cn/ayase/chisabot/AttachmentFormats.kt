@@ -32,8 +32,8 @@ internal object AttachmentFormats {
         return mime.ifBlank { "application/octet-stream" }
     }
     fun accepts(mime: String) = if (mime.startsWith("image/")) mime in imageMimes else isText(mime) || mime in office.values || mime.startsWith("audio/") || mime.startsWith("video/") || mime == "application/octet-stream"
-    fun limit(mime: String): Int = when { mime in imageMimes -> 8 * 1024 * 1024; isText(mime) -> 1024 * 1024; else -> 20 * 1024 * 1024 }
-    fun read(input: InputStream, maxBytes: Int): ByteArray {
+    fun limit(mime: String): Long = when { mime in imageMimes -> 8L * 1024 * 1024; isText(mime) -> 1024L * 1024; else -> Long.MAX_VALUE }
+    fun read(input: InputStream, maxBytes: Long): ByteArray {
         val output = ByteArrayOutputStream()
         val buffer = ByteArray(8192)
         while (true) {

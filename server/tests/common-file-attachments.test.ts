@@ -6,9 +6,24 @@ import {
   mimeForFilename,
 } from "../../shared/attachments";
 import { sniffMimeType } from "../src/channels/attachment-mime";
-import { resolveAttachmentParts } from "../src/channels/attachment-parts";
+import { newInlineBudget, resolveAttachmentParts } from "../src/channels/attachment-parts";
 
 describe("common chat files reach the model as actual extracted text", () => {
+  test("a document over 32 MiB is extracted and charged for its readable text", async () => {
+    // PDF permits trailing whitespace. Keep a real text page and cross both former size gates.
+    const pdf = readFileSync(new URL("./fixtures/common-files/invoice.pdf", import.meta.url));
+    const bytes = Buffer.concat([pdf, Buffer.alloc(33 * 1024 * 1024, 0x20)]);
+    const budget = newInlineBudget();
+    const parts = await resolveAttachmentParts(
+      [{ type: "document", source: { type: "url", value: "/api/attachments/large" } }],
+      async () => ({ name: "large.pdf", mimeType: "application/pdf", bytes }),
+      "fail",
+      budget,
+    ) as Array<{ text: string }>;
+    expect(parts[0].text).toContain("Quarterly revenue 12345");
+    expect(budget.remaining).toBeGreaterThan(31 * 1024 * 1024);
+    expect(budget.remaining).toBeLessThan(budget.limit);
+  });
   for (const [name, expected] of [
     ["report.docx", "中文合同 金额12345"],
     ["sales.xlsx", "12345"],
@@ -59,7 +74,7 @@ describe("common chat files reach the model as actual extracted text", () => {
     )) as Array<{ text: string }>;
     expect(parts[0].text).toContain("未能读取");
   });
-  test("binary Office claims require matching bytes and the 20 MB limit is exported", () => {
+  test("binary Office claims require matching bytes and document upload size is unrestricted", () => {
     expect(
       sniffMimeType(
         Buffer.from("not a Word document"),
@@ -67,7 +82,7 @@ describe("common chat files reach the model as actual extracted text", () => {
         "wrong.doc",
       ),
     ).toBe("application/octet-stream");
-    expect(MAX_DOCUMENT_BYTES).toBe(20 * 1024 * 1024);
+    expect(MAX_DOCUMENT_BYTES).toBe(Number.POSITIVE_INFINITY);
     for (const name of [
       "test.doc",
       "test.xls",
