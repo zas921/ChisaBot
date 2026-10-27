@@ -24,7 +24,7 @@ type Element = {
   repeat?: { statePath?: unknown } | null;
 };
 
-const CONTAINERS = new Set(["Stack", "Grid", "Card", "Carousel", "Accordion", "Tabs"]);
+const CONTAINERS = new Set(["Stack", "Grid", "Card", "Carousel", "Accordion", "Tabs", "SwipeFeed"]);
 
 /** 数据在某个数组属性里的组件：数组为空就是空区块（2026-10-13 富组件）。 */
 const ARRAY_PROP: Record<string, string> = {

@@ -58,6 +58,14 @@ if (isLocalPage) {
     exposeWindowControls();
     const bool = (v) => (typeof v === "boolean" ? v : undefined);
     contextBridge.exposeInMainWorld("chisabotPC", {
+      media: {
+        version: 1,
+        open: (input) => ipcRenderer.invoke("media:open", input),
+        layout: (input) => ipcRenderer.invoke("media:layout", input),
+        control: (input) => ipcRenderer.invoke("media:control", input),
+        release: (id) => ipcRenderer.invoke("media:release", id),
+        onState(callback) { const listener = (_event, state) => callback(state); ipcRenderer.on("media:state", listener); return () => ipcRenderer.removeListener("media:state", listener); },
+      },
       state: () => ipcRenderer.invoke("pc:state"),
       setLocal: (patch) =>
         ipcRenderer.invoke("pc:set", {

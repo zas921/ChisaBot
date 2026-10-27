@@ -1,0 +1,18 @@
+.jr-media { margin: 0; min-width: 0; width: 100%; overflow: hidden; }
+.jr-media figcaption { margin-bottom: 8px; font-size: 13px; }
+.jr-media video { display: block; background: #101114; border-radius: 10px; }
+.jr-media audio { display: block; width: 100%; }
+.jr-media iframe { display: block; width: 100%; border: 0; border-radius: 8px; }
+.jr-media-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.jr-media-toolbar > span { flex: 1 1 100%; font-size: 13px; }
+.jr-media-toolbar button { border: 1px solid var(--border); border-radius: 6px; padding: 5px 9px; font: inherit; font-size: 12px; background: transparent; cursor: pointer; }
+.jr-media-toolbar button:disabled { opacity: .5; cursor: default; }
+.jr-media-toolbar button:focus-visible, .jr-swipe-feed:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+.jr-media-note, .jr-web-slot > p { font-size: 12px; line-height: 1.5; color: var(--muted-foreground); overflow-wrap: anywhere; }
+.jr-web-slot { border: 1px dashed var(--border); border-radius: 8px; display: grid; place-items: center; padding: 12px; }
+.jr-swipe-feed { display: flex; flex-direction: column; min-height: 0; overflow-x: hidden; overflow-y: auto; scroll-snap-type: y mandatory; overscroll-behavior-y: contain; touch-action: pan-y; border-radius: 10px; }
+.jr-swipe-page { flex: 0 0 100%; height: 100%; min-height: 0; overflow: hidden; scroll-snap-align: start; scroll-snap-stop: always; display: flex; flex-direction: column; justify-content: center; }
+.jr-swipe-page > * { min-height: 0; max-height: 100%; }
+.jr-swipe-page .jr-media { display: flex; flex-direction: column; max-height: 100%; }
+.jr-swipe-page video { flex: 1; min-height: 0; }
+@media (prefers-reduced-motion: reduce) { .jr-swipe-feed { scroll-behavior: auto; } }

@@ -7,6 +7,7 @@ import {
 } from "@json-render/core";
 import { schema } from "@json-render/react/schema";
 import { z } from "zod";
+import { mediaHttpsUrl } from "../media";
 
 /**
  * 生成式界面（json-render）的组件目录，服务器与浏览器共用一份。
@@ -273,6 +274,46 @@ export const jsonRenderCatalog = defineCatalog(schema, {
       }),
       slots: [],
       description: "图片。只用你确实拿到的真实 https 图片地址，不要编造链接。",
+    },
+    Video: {
+      props: z.object({
+        src: z.string().refine((value) => mediaHttpsUrl(value) !== null, "必须是无用户名和密码的 HTTPS 媒体地址"),
+        title: z.string().max(160).nullish(),
+        poster: z.string().refine((value) => mediaHttpsUrl(value) !== null, "封面必须是 HTTPS 地址").nullish(),
+        autoplay: z.boolean().nullish(),
+        muted: z.boolean().nullish(),
+        loop: z.boolean().nullish(),
+        aspect: z.enum(["16:9", "9:16", "4:3", "auto"]).nullish(),
+      }),
+      slots: [],
+      description: "带播放、声音、进度和全屏控制的视频播放器。src 必须是真实 HTTPS 视频流，不能填网站页面。默认点击播放；自动有声播放可能被浏览器拦截。",
+    },
+    Audio: {
+      props: z.object({
+        src: z.string().refine((value) => mediaHttpsUrl(value) !== null, "必须是无用户名和密码的 HTTPS 媒体地址"),
+        title: z.string().max(160).nullish(),
+        loop: z.boolean().nullish(),
+      }),
+      slots: [],
+      description: "带播放、声音和进度控制的音频播放器。只接受真实 HTTPS 音频地址，默认不自动播放。",
+    },
+    WebEmbed: {
+      props: z.object({
+        url: z.string().refine((value) => mediaHttpsUrl(value) !== null, "必须是无用户名和密码的 HTTPS 网页地址"),
+        title: z.string().max(160),
+        mode: z.enum(["iframe", "browser"]).nullish(),
+        height: z.number().int().min(180).max(720).nullish(),
+      }),
+      slots: [],
+      description: "用户点击加载后打开外部网页。iframe 模式供允许嵌入的官方播放器；browser 模式需要支持媒体面板的 PC 客户端，以独立浏览器会话打开完整网站，支持网站自身的滚动和手势及弹出小窗。网站拒绝嵌入时不要声称 iframe 可用。",
+    },
+    SwipeFeed: {
+      props: z.object({
+        label: z.string().max(160).nullish(),
+        height: z.number().int().min(180).max(720).nullish(),
+      }),
+      slots: ["default"],
+      description: "纵向逐页滑动容器，每个直接子元素是一页；支持滚轮、触控板、触摸及鼠标上下拖动，不生成上一条或下一条按钮。可放 Video 或其他内容。它不提供网站推荐流或视频地址。",
     },
     Separator: {
       props: z.object({ label: z.string().nullish().describe("可选，线中间的小字") }),

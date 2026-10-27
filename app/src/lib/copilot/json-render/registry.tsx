@@ -32,6 +32,7 @@ import {
 } from "./rich";
 import { ActionArea, useLiveValue, useRichActions } from "./rich-context";
 import { Products } from "./products";
+import { AudioPlayer, SwipeFeed, VideoPlayer, WebEmbed } from "./media";
 import { safeHttp, safeHttps, splitDotted, trendOfText } from "./rich-utils";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -601,6 +602,10 @@ export const { registry: jsonRenderRegistry } = defineRegistry(jsonRenderCatalog
         </figure>
       );
     },
+    Video: ({ props }) => <VideoPlayer {...props} />,
+    Audio: ({ props }) => <AudioPlayer {...props} />,
+    WebEmbed: ({ props }) => <WebEmbed {...props} />,
+    SwipeFeed: ({ props, children }) => <SwipeFeed {...props}>{children}</SwipeFeed>,
     Separator: ({ props }) =>
       props.label ? (
         <div className="jr-sep-l jr-el">

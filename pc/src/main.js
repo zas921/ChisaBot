@@ -48,6 +48,7 @@ const { ensureEnrolled } = require("./agent/enrollment");
 const { createUpstreamNotice } = require("./upstream-notice");
 const shellRefresh = require("./shell-refresh");
 const { createCompactController } = require("./compact-window");
+const { createMediaHost } = require("./media-host");
 const { computeUpdateBounds } = require("./update-placement");
 const windowChrome = require("./window-chrome");
 const buildConfig = require("./build-config");
@@ -1296,7 +1297,9 @@ async function setLocal(patch) {
   return webLocalState();
 }
 
+let mediaHost = null;
 function registerIpc() {
+  mediaHost = createMediaHost({ authorize: fromServerPage, getParentWindow: () => windows.chat });
   // 本机页面（设置向导 / 审批 / 本机确认 / 离线页）
   handleLocal("state:get", () => publicState());
   // 本机登录页（ui/login.html）。错误带 kind，登录页据此把提示放到对应输入框旁；
@@ -1461,6 +1464,8 @@ app.on("window-all-closed", () => {
   /* 常驻托盘 */
 });
 app.on("before-quit", () => {
+  mediaHost?.destroy();
+  mediaHost = null;
   quitting = true;
   agent?.stop();
   // 下载好的更新需要重新安装（换了图标 / 组件）而用户选了「稍后」：退出这一刻静默重新安装。

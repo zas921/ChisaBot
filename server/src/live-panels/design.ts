@@ -212,6 +212,7 @@ const L = PANEL_LIMITS;
 
 /** 给机器人的面板设计规范 + 制作流程（系统提示词）。 */
 export const PANEL_DESIGN_GUIDE = [
+  "媒体能力：Video / Audio 使用真实 HTTPS 媒体流；WebEmbed 的 iframe 模式仅适用于允许嵌入的网页，browser 模式需要新版 PC 客户端。SwipeFeed 提供纵向滑动翻页，每个直接子元素是一页，不用按钮替代滑动。以上只提供渲染能力，不提供站源、推荐流或网页解析服务；不得把网站页面地址当成视频流，也不要声称未经播放验收的来源已经可用。",
   "【面板设计规范】右栏面板是一张窄卡片（先按 300px 宽设计，手机和宽屏会自动适配）。用户扫一眼就要看懂，而且要好看：用图表、环、着色磁贴、封面、状态点把数据「画」出来，而不是一堆文字。",
   "制作流程（每次 panel_update 之前都走一遍）：",
   "1. 一句话问题：先想清楚这张面板回答用户的哪一个问题（例如「比特币现在多少钱、这周涨还是跌」「香港这几天会不会下雨」），和这个问题无关的数据一律不放。",
@@ -244,7 +245,7 @@ export const PANEL_DESIGN_GUIDE = [
 type El = { type?: string; props?: Record<string, unknown>; children?: unknown[]; repeat?: unknown };
 
 /** 算「大块」的组件（HeatStrip 只有日历形态算，Ring 只有多段甜甜圈算，见 isBig）。 */
-const BIG_PARTS = new Set(["Table", "List", "Image", "Chart", "Hero", "Timeline", "KeyValue", "Carousel", "Gauge", "Products"]);
+const BIG_PARTS = new Set(["Table", "List", "Image", "Chart", "Hero", "Timeline", "KeyValue", "Carousel", "Gauge", "Products", "Video", "Audio", "WebEmbed", "SwipeFeed"]);
 
 /** 链接 / 图片地址：必须是 http(s)（图片 https），且不是示例里的占位地址。 */
 function badUrl(value: unknown, httpsOnly: boolean): string | null {
@@ -483,7 +484,9 @@ export function lintPanelSpec(source: string, panelTitle: string): string[] {
     check(p.href, "href", false);
     if (el.type === "Link") check(p.url, "url", false);
     check(p.image, "image", true);
-    if (el.type === "Avatar" || el.type === "Image") check(p.src, "src", true);
+    if (["Avatar", "Image", "Video", "Audio"].includes(el.type ?? "")) check(p.src, "src", true);
+    if (el.type === "Video") check(p.poster, "poster", true);
+    if (el.type === "WebEmbed") check(p.url, "url", true);
     for (const item of Array.isArray(p.items) ? (p.items as Record<string, unknown>[]) : []) {
       if (!item || typeof item !== "object") continue;
       check(item.href, "href", false);

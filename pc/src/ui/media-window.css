@@ -1,0 +1,2 @@
+body { margin: 0; font: 13px var(--font-sans, system-ui); }
+nav { height: 48px; display: flex; align-items: center; gap: 8px; padding: 0 10px; background: var(--glass-1); }

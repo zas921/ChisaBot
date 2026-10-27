@@ -59,6 +59,7 @@ export type PcLocalPatch = Partial<
 >;
 
 export type PcBridge = {
+  media?: import("../../../shared/media").PanelWebBridge;
   state(): Promise<PcLocalState>;
   /** 收紧（开启紧急停止 / 开启本机确认）立即生效；放松要在 PC 上本机确认，用户取消时返回的状态不变。 */
   setLocal(patch: PcLocalPatch): Promise<PcLocalState>;
