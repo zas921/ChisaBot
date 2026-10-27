@@ -904,7 +904,7 @@ export function ChannelChat({
    * `Error: signal is aborted without reason`，这一轮以「运行命令 这一步出错」收尾（2026-10-20 真机）。
    *
    * 现在看门狗看的是**静默**：模型在写、工具在跑、工具结果在回来，都刷新这个时刻；真的什么都没动满
-     * 12 秒（首段）查消息是否落库，180 秒静默只探测后台，仍运行就等到最终上限。
+   * 12 秒（首段）查消息是否落库，180 秒静默只探测后台，仍运行就等到最终上限。
    */
   const runProgressAt = useRef(0);
   const noteRunProgress = useRef(() => {

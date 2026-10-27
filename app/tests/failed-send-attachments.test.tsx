@@ -4,6 +4,7 @@ import {
   beforeAll,
   beforeEach,
   expect,
+  spyOn,
   test,
 } from "bun:test";
 import type { Message, RunAgentInput } from "@ag-ui/core";
@@ -32,6 +33,7 @@ import {
 } from "@/lib/channels/queries";
 import { queryClient } from "@/query-client";
 import { settleReactWork } from "./settle-react-work";
+import { SEND_REPLY_WAITING_NOTICE, SEND_REPLY_LIMIT_REASON } from "@/lib/copilot/connection-drop";
 
 /**
  * WHAT A FAILED SEND DOES TO THE FILES IT WAS CARRYING, DRIVEN THROUGH THE REAL CHANNEL.
@@ -90,6 +92,7 @@ let uploads: string[];
 let runAnswers: ((input: RunAgentInput) => Promise<Response>)[];
 let core: ReturnType<typeof useCopilotKit>["copilotkit"] | undefined;
 let originalFetch: typeof fetch;
+let watchdogFixture: { running: boolean; mutations: string[] } | null = null;
 
 function CoreProbe() {
   core = useCopilotKit().copilotkit;
@@ -134,6 +137,19 @@ beforeAll(() => {
             : input.url,
         "http://localhost",
       );
+      if (watchdogFixture) {
+        if (/\/api\/bot-threads\/[^/]+\/sync$/.test(url.pathname))
+          return NativeResponse.json({ current: null, thread: {
+            threadId: channel.threadId, seq: "1", running: watchdogFixture.running,
+            live: watchdogFixture.running, waiting: false, workers: null, inbox: null,
+          } });
+        if (/\/threads\/[^/]+\/messages$/.test(url.pathname))
+          return NativeResponse.json({ messages: runs[0]?.messages ?? [opening] });
+        if (url.pathname.endsWith("/unlock") || url.pathname.includes("/stop/") || url.pathname === "/api/ops/budget") {
+          watchdogFixture.mutations.push(url.pathname);
+          return NativeResponse.json({ ok: true, stopped: true });
+        }
+      }
       if (init?.method === "DELETE") {
         deletes.push(url.pathname);
         return new NativeResponse(null, { status: 204 });
@@ -201,10 +217,59 @@ beforeAll(() => {
 });
 
 beforeEach(() => {
+  watchdogFixture = null;
   runs = [];
   deletes = [];
   uploads = [];
   runAnswers = [];
+});
+
+test("a persisted silent run keeps its Stop button beyond three minutes without stop/unlock", async () => {
+  const response = deferred();
+  runAnswers = [() => response.promise];
+  const view = await mounted();
+  const user = userEvent.setup({ document: view.container.ownerDocument });
+  await user.type(view.getByRole("textbox", { name: "消息" }), "Think through this task");
+  await user.click(view.getByRole("button", { name: "发送消息" }));
+  await waitFor(() => expect(runs).toHaveLength(1));
+  watchdogFixture = { running: true, mutations: [] };
+  const realNow = Date.now;
+  let offset = 181_000;
+  const clock = spyOn(Date, "now").mockImplementation(() => realNow() + offset);
+  try {
+    await waitFor(() => expect(view.queryByText(SEND_REPLY_WAITING_NOTICE)).not.toBeNull(), { timeout: 5_000 });
+    expect(watchdogFixture.mutations).toEqual([]);
+    expect(view.queryByLabelText("停止机器人")).not.toBeNull();
+    await user.click(view.getByLabelText("停止机器人"));
+    await waitFor(() => expect(watchdogFixture?.mutations.some((path) => path.endsWith("/unlock"))).toBe(true));
+    watchdogFixture.running = false;
+    response.settle(finished(runs[0]!));
+    offset = 0;
+    await waitFor(() => expect(view.queryByText(SEND_REPLY_WAITING_NOTICE)).toBeNull());
+  } finally {
+    clock.mockRestore();
+    response.settle(finished(runs[0]!));
+  }
+});
+
+test("a silent live server cannot prevent the channel's final 25 minute stop", async () => {
+  const response = deferred();
+  runAnswers = [() => response.promise];
+  const view = await mounted();
+  const user = userEvent.setup({ document: view.container.ownerDocument });
+  await user.type(view.getByRole("textbox", { name: "消息" }), "A bounded task");
+  await user.click(view.getByRole("button", { name: "发送消息" }));
+  await waitFor(() => expect(runs).toHaveLength(1));
+  watchdogFixture = { running: true, mutations: [] };
+  const realNow = Date.now;
+  const clock = spyOn(Date, "now").mockImplementation(() => realNow() + 25 * 60_000 + 1_000);
+  try {
+    await waitFor(() => expect(watchdogFixture?.mutations.some((path) => path.endsWith("/unlock"))).toBe(true), { timeout: 5_000 });
+    expect(view.queryByText(SEND_REPLY_LIMIT_REASON)).not.toBeNull();
+  } finally {
+    clock.mockRestore();
+    response.settle(finished(runs[0]!));
+  }
 });
 
 afterEach(() => {
