@@ -71,6 +71,100 @@ export const SEND_WATCHDOG_MS = 12_000;
 /** 已落库后继续等回答的上限。比 SEND_WATCHDOG_MS 长（模型可能慢），但仍封顶以免永久卡住。 */
 export const SEND_REPLY_WATCHDOG_MS = 180_000;
 
+/** 与服务端 MAX_RUN_WALL_MS 相同；后台的续锁或流事件均不能延长本轮总上限。 */
+export const SEND_REPLY_MAX_MS = 25 * 60_000;
+export const SEND_REPLY_LIMIT_REASON =
+  "这一轮已达到 25 分钟运行上限，已停止。可以拆分任务后继续。";
+export const SEND_REPLY_WAITING_NOTICE =
+  "模型还没有返回内容，服务器仍在处理。可以继续等待，或点「停止」。";
+
+export type ReplyWaitOutcome =
+  | "done"
+  | "stopped"
+  | "timeout"
+  | "server_idle"
+  | "unreachable";
+
+/**
+ * 已落库的消息：静默只触发只读状态探测，不能据此停止模型。探测也不能续期总上限。
+ * 独立计时循环保证状态接口卡住、流持续输出时，手动停止和总上限仍然生效。
+ * 返回 unreachable 时只放下本地等待，不对状态未知的后台发送 stop / unlock。
+ */
+export function waitForPersistedReply<T>(
+  run: Promise<T>,
+  deps: {
+    afterMs: (ms: number) => Promise<void>;
+    startedAt: number;
+    lastProgressAt: () => number;
+    running: () => Promise<boolean | null | "unsupported">;
+    stopped: () => boolean;
+    onWaiting?: (waiting: boolean) => void;
+    now?: () => number;
+    silenceMs?: number;
+    maxMs?: number;
+    probeMs?: number;
+    unreachableMs?: number;
+  },
+): Promise<ReplyWaitOutcome> {
+  const now = deps.now ?? Date.now;
+  const silenceMs = deps.silenceMs ?? SEND_REPLY_WATCHDOG_MS;
+  const maxMs = deps.maxMs ?? SEND_REPLY_MAX_MS;
+  const probeMs = deps.probeMs ?? 5_000;
+  const unreachableMs = deps.unreachableMs ?? 15_000;
+  return new Promise((resolve) => {
+    let settled = false;
+    let probing = false;
+    let nextProbeAt = 0;
+    let unansweredSince: number | null = null;
+    let waiting = false;
+    const showWaiting = (value: boolean) => {
+      if (waiting === value) return;
+      waiting = value;
+      deps.onWaiting?.(value);
+    };
+    const finish = (value: ReplyWaitOutcome) => {
+      if (settled) return;
+      settled = true;
+      showWaiting(false);
+      resolve(value);
+    };
+    void run.then(() => finish("done"), () => finish("done"));
+    const watch = async () => {
+      while (!settled) {
+        if (deps.stopped()) return finish("stopped");
+        const remaining = deps.startedAt + maxMs - now();
+        if (remaining <= 0) return finish("timeout");
+        if (now() - deps.lastProgressAt() < silenceMs) {
+          showWaiting(false);
+          unansweredSince = null;
+        } else {
+          if (unansweredSince !== null && now() - unansweredSince >= unreachableMs)
+            return finish("unreachable");
+          if (!probing && now() >= nextProbeAt) {
+            probing = true;
+            unansweredSince ??= now();
+            void Promise.resolve().then(deps.running).catch(() => null).then((running) => {
+              probing = false;
+              if (settled || deps.stopped()) return;
+              // 流已恢复时，忽略较早发起的状态探测，防止旧响应覆盖新进展。
+              if (now() - deps.lastProgressAt() < silenceMs) return;
+              nextProbeAt = now() + probeMs;
+              if (running === true) {
+                unansweredSince = null;
+                showWaiting(true);
+              } else if (running === false) {
+                finish("server_idle");
+              }
+            });
+          }
+        }
+        await deps.afterMs(Math.min(SEND_WATCHDOG_POLL_MS, remaining));
+      }
+    };
+    void watch();
+  });
+}
+
 /** 有 `lastProgressAt` 时重新看一次的粒度：一秒一次，够准，也不吵。 */
 export const SEND_WATCHDOG_POLL_MS = 1_000;
 

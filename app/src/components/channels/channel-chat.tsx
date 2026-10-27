@@ -48,11 +48,13 @@ import {
   isConnectionDrop,
   raceSendWatchdog,
   reportBudgetEvent,
-  SEND_REPLY_WATCHDOG_MS,
+  SEND_REPLY_LIMIT_REASON,
+  SEND_REPLY_WAITING_NOTICE,
   SEND_UNREACHABLE_REASON,
   SEND_WATCHDOG_MS,
   settleDroppedTurn,
   storedTurnAnswered,
+  waitForPersistedReply,
   pingRelayAlive,
   RELAY_ALIVE_INTERVAL_MS,
 } from "@/lib/copilot/connection-drop";
@@ -880,6 +882,8 @@ export function ChannelChat({
 
   // Run failures arrive as events and are reported only for turns started in this mount.
   const [runError, setRunError] = useState<string | null>(null);
+  const [waitingForModel, setWaitingForModel] = useState(false);
+  const replyWaitAbort = useRef<AbortController | null>(null);
   /** 服务器说这一轮还在、却停在一步没人执行的浏览器操作上（§109）：给「停止」，并说清原因。 */
   const [relayStalled, setRelayStalled] = useState(false);
   /**
@@ -900,7 +904,7 @@ export function ChannelChat({
    * `Error: signal is aborted without reason`，这一轮以「运行命令 这一步出错」收尾（2026-10-20 真机）。
    *
    * 现在看门狗看的是**静默**：模型在写、工具在跑、工具结果在回来，都刷新这个时刻；真的什么都没动满
-   * 12 秒（首段）/ 180 秒（等回答）才算挂起。
+     * 12 秒（首段）查消息是否落库，180 秒静默只探测后台，仍运行就等到最终上限。
    */
   const runProgressAt = useRef(0);
   const noteRunProgress = useRef(() => {
@@ -1038,6 +1042,7 @@ export function ChannelChat({
     );
 
     setRunError(null);
+    setWaitingForModel(false);
     setRelayStalled(false);
     forgetTurnOutcome(channel.threadId);
     turnFailure.current = null;
@@ -1118,6 +1123,8 @@ export function ChannelChat({
         failRef.current(stoppedReason(error));
       },
     });
+    const waitAbort = new AbortController();
+    replyWaitAbort.current = waitAbort;
     try {
       /*
        * DOG-01 实机 FAIL（v0.1.18）：sync 仍通时 connection-drop 的 10s unreachable 不会触发；
@@ -1125,6 +1132,7 @@ export function ChannelChat({
        * 这里给 run 加硬超时：超时后停掉、查落库；没落库就可见失败并让外层把草稿放回输入框。
        */
       noteRunProgress.current();
+      const runStartedAt = Date.now();
       const runPromise = copilotkit.runAgent({
         agent: target,
         ...((panelAuthoring || inboxSourceId) ? { forwardedProps: {
@@ -1175,36 +1183,71 @@ export function ChannelChat({
           void runPromise.catch(() => undefined);
           throw new Error(first.reason);
         }
-        // Message reached the server; wait longer for a slow model, but still bound
-        // (CR-P1-03): unbounded await here wedged runsInFlight / composer forever.
-        const raceReply = await raceSendWatchdog(runPromise, {
+        // 静默不等于失败：确认后台还在运行就继续等，只有墙钟总上限才自动停止。
+        const reply = await waitForPersistedReply(runPromise, {
           afterMs,
-          timeoutMs: SEND_REPLY_WATCHDOG_MS,
+          startedAt: runStartedAt,
           lastProgressAt,
+          stopped: () => waitAbort.signal.aborted,
+          onWaiting: (waiting) => {
+            if (mountedRef.current && replyWaitAbort.current === waitAbort) setWaitingForModel(waiting);
+          },
+          running: async () => {
+            const state = await readSync(runtimeAgentId, channel.threadId, 5_000);
+            if (state === "unsupported") return "unsupported";
+            return state?.thread?.threadId === channel.threadId ? state.thread.running : null;
+          },
         });
-        const second = decideSendWatchdogAction({
-          firstRace: "timeout",
-          persisted: true,
-          replyRace: raceReply,
-        });
-        if (second.kind === "reply_hang") {
+        if (reply === "stopped") {
+          void runPromise.catch(() => undefined);
+          return;
+        }
+        if (reply === "timeout") {
           try {
             copilotkit.stopAgent({ agent: target });
           } catch {
             /* stop best-effort */
           }
-          reportBudgetEvent(second.budget);
+          reportBudgetEvent("SEND_REPLY_HANG");
           forceUnlockThread(channel.threadId);
-          failRef.current(second.reason);
+          failRef.current(SEND_REPLY_LIMIT_REASON);
           void runPromise.catch(() => undefined);
-          throw new Error(second.reason);
+          throw new Error(SEND_REPLY_LIMIT_REASON);
         }
-        await runPromise;
+        if (reply === "unreachable") {
+          // 状态未知：不停止后台，也不解锁。重连后由同步恢复。
+          const reason = "暂时无法确认服务器上的运行状态。恢复连接或刷新后可继续查看。";
+          failRef.current(reason);
+          void target.detachActiveRun().catch(() => undefined);
+          void runPromise.catch(() => undefined);
+          throw new Error(reason);
+        }
+        if (reply === "server_idle") {
+          // 可能只是浏览器丢了结束事件：读回已完成的回答，绝不重发任务。
+          const saved = await readThreadMessages(channel.threadId, runtimeAgentId).catch(() => null);
+          if (saved?.availability === "ready" && storedTurnAnswered(saved.messages as never, userMessageId)) {
+            target.setMessages(withStoredTail(mergeStoredMessages(target.messages, saved.messages), saved.messages));
+            awaitingReply.current = false;
+            void target.detachActiveRun().catch(() => undefined);
+          } else {
+            failRef.current(CONNECTION_LOST_REASON);
+            void target.detachActiveRun().catch(() => undefined);
+            void runPromise.catch(() => undefined);
+            throw new Error(CONNECTION_LOST_REASON);
+          }
+          void runPromise.catch(() => undefined);
+        } else {
+          await runPromise;
+        }
       } else {
         await runPromise;
       }
     } finally {
       runWatch.unsubscribe();
+      if (replyWaitAbort.current === waitAbort) {
+        replyWaitAbort.current = null;
+        if (mountedRef.current) setWaitingForModel(false);
+      }
       setRunsInFlight((count) => Math.max(0, count - 1));
     }
     if (!stopRequestedRef.current) await persistFailedFrontendResults(channel.threadId, target.messages);
@@ -1498,6 +1541,8 @@ export function ChannelChat({
       setLocalStops((previous) => new Set([...previous, lastUser.id]));
     // Also blocks inbox fallback after Stop during a frontend tool handoff.
     stopRequestedRef.current = true;
+    replyWaitAbort.current?.abort();
+    setWaitingForModel(false);
     awaitingReply.current = false;
     // Track B：停止必须立刻放下 busy，不能干等 runPromise/finally——否则频道永久灰。
     turnsRef.current = 0;
@@ -1847,6 +1892,11 @@ export function ChannelChat({
                  * it — and they are independent, so neither is an `else` for the other.
                  */
                 <>
+                  {waitingForModel ? (
+                    <p className="pb-2 text-sm text-muted-foreground" role="status">
+                      {SEND_REPLY_WAITING_NOTICE}
+                    </p>
+                  ) : null}
                   <HandoffResumeNotice
                     botId={runtimeAgentId}
                     agent={agent}

@@ -55,15 +55,14 @@ export type FallbackDeps = {
 };
 
 /**
- * 主模型卡住多久就换备用（DESIGN.md §101.10）。2026-10-18 生产：codex/gpt-6-luna 一次 45 秒一个字都没回
- * （自检 45007 ms 失败），备用模型完全没被用上——包装只在主模型「报错」时换，一直不回不算错。
- * 30 秒：正常的第一段输出 1–3 秒就到（流式时 Responses API 一开始就有 response.created），自检 45 秒的
- * 上限里还留得出时间给备用模型答完。CHISABOT_MODEL_FIRST_OUTPUT_MS 可改，0 关闭。
+ * 静默可能是上游隐藏了思考过程，不能默认 30 秒就中止主模型并切换。
+ * 默认关闭首输出期限；显式 CHISABOT_MODEL_FIRST_OUTPUT_MS 仍可启用。
+ * 明确的额度 / 服务错误照常切换；会话运行器的 25 分钟墙钟与用户停止仍约束请求。
  */
 export const FIRST_OUTPUT_MS = (() => {
   const raw = process.env.CHISABOT_MODEL_FIRST_OUTPUT_MS;
   const n = raw === undefined || raw === "" ? NaN : Number(raw);
-  return Number.isFinite(n) && n >= 0 ? n : 30_000;
+  return Number.isFinite(n) && n >= 0 ? n : 0;
 })();
 
 class FirstOutputTimeout extends Error {

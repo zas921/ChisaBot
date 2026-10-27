@@ -65,10 +65,10 @@ export async function writeServerThread(agentId: string, threadId: string, onlyI
 }
 
 /** 问一次对话的变化戳；「服务器没有这个接口」单独返回 "unsupported"（频道聊天用，见 thread-activity.ts）。 */
-export async function readSync(agentId: string, threadId: string): Promise<SyncReply | "unsupported" | null> {
+export async function readSync(agentId: string, threadId: string, timeoutMs?: number): Promise<SyncReply | "unsupported" | null> {
   try {
     return await readJson<SyncReply>(
-      await tryClient(`${botThreadsApi(agentId)}/sync?threadId=${encodeURIComponent(threadId)}`),
+      await tryClient(`${botThreadsApi(agentId)}/sync?threadId=${encodeURIComponent(threadId)}`, { timeoutMs }),
     );
   } catch {
     return null;
