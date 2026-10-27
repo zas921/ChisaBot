@@ -84,7 +84,9 @@ suite("thread truncation on a dedicated PostgreSQL database", () => {
     expect(await stored()).toEqual(["u1", "answer-r1"]);
 
     const replay = await collect(backend.runner.connect({ threadId: thread, agentId: bot }));
-    expect(replay.filter((event) => event.type === EventType.RUN_STARTED)).toHaveLength(1);
+    expect(replay.find((event) => event.type === EventType.MESSAGES_SNAPSHOT)).toMatchObject({
+      messages: [{ id: "u1" }, { id: "answer-r1" }],
+    });
     expect(JSON.stringify(replay)).not.toContain("answer-r2");
     const runs = await database.$client.unsafe<{ run_id: string }[]>("SELECT run_id FROM openbot_local_runs WHERE thread_id = $1 ORDER BY run_id", [thread]);
     expect(runs.map((row) => row.run_id)).toEqual(["r1"]);
@@ -118,5 +120,46 @@ suite("thread truncation on a dedicated PostgreSQL database", () => {
     expect(response?.status).toBe(200);
     expect(await stored()).toEqual(["u1", "answer-r1"]);
     expect(((await response!.json()) as { revision: string }).revision).toBe("2");
+  });
+
+  test("edits a mid-run supplement, preserves its prefix on reconnect and accepts later edits", async () => {
+    const primary = { id: "primary", role: "user", content: "original question" } as Message;
+    const supplement = { id: "supplement", role: "user", content: "old supplement" } as Message;
+    const prefix = [
+      { id: "u1", role: "user", content: "one" },
+      { id: "answer-r1", role: "assistant", content: "ok" },
+      primary,
+      { id: "before-supplement", role: "assistant", content: "already answered" },
+    ] as Message[];
+    const old = [...prefix, supplement, { id: "old-tail", role: "assistant", content: "old answer" }] as Message[];
+    class SupplementAgent extends AbstractAgent {
+      protected run(input: RunAgentInput) {
+        return of(
+          { type: EventType.RUN_STARTED, threadId: thread, runId: input.runId },
+          { type: EventType.MESSAGES_SNAPSHOT, messages: old },
+          { type: EventType.RUN_FINISHED, threadId: thread, runId: input.runId },
+        ) as Observable<BaseEvent>;
+      }
+    }
+    await collect(backend.runner.run({ threadId: thread, agent: new SupplementAgent({ agentId: bot }), input: input("r-supplement", [primary]) }));
+    expect(await stored()).toEqual(old.map((message) => message.id));
+    const response = await truncate({ fromMessageId: "supplement", mode: "edit" });
+    expect(response?.status).toBe(200);
+    expect(await response!.json()).toMatchObject({ removed: ["supplement", "old-tail"] });
+    expect(await stored()).toEqual(prefix.map((message) => message.id));
+    const replay = await collect(backend.runner.connect({ threadId: thread, agentId: bot }));
+    expect(replay.find((event) => event.type === EventType.MESSAGES_SNAPSHOT)).toMatchObject({ messages: prefix });
+    const events = await database.$client.unsafe("SELECT event FROM openbot_local_events WHERE thread_id = $1 AND run_id = 'r-supplement'", [thread]);
+    expect(events).toHaveLength(0);
+    const runs = await database.$client.unsafe("SELECT run_id FROM openbot_local_runs WHERE thread_id = $1 AND run_id = 'r-supplement'", [thread]);
+    expect(runs).toHaveLength(0);
+
+    const edited = { id: "edited-supplement", role: "user", content: "new supplement" } as Message;
+    await turn("r-edited", [...old, edited]);
+    expect(await stored()).toEqual([...prefix.map((message) => message.id), edited.id, "answer-r-edited"]);
+    const second = await truncate({ fromMessageId: primary.id, mode: "edit" });
+    expect(second?.status).toBe(200);
+    expect(await stored()).toEqual(["u1", "answer-r1"]);
+    expect(await database.$client.unsafe("SELECT run_id FROM openbot_local_runs WHERE thread_id = $1 AND run_id = 'r-edited'", [thread])).toHaveLength(0);
   });
 });

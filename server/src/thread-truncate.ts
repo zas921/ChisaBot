@@ -5,15 +5,14 @@ import type { Database } from "./db/client";
  * 重新生成 / 编辑后重发（DESIGN.md §67，CB-042）：把一段对话从某条用户消息起截掉。
  *
  * - `openbot_local_threads.messages` 截到这条用户消息之前（它和它之后的全部去掉）；
- * - `openbot_local_events` 从这条用户消息那一轮的 RUN_STARTED（第一个在 `input.messages` 里带上它的）起全删，
- *   回放（刷新、别的设备接入）就和截断后的消息列表一致；那几轮的 `openbot_local_runs` 一起删；
+ * - `openbot_local_events` 从包含被删消息的最早一轮起全删，那几轮的 `openbot_local_runs` 一起删；
+ *   回答中追加的消息也可编辑，之前的文字仍由权威消息快照保留，刷新 / 其他设备接入读同一份快照；
  * - 截掉的消息 id 记进 `chisabot_thread_truncations`（墓碑）：还没收到截断的旧设备再发消息时会把整段旧消息
  *   一起带上来，运行器按墓碑把它们滤掉，不会「复活」；这张表的行数就是对话的「版本」，同步戳带着它，
  *   别的设备看到版本变了就按服务器回放重建（不能只看事件序号：截断后它先变小、再随新一轮变大）。
  * - 收件箱里还没读 / 欠回答的消息撤回，被截掉那几轮还在等的确认卡片作废，那几轮派出去还在跑的后台任务停掉。
  *
- * 只能在对话没在回答时截（回答中途截会和正在写的那一轮打架）；只能从「开启一轮」的用户消息截——
- * 回答中途插进去的消息（收件箱读进来的）没有自己的 RUN_STARTED，从它截会留下半轮回放，拒绝。
+ * 只能在对话没在回答时截（回答中途截会和正在写的那一轮打架）。事件按整轮删除，避免留下半轮记录。
  */
 
 export type TruncationStart = { sequence: string; runId: string; ids: readonly string[] };
@@ -23,8 +22,8 @@ export type TruncationPlan =
   | { ok: false; status: 400 | 404 | 409; error: string };
 
 /**
- * 纯函数：从哪里截。`starts` 是这条对话所有 RUN_STARTED（按序号升序）和它们输入里的消息 id。
- * 事件表为空（很老的对话、或从没经过运行器）时只截消息。
+ * 纯函数：从哪里截。`starts` 按每轮的首事件序号升序，ids 包括输入、消息快照和增量事件里的消息 id。
+ * 以前截断过的半轮前文、老对话可能只剩消息快照，没有对应事件；这时只删除与本次后文有关的轮次。
  */
 export function planTruncation(
   messages: readonly Pick<Message, "id" | "role">[],
@@ -40,9 +39,9 @@ export function planTruncation(
     message.role === "assistant" ? ((message as { toolCalls?: { id?: unknown }[] }).toolCalls ?? []).map((call) => String(call.id ?? "")).filter(Boolean) : [],
   );
   if (!starts.length) return { ok: true, index, cutSequence: null, removed, removedToolCalls };
-  const start = starts.find((item) => item.ids.includes(fromMessageId));
-  if (!start) return { ok: false, status: 409, error: "这条消息是在回答中途插进去的，不能单独重发" };
-  return { ok: true, index, cutSequence: start.sequence, removed, removedToolCalls };
+  const removedIds = new Set(removed);
+  const start = starts.find((item) => item.ids.some((id) => removedIds.has(id)));
+  return { ok: true, index, cutSequence: start?.sequence ?? null, removed, removedToolCalls };
 }
 
 export async function ensureTruncationTable(database: Database) {
@@ -111,9 +110,15 @@ export async function truncateThread(
     if (row.run_id && row.lock_expires_at && new Date(row.lock_expires_at).getTime() > Date.now())
       throw new TruncateError("机器人正在回答，等它说完（或先停止）再重发", 409);
     const starts = await transaction.unsafe<{ sequence: string; run_id: string; ids: string[] | null }[]>(
-      `SELECT sequence::text AS sequence, run_id,
-         (SELECT coalesce(jsonb_agg(m->>'id'), '[]'::jsonb) FROM jsonb_array_elements(coalesce(event->'input'->'messages', '[]'::jsonb)) m) AS ids
-       FROM openbot_local_events WHERE thread_id = $1 AND event->>'type' = 'RUN_STARTED' ORDER BY sequence`,
+      `SELECT min(e.sequence)::text AS sequence, e.run_id,
+         coalesce(jsonb_agg(DISTINCT m->>'id') FILTER (WHERE m->>'id' IS NOT NULL), '[]'::jsonb) AS ids
+       FROM openbot_local_events e
+       LEFT JOIN LATERAL jsonb_array_elements(
+         coalesce(e.event->'input'->'messages', '[]'::jsonb)
+         || CASE WHEN e.event->>'type' = 'MESSAGES_SNAPSHOT' THEN coalesce(e.event->'messages', '[]'::jsonb) ELSE '[]'::jsonb END
+         || jsonb_build_array(jsonb_build_object('id', e.event->>'messageId'))
+       ) m ON true
+       WHERE e.thread_id = $1 GROUP BY e.run_id ORDER BY min(e.sequence)`,
       [input.threadId],
     );
     const plan = planTruncation(

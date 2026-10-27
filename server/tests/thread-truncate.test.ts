@@ -28,11 +28,23 @@ describe("planTruncation", () => {
     expect(plan.ok && plan.removed.length).toBe(6);
   });
 
-  test("refuses assistant messages, unknown ids and mid-run injections", () => {
+  test("refuses assistant messages and unknown ids", () => {
     expect(planTruncation(messages, starts, "a1")).toMatchObject({ ok: false, status: 400 });
     expect(planTruncation(messages, starts, "nope")).toMatchObject({ ok: false, status: 404 });
-    const injected = [...messages, { id: "u3", role: "user" }] as never[];
-    expect(planTruncation(injected, starts, "u3")).toMatchObject({ ok: false, status: 409 });
+  });
+
+  test("an injected user message cuts its containing run and preserves earlier messages", () => {
+    const injected = [...messages.slice(0, 3), { id: "extra", role: "user" }, ...messages.slice(3)] as never[];
+    const observed = [starts[0]!, { ...starts[1]!, ids: ["u2", "extra", "a2", "t2"] }, starts[2]!];
+    expect(planTruncation(injected, observed, "extra")).toEqual({
+      ok: true, index: 3, cutSequence: "20", removed: ["extra", "a2", "t2", "a3"], removedToolCalls: ["call-1"],
+    });
+  });
+
+  test("snapshot-only history can still be edited, deleting later recorded answers", () => {
+    // A previous edit removed the containing run's events but kept u2 and its prefix.
+    expect(planTruncation(messages, [starts[0]!, starts[2]!], "u2")).toMatchObject({ ok: true, index: 2, cutSequence: "30" });
+    expect(planTruncation(messages, [starts[0]!], "u2")).toMatchObject({ ok: true, index: 2, cutSequence: null });
   });
 
   test("a thread without events cuts only messages", () => {
