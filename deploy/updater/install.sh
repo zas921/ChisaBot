@@ -25,7 +25,7 @@ case "${1:-}" in
   "") ;;
   *) BASE_COMMIT=$1 ;;
 esac
-FILES="compose-image.sh update.sh request.sh rollback.sh health.sh post-deploy-smoke.sh smoke.sh deps-fingerprint.sh rollback.template.sh git-askpass.sh magpie.sh chisabot-updater.py Dockerfile.update install.sh"
+FILES="compose-image.sh update.sh request.sh rollback.sh health.sh post-deploy-smoke.sh smoke.sh deps-fingerprint.sh rollback.template.sh git-askpass.sh magpie.sh magpie-update.py chisabot-updater.py Dockerfile.update install.sh"
 pick_python() { # python3 (>= 3.6) first, then python2
   local c
   for c in python3 python2 python; do
@@ -41,8 +41,11 @@ PY=${CHISABOT_PYTHON:-$(pick_python)}
 for f in $FILES; do
   case "$f" in
     *.sh) bash -n "$HERE/$f" || { echo "$f does not parse; not installing" >&2; exit 1; } ;;
-    *.py) "$PY" -c 'import sys; compile(open(sys.argv[1]).read(), sys.argv[1], "exec")' "$HERE/$f" \
-            || { echo "$f does not compile with $PY; not installing" >&2; exit 1; } ;;
+    *.py)
+      CHECK_PY=$PY
+      [ "$f" != magpie-update.py ] || CHECK_PY=python3
+      "$CHECK_PY" -c 'import sys; compile(open(sys.argv[1]).read(), sys.argv[1], "exec")' "$HERE/$f" \
+            || { echo "$f does not compile with $CHECK_PY; not installing" >&2; exit 1; } ;;
   esac
 done
 

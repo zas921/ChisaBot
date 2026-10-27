@@ -243,8 +243,10 @@ function Overview({ data, onSync }: { data: MagpieOverview; onSync: () => Promis
 const MAGPIE_UPDATE_STEPS: Record<string, string> = {
   prepare: "准备",
   pull: "拉取镜像",
+  backup: "备份配置与登录数据",
   swap: "重建容器",
   health: "健康检查",
+  rollback: "恢复原版本",
   done: "完成",
 };
 
@@ -311,7 +313,7 @@ function GatewayUpdateSection({ magpieVersion }: { magpieVersion?: string }) {
           </Button>
         </div>
       }
-      description="Magpie 是自托管的模型网关，可以就地升到镜像标签的当前版本。升级只重建这一个容器，正在回答的对话不受影响。"
+      description="更新前自动备份，保留代理、提供方和登录配置；验证失败自动恢复原版本。切换时 Magpie 会短暂重启，请等当前回答结束后更新。"
       title="网关版本与更新"
     >
       {error ? <ErrorCard description={error} title="操作没有完成" /> : null}
@@ -339,8 +341,8 @@ function GatewayUpdateSection({ magpieVersion }: { magpieVersion?: string }) {
           }
           title="镜像版本"
         >
-          <span className={gateway?.updateAvailable ? "magpie-badge is-warn" : "magpie-badge is-ok"}>
-            {gateway?.updateAvailable ? "有新版本" : gateway ? "已是最新" : "未知"}
+          <span className={gateway?.updateAvailable || gateway?.error ? "magpie-badge is-warn" : "magpie-badge is-ok"}>
+            {gateway?.updateAvailable ? "有新版本" : gateway?.currentDigest && gateway.latestDigest && !gateway.error ? "已是最新" : "未知"}
           </span>
         </SettingRow>
         {gateway?.currentDigest ? (
@@ -348,7 +350,7 @@ function GatewayUpdateSection({ magpieVersion }: { magpieVersion?: string }) {
             description={
               gateway.latestDigest && gateway.updateAvailable
                 ? `镜像仓库上现在是 ${shortDigest(gateway.latestDigest)}。`
-                : "与镜像仓库上的摘要一致。"
+                : gateway.latestDigest && !gateway.error ? "与镜像仓库上的摘要一致。" : "尚未确认镜像仓库上的版本。"
             }
             title="当前镜像摘要"
           >
@@ -360,9 +362,14 @@ function GatewayUpdateSection({ magpieVersion }: { magpieVersion?: string }) {
             <span className="magpie-badge is-warn">{stepLabel(job?.step)}</span>
           </SettingRow>
         ) : null}
-        {job && !running && job.status === "failed" ? (
+        {job && !running && (job.status === "failed" || job.status === "rolled_back") ? (
           <SettingRow description={job.error ?? "详细日志见「系统更新」页的历史。"} title="上次更新失败">
-            <span className="magpie-badge is-danger">失败</span>
+            <span className="magpie-badge is-danger">{job.status === "rolled_back" ? "已恢复原版本" : "失败"}</span>
+          </SettingRow>
+        ) : null}
+        {job && !running && job.status === "succeeded" ? (
+          <SettingRow description={lastLog ?? "Magpie 更新完成。"} title="上次更新">
+            <span className="magpie-badge is-ok">成功</span>
           </SettingRow>
         ) : null}
       </Card>

@@ -234,6 +234,10 @@ install -m 400 -o 1002 -g 1002 /opt/magpie/private/web.key /opt/openbot-zh/secre
 
 ## 版本与更新（一键升到最新）
 
+**当前一键更新流程见 [Magpie 一键更新](magpie-updates.md)。** 更新器现按运行中容器的配置更新，
+保留代理、挂载和网络，自动备份并在失败时恢复数据与旧容器；不再依赖下述旧 Compose 路径配置。
+下方关于 Compose 重建和重新打标签回退的说明保留为旧部署历史。
+
 镜像是**标签**，不是写死的摘要（`deploy/magpie.compose.yaml` 里是 `${MAGPIE_IMAGE:-ghcr.io/yetone/magpie:latest}`）。
 「管理后台 → 模型平台 Magpie」的「网关版本与更新」卡可以就地升到该标签的当前版本，不用上服务器敲命令。
 
