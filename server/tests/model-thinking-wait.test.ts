@@ -4,7 +4,7 @@ import { fallbackLanguageModel, FIRST_OUTPUT_MS, resetModelCooldowns } from "../
 test("a real HTTP model taking over 30 seconds is allowed to return without fallback", async () => {
   resetModelCooldowns();
   const upstream = Bun.serve({
-    hostname: "127.0.0.1", port: 0,
+    hostname: "127.0.0.1", port: 0, idleTimeout: 60,
     fetch: async () => {
       await Bun.sleep(31_000);
       return Response.json({ text: "Completed after hidden thinking" });

@@ -68,7 +68,7 @@ export const SEND_REPLY_HANG_REASON =
 /** 发消息后等多久还没结束 / 没落库就改报错。略长于常见模型首字，远短于 40s 假成功。 */
 export const SEND_WATCHDOG_MS = 12_000;
 
-/** 已落库后继续等回答的上限。比 SEND_WATCHDOG_MS 长（模型可能慢），但仍封顶以免永久卡住。 */
+/** 已落库后的静默探测阈值；达到时检查后台状态，不直接停止模型。 */
 export const SEND_REPLY_WATCHDOG_MS = 180_000;
 
 /** 与服务端 MAX_RUN_WALL_MS 相同；后台的续锁或流事件均不能延长本轮总上限。 */
