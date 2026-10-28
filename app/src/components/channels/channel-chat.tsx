@@ -48,7 +48,6 @@ import {
   isConnectionDrop,
   raceSendWatchdog,
   reportBudgetEvent,
-  SEND_REPLY_LIMIT_REASON,
   SEND_REPLY_WAITING_NOTICE,
   SEND_UNREACHABLE_REASON,
   SEND_WATCHDOG_MS,
@@ -58,6 +57,7 @@ import {
   pingRelayAlive,
   RELAY_ALIVE_INTERVAL_MS,
 } from "@/lib/copilot/connection-drop";
+import { runContinuingAgent } from "@/lib/copilot/continue-agent";
 import { ConversationProvider } from "@/lib/copilot/conversation";
 import { frontendToolProgressAt } from "@/lib/copilot/frontend-tool-activity";
 import { afterMs, joinWithin } from "@/lib/copilot/join-thread";
@@ -1133,13 +1133,13 @@ export function ChannelChat({
        */
       noteRunProgress.current();
       const runStartedAt = Date.now();
-      const runPromise = copilotkit.runAgent({
+      const runPromise = runContinuingAgent(copilotkit, {
         agent: target,
         ...((panelAuthoring || inboxSourceId) ? { forwardedProps: {
           ...panelAuthoring,
           ...(inboxSourceId ? { chisabotInboxResume: { sourceId: inboxSourceId, messageId: userMessageId } } : {}),
         } } : {}),
-      });
+      }, () => stopRequestedRef.current || pausedForApproval() || turnFailure.current !== null);
       /**
        * 看门狗问的「最近一次有进展」：这一轮的 run 事件（模型在写、工具结果在回来…），或者浏览器里
        * 正在跑的前端工具（`computer_run_command` 那种，执行期间没有任何事件）。
@@ -1183,7 +1183,7 @@ export function ChannelChat({
           void runPromise.catch(() => undefined);
           throw new Error(first.reason);
         }
-        // 静默不等于失败：确认后台还在运行就继续等，只有墙钟总上限才自动停止。
+        // 静默不等于失败：确认后台还在运行就继续等，后台运行期间持续等待，用户可主动停止。
         const reply = await waitForPersistedReply(runPromise, {
           afterMs,
           startedAt: runStartedAt,
@@ -1201,18 +1201,6 @@ export function ChannelChat({
         if (reply === "stopped") {
           void runPromise.catch(() => undefined);
           return;
-        }
-        if (reply === "timeout") {
-          try {
-            copilotkit.stopAgent({ agent: target });
-          } catch {
-            /* stop best-effort */
-          }
-          reportBudgetEvent("SEND_REPLY_HANG");
-          forceUnlockThread(channel.threadId);
-          failRef.current(SEND_REPLY_LIMIT_REASON);
-          void runPromise.catch(() => undefined);
-          throw new Error(SEND_REPLY_LIMIT_REASON);
         }
         if (reply === "unreachable") {
           // 状态未知：不停止后台，也不解锁。重连后由同步恢复。
@@ -1574,7 +1562,7 @@ export function ChannelChat({
   }, [restoring, channel.threadId]);
 
   /*
-   * 这一轮停在一步浏览器操作上，却没有人在执行它（§109）：服务器还在等那一步的结果（最长 25 分钟都算「在回答」），
+   * 这一轮停在一步浏览器操作上，却没有人在执行它（§109）：服务器还在等那一步的结果（页面持续报平安就仍算「在回答」），
    * 可执行它的页面已经刷新 / 关掉了。以前这里只会一直转（切回来时还每 2 秒重接一次，图标来回跳）。
    * 服务器说在回答、这一页自己没在跑、事件序号 30 秒没动、最后一条是还没有结果的工具调用：说清楚，并给「停止」。
    * 序号一动（那一步在别处做完了、接着往下写）就收回。
@@ -1628,7 +1616,7 @@ export function ChannelChat({
   /*
    * 这一页有一轮在进行（包括浏览器工具在跑）：每 20 秒向服务器报一次平安。服务器在两段模型运行之间保留
    * 「等浏览器工具交结果」的接力；执行工具的这一页刷新 / 关掉 / 睡着之后，结果永远不会来，没有这个心跳就要干等满
-   * 25 分钟，期间别的设备一直看到「在回答」。报过平安的接力，静默 150 秒服务器就放开。
+   * 等不到结果，期间别的设备一直看到「在回答」。报过平安的接力，静默 150 秒服务器就放开。
    */
   const turnActive = turnsInFlight > 0;
   useEffect(() => {
@@ -1726,7 +1714,7 @@ export function ChannelChat({
       stopRequestedRef.current = false;
       setRunsInFlight((count) => count + 1);
       try {
-        const result = await copilotkit.runAgent(options);
+        const result = await runContinuingAgent(copilotkit, options, () => stopRequestedRef.current || pausedForApproval() || turnFailure.current !== null);
         if (!stopRequestedRef.current && await persistFailedFrontendResults(channel.threadId, options.agent.messages)) {
           turnFailure.current = unfinishedTurnReason(options.agent.messages as never, new Set()) ?? "工具执行失败。";
         }
@@ -1904,7 +1892,7 @@ export function ChannelChat({
                     run={async () => {
                       setRunsInFlight((count) => count + 1);
                       try {
-                        await copilotkit.runAgent({ agent });
+                        await runContinuingAgent(copilotkit, { agent }, () => stopRequestedRef.current || pausedForApproval());
                       } finally {
                         setRunsInFlight((count) => count - 1);
                       }

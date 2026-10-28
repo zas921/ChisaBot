@@ -619,18 +619,15 @@ type FrontendRelay = {
   runId: string;
   inboxRunIds: string[];
   callIds: string[];
-  timer: ReturnType<typeof setTimeout>;
   closing?: Promise<void>;
   /** 执行这些前端工具的页面最近一次报平安的时刻（毫秒）。 */
   aliveAt: number;
-  /** 这一轮的页面报过平安：之后静默超过 RELAY_STALE_MS 就当它没了（刷新 / 关掉 / 手机锁屏），不干等满 25 分钟。 */
-  watched: boolean;
 };
 
 /**
  * 浏览器侧工具的接力，执行它的页面多久没报平安就放开（2026-10-22）。
  *
- * 前端工具由浏览器执行：模型段结束后服务器保留接力（`frontend`），等页面把工具结果交回来，最长 25 分钟，
+ * 前端工具由浏览器执行：模型段结束后服务器保留接力（`frontend`），等页面把工具结果交回来，页面持续报平安就一直等，
  * 这期间同步接口一直说「在回答」。执行它的页面刷新 / 关掉 / 睡着之后，结果永远不会来：另一台设备看到
  * 「在回答」却没有任何东西在动（电脑空闲、手机转圈），发消息只会被塞进收件箱排队，重新生成直接 409。
  * 页面有一轮在进行时每 20 秒 `POST /threads/:id/relay-alive` 一次；静默这么久就放开接力。
@@ -659,12 +656,6 @@ type ActiveRun = {
 /** 一次运行最多接着跑几段（每段 = 一次完整的模型循环；段与段之间读进新排队的消息）。 */
 const MAX_SEGMENTS = 8;
 
-/**
- * Track B：交互回合墙钟上限。锁心跳每 30s 续 120s，挂死的 agent 会一直占着锁 → 永久 busy。
- * 到期强制 stop（与 headless turnTimeout 同思路，略宽于常见长工具回合）。
- */
-const MAX_RUN_WALL_MS = 25 * 60_000;
-
 /** 到期锁 / 无内存条目的残留 run_id 多久扫一次。 */
 const STALE_LOCK_SWEEP_MS = 60_000;
 
@@ -685,14 +676,12 @@ export class PostgresAgentRunner extends AgentRunner {
   private readonly frontend = new Map<string, FrontendRelay>();
   private clearFrontend(threadId: string): FrontendRelay | undefined {
     const relay = this.frontend.get(threadId);
-    if (relay) clearTimeout(relay.timer);
     this.frontend.delete(threadId);
     return relay;
   }
   /** Keep the old relay busy until its durable pause is committed, before any fresh turn starts. */
   private closeFrontend(threadId: string, relay: FrontendRelay, outcome: "owed" | "stopped", recordStop = false): Promise<void> {
     if (relay.closing) return relay.closing;
-    clearTimeout(relay.timer);
     relay.closing = (async () => {
       while (this.frontend.get(threadId) === relay) {
         try {
@@ -752,7 +741,6 @@ export class PostgresAgentRunner extends AgentRunner {
     const relay = this.frontend.get(threadId);
     if (!relay) return false;
     relay.aliveAt = now;
-    relay.watched = true;
     return true;
   }
 
@@ -766,7 +754,7 @@ export class PostgresAgentRunner extends AgentRunner {
   sweepRelays(now = Date.now()): number {
     let closed = 0;
     for (const [threadId, relay] of this.frontend) {
-      if (relay.closing || !relay.watched || now - relay.aliveAt <= RELAY_STALE_MS) continue;
+      if (relay.closing || now - relay.aliveAt <= RELAY_STALE_MS) continue;
       closed += 1;
       console.warn(
         JSON.stringify({ type: "frontend-relay-stale", thread: threadId, silentMs: now - relay.aliveAt }),
@@ -1187,32 +1175,7 @@ export class PostgresAgentRunner extends AgentRunner {
         prepared.sanitize(agent.state),
       );
       let renewing = false;
-      const runStartedAt = Date.now();
       heartbeat = setInterval(() => {
-        // Track B：墙钟到期 → 强制 stop，避免挂死 agent 靠续锁永久占频道。
-        if (!entry.stopped && Date.now() - runStartedAt >= MAX_RUN_WALL_MS) {
-          console.warn(
-            JSON.stringify({
-              type: "conversation-run-wall-clock",
-              thread: threadId,
-              run: entry.runId,
-              wallMs: MAX_RUN_WALL_MS,
-            }),
-          );
-          entry.stopped = true;
-          try {
-            entry.abort.abort();
-          } catch {
-            /* ignore */
-          }
-          try {
-            entry.agent.abortRun();
-          } catch {
-            /* ignore */
-          }
-          void entry.agent.detachActiveRun().catch(() => undefined);
-          return;
-        }
         if (renewing) return;
         renewing = true;
         void guarded(() =>
@@ -1341,13 +1304,7 @@ export class PostgresAgentRunner extends AgentRunner {
               inboxRunIds: entry.inboxRunIds,
               callIds,
               aliveAt: heardAt ?? Date.now(),
-              watched: heardAt !== undefined,
-              timer: setTimeout(() => {
-                if (this.frontend.get(threadId) !== relay) return;
-                void this.closeFrontend(threadId, relay, "owed").catch(() => {});
-              }, MAX_RUN_WALL_MS),
             };
-            relay.timer.unref?.();
             this.frontend.set(threadId, relay);
           } else {
             for (const runId of entry.inboxRunIds) await this.inbox.settle(
@@ -1952,7 +1909,7 @@ export async function createLocalConversations(
             ? body.mode
             : "resend";
         // 只剩「等浏览器交工具结果」的接力：用户明确要重来，就放开它（和点停止一样），不再 409。
-        // 以前执行工具的页面没了之后，这里会一直 409 到接力满 25 分钟，而界面上看着是空闲的。
+        // 以前执行工具的页面没了之后，这里会一直 409 到接力清理，而界面上看着是空闲的。
         if (runner.isRelay(threadId)) await runner.stop({ threadId }).catch(() => false);
         if (runner.isActive(threadId))
           throw new LocalConversationError(

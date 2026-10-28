@@ -71,23 +71,18 @@ export const SEND_WATCHDOG_MS = 12_000;
 /** 已落库后的静默探测阈值；达到时检查后台状态，不直接停止模型。 */
 export const SEND_REPLY_WATCHDOG_MS = 180_000;
 
-/** 与服务端 MAX_RUN_WALL_MS 相同；后台的续锁或流事件均不能延长本轮总上限。 */
-export const SEND_REPLY_MAX_MS = 25 * 60_000;
-export const SEND_REPLY_LIMIT_REASON =
-  "这一轮已达到 25 分钟运行上限，已停止。可以拆分任务后继续。";
 export const SEND_REPLY_WAITING_NOTICE =
   "模型还没有返回内容，服务器仍在处理。可以继续等待，或点「停止」。";
 
 export type ReplyWaitOutcome =
   | "done"
   | "stopped"
-  | "timeout"
   | "server_idle"
   | "unreachable";
 
 /**
- * 已落库的消息：静默只触发只读状态探测，不能据此停止模型。探测也不能续期总上限。
- * 独立计时循环保证状态接口卡住、流持续输出时，手动停止和总上限仍然生效。
+ * 已落库的消息：静默只触发只读状态探测，不能据此停止模型。后台仍在运行时没有总时长截止。
+ * 独立计时循环保证状态接口卡住时，手动停止与失联探测仍然生效。
  * 返回 unreachable 时只放下本地等待，不对状态未知的后台发送 stop / unlock。
  */
 export function waitForPersistedReply<T>(
@@ -101,14 +96,12 @@ export function waitForPersistedReply<T>(
     onWaiting?: (waiting: boolean) => void;
     now?: () => number;
     silenceMs?: number;
-    maxMs?: number;
     probeMs?: number;
     unreachableMs?: number;
   },
 ): Promise<ReplyWaitOutcome> {
   const now = deps.now ?? Date.now;
   const silenceMs = deps.silenceMs ?? SEND_REPLY_WATCHDOG_MS;
-  const maxMs = deps.maxMs ?? SEND_REPLY_MAX_MS;
   const probeMs = deps.probeMs ?? 5_000;
   const unreachableMs = deps.unreachableMs ?? 15_000;
   return new Promise((resolve) => {
@@ -132,8 +125,6 @@ export function waitForPersistedReply<T>(
     const watch = async () => {
       while (!settled) {
         if (deps.stopped()) return finish("stopped");
-        const remaining = deps.startedAt + maxMs - now();
-        if (remaining <= 0) return finish("timeout");
         if (now() - deps.lastProgressAt() < silenceMs) {
           showWaiting(false);
           unansweredSince = null;
@@ -158,7 +149,7 @@ export function waitForPersistedReply<T>(
             });
           }
         }
-        await deps.afterMs(Math.min(SEND_WATCHDOG_POLL_MS, remaining));
+        await deps.afterMs(SEND_WATCHDOG_POLL_MS);
       }
     };
     void watch();

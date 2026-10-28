@@ -1,6 +1,5 @@
 import { expect, test } from "bun:test";
 import {
-  SEND_REPLY_MAX_MS,
   waitForPersistedReply,
 } from "../src/lib/copilot/connection-drop";
 
@@ -24,7 +23,6 @@ function scenario() {
       lastProgressAt: () => progress,
       stopped: () => stopped,
       silenceMs: 180_000,
-      maxMs: SEND_REPLY_MAX_MS,
       probeMs: 5_000,
       onWaiting: (value: boolean) => { notices.push(value); },
       afterMs: async (ms: number) => {
@@ -49,24 +47,18 @@ test("a silent model stays alive beyond three minutes when the server is running
   expect(s.notices).toEqual([true, false]);
 });
 
-test("server keepalives cannot extend the final 25 minute wall clock", async () => {
-  const s = scenario();
-  expect(await waitForPersistedReply(s.run, {
-    ...s.deps, running: async () => true,
-  })).toBe("timeout");
-  expect(s.time()).toBe(SEND_REPLY_MAX_MS);
-  expect(s.notices).toEqual([true, false]);
-});
-
-test("continuous model progress cannot extend the final wall clock either", async () => {
+test.each([false, true])("a live model can run for two hours, continuous output=%s", async (continuous) => {
   const s = scenario();
   let probes = 0;
-  s.onTick(s.progress);
+  s.onTick(() => {
+    if (continuous) s.progress();
+    if (s.time() >= 2 * 60 * 60_000) s.finish();
+  });
   expect(await waitForPersistedReply(s.run, {
     ...s.deps, running: async () => { probes++; return true; },
-  })).toBe("timeout");
-  expect(probes).toBe(0);
-  expect(s.time()).toBe(SEND_REPLY_MAX_MS);
+  })).toBe("done");
+  expect(s.time()).toBe(2 * 60 * 60_000);
+  expect(continuous ? probes === 0 : probes > 100).toBe(true);
 });
 
 test("manual stop releases a silent turn even when the run and status request hang", async () => {
@@ -100,14 +92,6 @@ test("a wedged status request is bounded independently of its own timeout", asyn
     ...s.deps, running: () => new Promise(() => {}),
   })).toBe("unreachable");
   expect(s.time()).toBe(195_000);
-});
-
-test("the wall clock wins even if a status request never returns", async () => {
-  const s = scenario();
-  expect(await waitForPersistedReply(s.run, {
-    ...s.deps, maxMs: 185_000, running: () => new Promise(() => {}),
-  })).toBe("timeout");
-  expect(s.time()).toBe(185_000);
 });
 
 test("new stream output clears the waiting notice and invalidates an old idle probe", async () => {

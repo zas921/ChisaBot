@@ -33,7 +33,7 @@ import {
 } from "@/lib/channels/queries";
 import { queryClient } from "@/query-client";
 import { settleReactWork } from "./settle-react-work";
-import { SEND_REPLY_WAITING_NOTICE, SEND_REPLY_LIMIT_REASON } from "@/lib/copilot/connection-drop";
+import { SEND_REPLY_WAITING_NOTICE } from "@/lib/copilot/connection-drop";
 
 /**
  * WHAT A FAILED SEND DOES TO THE FILES IT WAS CARRYING, DRIVEN THROUGH THE REAL CHANNEL.
@@ -252,20 +252,21 @@ test("a persisted silent run keeps its Stop button beyond three minutes without 
   }
 });
 
-test("a silent live server cannot prevent the channel's final 25 minute stop", async () => {
+test("a silent live server remains running past the former 25 minute limit", async () => {
   const response = deferred();
   runAnswers = [() => response.promise];
   const view = await mounted();
   const user = userEvent.setup({ document: view.container.ownerDocument });
-  await user.type(view.getByRole("textbox", { name: "消息" }), "A bounded task");
+  await user.type(view.getByRole("textbox", { name: "消息" }), "A long task");
   await user.click(view.getByRole("button", { name: "发送消息" }));
   await waitFor(() => expect(runs).toHaveLength(1));
   watchdogFixture = { running: true, mutations: [] };
   const realNow = Date.now;
   const clock = spyOn(Date, "now").mockImplementation(() => realNow() + 25 * 60_000 + 1_000);
   try {
-    await waitFor(() => expect(watchdogFixture?.mutations.some((path) => path.endsWith("/unlock"))).toBe(true), { timeout: 5_000 });
-    expect(view.queryByText(SEND_REPLY_LIMIT_REASON)).not.toBeNull();
+    await waitFor(() => expect(view.queryByText(SEND_REPLY_WAITING_NOTICE)).not.toBeNull(), { timeout: 5_000 });
+    expect(watchdogFixture.mutations).toEqual([]);
+    expect(view.queryByLabelText("停止机器人")).not.toBeNull();
   } finally {
     clock.mockRestore();
     response.settle(finished(runs[0]!));

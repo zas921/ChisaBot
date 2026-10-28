@@ -21,9 +21,7 @@ function runner() {
     runId: "r1",
     inboxRunIds: ["r1"],
     callIds: ["call-1"],
-    timer: setTimeout(() => {}, 1_000_000),
     aliveAt: 0,
-    watched: true,
     ...overrides,
   });
   return { instance, frontend, relay, settled };
@@ -61,10 +59,21 @@ describe("接力的存活判断", () => {
     expect(frontend.has("t1")).toBe(true);
   });
 
-  test("从没有页面报过平安的接力（旧页面）不按静默放开，仍由 25 分钟的上限管", () => {
+  test("从未报过平安的页面失联后同样清理，不留下永久占用", async () => {
     const { instance, frontend, relay } = runner();
-    frontend.set("t1", relay({ aliveAt: 1_000, watched: false }));
-    expect(instance.sweepRelays(1_000 + RELAY_STALE_MS * 10)).toBe(0);
+    frontend.set("t1", relay({ aliveAt: 1_000 }));
+    expect(instance.sweepRelays(1_000 + RELAY_STALE_MS * 10)).toBe(1);
+    await Bun.sleep(20);
+    expect(frontend.has("t1")).toBe(false);
+  });
+
+  test("页面持续报平安，两小时后的工具接力仍然有效", () => {
+    const { instance, frontend, relay } = runner();
+    frontend.set("t1", relay({ aliveAt: 0 }));
+    for (let now = 20_000; now <= 2 * 60 * 60_000; now += 20_000) {
+      instance.touchRelay("t1", now);
+      expect(instance.sweepRelays(now)).toBe(0);
+    }
     expect(frontend.has("t1")).toBe(true);
   });
 
