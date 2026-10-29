@@ -60,7 +60,13 @@ suite(
         if (result) return result;
         await Bun.sleep(20);
       }
-      throw new Error("Timed out awaiting the real goal workflow");
+      const diagnostics = await db.$client.unsafe(
+        "SELECT id,status,detail,rounds,message_cursor,jobs FROM chisabot_goal_tasks WHERE owner_user_id=$1",
+        [owner],
+      );
+      throw new Error(
+        `Timed out awaiting the real goal workflow: ${JSON.stringify(diagnostics)}`,
+      );
     }
     async function rig(delay = 500) {
       const directory = await mkdtemp(join(tmpdir(), "chisabot-goal-"));

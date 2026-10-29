@@ -895,6 +895,14 @@ export function createGoalTasks(options: {
       );
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
+      console.error(
+        "goal-task-turn-failed",
+        JSON.stringify({
+          taskId: row.id,
+          error: error instanceof Error ? error.name : "UnknownError",
+          detail: detail.slice(0, 500),
+        }),
+      );
       await release(
         row,
         token,
