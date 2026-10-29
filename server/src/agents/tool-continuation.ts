@@ -12,7 +12,7 @@ import { currentConfirmTurn, currentToolAbort } from "../confirmations/context";
 import { REFUSAL_MARKER } from "../plugins/tools";
 
 export const LONG_TASK_GUIDANCE =
-  "长任务持续执行：按用户要求完成所有步骤并验证结果，再给最终答复。工具步数只是内部批次，达到批次边界后系统会自动从已有结果续跑；不要因为本轮步数结束而收尾，也不要要求用户说‘继续’。已完成的操作不要重复执行。需要审批、登录或关键资料时等待用户；用户停止时立即停止。";
+  "长任务持续执行：按用户要求完成所有步骤并验证结果，再给最终答复。工具步数只是内部批次，达到批次边界后系统会自动从已有结果续跑；不要因为本轮步数结束而收尾，也不要要求用户说‘继续’。用户明确要求长任务持续到全部目标验收通过时，先用 goal_start 登记目标与实际验收命令；已有任务用 goal_status 沿用，不重复登记。后台作业完成和正常回复结束后，由持续任务调度恢复原对话，全部实际验收通过后用 goal_finish 结束。已完成的操作不要重复执行。需要审批、登录或关键资料时等待用户；用户停止时立即停止。";
 
 /** Native results are JSON encoded on the AG-UI wire, including plain strings. */
 function blockedResult(content: Message["content"]): boolean {

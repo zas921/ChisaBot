@@ -14,6 +14,8 @@ export type TurnRunner = (input: {
   agentId: string;
   threadId: string; // the owner's thread for the routine's channel
   instruction: string; // the user message of this turn
+  /** Internal continuation of an explicitly enrolled goal; context, never a forged user message. */
+  automationContext?: string;
   initiator?: AuditInitiator;
   signal?: AbortSignal;
   continuation?: {

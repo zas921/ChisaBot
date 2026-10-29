@@ -43,6 +43,8 @@ ChisaBot 是 CopilotKit/OpenBot 的中文私人助手分支：一台云端服务
 
 ## 功能文档（按范围）
 
+持续目标与后台完成恢复：[goal-tasks.md](goal-tasks.md)（CB-100，ADR-0015）。
+
 完整列表见 [features.md](features.md)。
 
 | 范围 | 文档 | DESIGN |

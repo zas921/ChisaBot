@@ -142,3 +142,7 @@ ChisaBot 的数据都在应用容器里的 PostgreSQL（数据库 `openbot`）�
 | `chisabot-sky` | 背景随时间变化开关（§7） |
 | `chisabot-layout` | 强制 `phone` / `wide` 布局（§40） |
 | `chisabot-sw` | `off` = 本浏览器停用 Service Worker（§40） |
+
+## chisabot_goal_tasks
+
+持续目标附加表，FK thread_id 删除级联。保存所有者、机器人、目标、criteria/jobs JSONB、状态、代次、消息游标、在途操作、租约和下次检查时间。一个对话最多一个未完成任务；原会话历史不复制，不插入伪造用户消息。启动幂等建表，见 ADR-0015。

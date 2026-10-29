@@ -1,3 +1,4 @@
+import { GoalTaskStatus } from "./goal-task-status";
 import type { Message } from "@ag-ui/core";
 import {
   type Attachment,
@@ -1835,11 +1836,11 @@ export function ChannelChat({
                 />
               }
               contextControl={
-                <ContextMeter
+                <><GoalTaskStatus threadId={channel.threadId} /><ContextMeter
                   agentId={runtimeAgentId}
                   running={anyBusy}
                   threadId={channel.threadId}
-                />
+                /></>
               }
               sendBlocked={modelSaving}
               agents={toAgentOptions(agentProfiles, channel.agentIds)}

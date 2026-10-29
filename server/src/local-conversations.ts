@@ -1131,6 +1131,8 @@ export class PostgresAgentRunner extends AgentRunner {
         }
         throw new LocalConversationError("保留的消息已暂停，请主动发送新消息或点击“发送这条”。", 409);
       }
+      if (input.forwardedProps?.goalTaskContinuation && await this.inbox.isPaused(threadId))
+        throw new LocalConversationError("Goal task was stopped before execution", 409);
       if (freshUser) await this.inbox.startExplicitTurn(threadId);
       prepared = prepareConversationMessages(row.messages, incoming, visible, held);
       entry.inputMessageIds = new Set(prepared.execution.map((message) => message.id));
