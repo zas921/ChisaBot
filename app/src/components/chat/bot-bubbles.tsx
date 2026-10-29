@@ -1,3 +1,5 @@
+import { ArtifactCard, parseArtifactFence } from "./artifact-card";
+export { sanitizedMermaidSvg, sanitizeSvgMarkup, svgMarkupToDataUrl } from "./artifact-card";
 import { IconArrowBackUp, IconChevronDown, IconFileText, IconPencil } from "@tabler/icons-react";
 import { motion, useReducedMotion } from "motion/react";
 import { memo, useLayoutEffect, useMemo, useRef, useState } from "react";
@@ -62,6 +64,10 @@ export const BotBubbles = memo(function BotBubbles({
 });
 
 function Segment({ seg, components }: { seg: BubbleSegment; components: Record<string, unknown> }) {
+  if (seg.kind === "code") {
+    const artifact = parseArtifactFence(seg.text);
+    if (artifact) return <ArtifactCard artifact={artifact} components={components} />;
+  }
   if (seg.kind === "draft") return <DraftCard text={seg.text} title={seg.title} />;
   if (seg.kind === "doc") return <DocCard components={components} text={seg.text} title={seg.title} />;
   return (

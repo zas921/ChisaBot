@@ -4,6 +4,7 @@ import { connect, type Socket } from "node:net";
 import {
   egressDecision,
   egressFor,
+  egressShellEnvironmentForBot,
   handleEgressPolicyRequest,
   parseEgressPolicy,
   parseEgressRules,
@@ -552,13 +553,17 @@ describe("the filter proxy", () => {
     const before = process.env.HTTP_PROXY;
     const filter = await startEgressFilter({ env: {}, forShell: true });
     expect(egressShellEnvironment().HTTP_PROXY).toBe(filter.url);
+    // The Bot's own derived key, the same one its browser is given.
+    expect(egressShellEnvironmentForBot("sales").HTTP_PROXY).toBe(
+      `http://sales:${encodeURIComponent(egressFor("sales", {})?.password ?? "")}@127.0.0.1:${filter.port}`,
+    );
     expect(egressShellEnvironment().NO_PROXY).toContain("127.0.0.1");
     expect(process.env.HTTP_PROXY).toBe(before);
     await stopEgressFilter();
     expect(egressShellEnvironment()).toEqual({});
   });
 
-  test("an anonymous connection is judged by every policy on the computer", async () => {
+  test("an anonymous connection is refused while any Bot on the computer is deny_all", async () => {
     const target = await origin();
     const filter = await startEgressFilter({ env: {} });
     setEgressPolicy("a", { mode: "allow_all", rules: [] });

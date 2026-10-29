@@ -1,112 +1,532 @@
-import { useEffect, useRef, useSyncExternalStore } from "react";
+import { useEffect, useRef } from "react";
 import { useTheme } from "@/components/theme-provider";
 import {
-  readStoredPreference,
-  writeStoredPreference,
-} from "@/lib/preference-storage";
-import {
-  applySky,
-  computeSky,
-  currentMinuteOfDay,
-  SKY_STORAGE_KEY,
-} from "@/lib/sky";
+  applyAppearanceToDocument,
+  computePaletteSky,
+  resolveActiveWallpaperCss,
+  resolveEffectiveHarkScene,
+  setHarkSkyScene,
+  useAppearance,
+} from "@/lib/appearance";
+import { usePerfMode } from "@/lib/perf-mode";
+import { createSkyWindow } from "@/lib/sky-window";
 
 /*
- * 「背景随时间变化」 state. `enabled` is a browser preference (like the theme, read by the boot script
- * in index.html before paint); `preview` is the settings slider's temporary hour and is never saved.
+ * Hark 原生 WebGL 动态天空与天气引擎宿主（移植自 Hark wallpaper_core.html + Pp 宿主控制器）：
+ *  - DOM 挂载 #sky-root > #skyph + <canvas id="gl"> + <canvas id="skyfreeze"> + #glfail；
+ *  - 首帧 WebGL drawArrays 完成时在 <html> 标记 data-sky-painted，隐藏 #skyph 占位并让 body 完全透明；
+ *  - 根据当前浅色/深色主题、主题配色或用户手动指定的 12 个精选场景驱动 window.hark.applyScene(0..11) / setLive(true)。
+ *
+ * 性能（2026-10-29）：引擎本身（wallpaper_core.html）不改，节流全在宿主这边——
+ *  - 引擎拿到的 requestAnimationFrame 是这里的 skyRaf：只在「允许跑」的窗口里出帧，最多 15fps；
+ *  - 引擎读到的 window.devicePixelRatio 是 min(真实 DPR, 1) × 0.6，画布内部只按 0.6 倍分辨率画，CSS 再拉满；
+ *  - 精选场景（默认 auto）= 天空快照：启动、换场景、改窗口大小、天气数据回来时醒来，换场景的 2.5s 渐变画完才停在最后一帧；
+ *  - 改窗口大小、从后台回来、从壁纸 / 性能模式切回天空：当帧立即重画（drawSkyNow），不露出被清空的画布；
+ *  - 「背景随时间变化」（live）= 动态天空：页面可见、窗口有焦点、且 2.5s 内有操作时才跑；
+ *    系统开了「减少动态效果」时退回快照；
+ *  - 设了壁纸或开了性能模式：不启动引擎；已经启动的停下并隐藏画布（html[data-sky-off]）；
+ *  - 不再强制 preserveDrawingBuffer：停住的画布保留最后一次上屏的画面，不需要每帧多拷一份缓冲。
  */
-type SkyState = { enabled: boolean; preview: number | null };
 
-let state: SkyState = {
-  enabled: readStoredPreference(SKY_STORAGE_KEY) !== "off",
-  preview: null,
-};
-const listeners = new Set<() => void>();
-const emit = () => {
-  for (const listener of listeners) listener();
-};
-const subscribe = (listener: () => void) => {
-  listeners.add(listener);
-  return () => listeners.delete(listener);
-};
+const SKY_EASE_MS = 1650;
+let easeTimer = 0;
 
-export function setSkyEnabled(enabled: boolean) {
-  writeStoredPreference(SKY_STORAGE_KEY, enabled ? "on" : "off");
-  state = { ...state, enabled };
-  emit();
+/**
+ * 在根上挂 `data-sky-ease`，1.6s 渐变跑完拿掉（保留供单元测试与主题切换调用）。
+ */
+export function easeNextSkyChange(
+  root: HTMLElement | undefined = typeof document !== "undefined"
+    ? document.documentElement
+    : undefined,
+) {
+  if (!root || typeof window === "undefined") return;
+  root.setAttribute("data-sky-ease", "");
+  window.clearTimeout(easeTimer);
+  easeTimer = window.setTimeout(() => {
+    root.removeAttribute("data-sky-ease");
+  }, SKY_EASE_MS);
 }
 
-/** A minute of day to show instead of the clock, or null to follow the clock again. */
-export function setSkyPreview(preview: number | null) {
-  state = { ...state, preview };
-  emit();
+/**
+ * 供「背景随时间变化」开关读取/切换 Hark 实时时钟天空（live）与精选场景（auto）。
+ */
+export function useSkyState(): { enabled: boolean; preview: number | null } {
+  const appearance = useAppearance();
+  return {
+    enabled: appearance.harkScene === "live",
+    preview: null,
+  };
 }
 
-export function useSkyState(): SkyState {
-  return useSyncExternalStore(
-    subscribe,
-    () => state,
-    () => state,
+export function setSkyEnabled(enabled: boolean): void {
+  setHarkSkyScene(enabled ? "live" : "auto");
+}
+
+export function setSkyPreview(hour: number | null): void {
+  if (typeof window === "undefined") return;
+  if (hour === null) {
+    window.hark?.setLive?.(true);
+  } else {
+    window.hark?.setHour?.(hour, true);
+  }
+}
+
+interface HarkController {
+  applyScene?: (index: number) => void;
+  setLive?: (on: boolean) => void;
+  setHour?: (hour: number, fade?: boolean) => void;
+  setTimeFlow?: (speed: number) => void;
+}
+
+declare global {
+  interface Window {
+    hark?: HarkController;
+    __harkBooting?: boolean;
+    webkit?: {
+      messageHandlers?: {
+        hark?: {
+          postMessage: (msg: unknown) => void;
+        };
+      };
+    };
+  }
+}
+
+const OFFLINE_FORECAST_JSON = JSON.stringify({
+  utc_offset_seconds: -new Date().getTimezoneOffset() * 60,
+  current: {
+    temperature_2m: 20,
+    weather_code: 1,
+    cloud_cover: 26,
+    is_day: 1,
+    wind_speed_10m: 9,
+    wind_direction_10m: 250,
+    relative_humidity_2m: 48,
+    cloud_cover_low: 14,
+    cloud_cover_mid: 10,
+    cloud_cover_high: 22,
+    wind_gusts_10m: 14,
+  },
+  hourly: {
+    time: [new Date().toISOString()],
+    visibility: [24000],
+    direct_radiation: [580],
+    diffuse_radiation: [120],
+    shortwave_radiation: [700],
+    terrestrial_radiation: [920],
+    snow_depth: [0],
+    cape: [0],
+  },
+});
+
+const OFFLINE_AQ_JSON = JSON.stringify({
+  current: {
+    us_aqi: 24,
+    aerosol_optical_depth: 0.08,
+  },
+});
+
+function createHarkFetch(): (
+  input: RequestInfo | URL,
+  init?: RequestInit,
+) => Promise<Response> {
+  return async (
+    input: RequestInfo | URL,
+    init?: RequestInit,
+  ): Promise<Response> => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.href
+          : input.url;
+    if (url.includes("gibs.earthdata.nasa.gov")) {
+      return new Response(null, { status: 204 });
+    }
+    if (url.includes("api.open-meteo.com/v1/forecast")) {
+      const ctrl = new AbortController();
+      const timer = window.setTimeout(() => ctrl.abort(), 2800);
+      try {
+        const res = await window.fetch(input, { ...init, signal: ctrl.signal });
+        window.clearTimeout(timer);
+        if (res.ok) return res;
+      } catch {
+        window.clearTimeout(timer);
+      }
+      return new Response(OFFLINE_FORECAST_JSON, {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (url.includes("air-quality-api.open-meteo.com")) {
+      const ctrl = new AbortController();
+      const timer = window.setTimeout(() => ctrl.abort(), 2800);
+      try {
+        const res = await window.fetch(input, { ...init, signal: ctrl.signal });
+        window.clearTimeout(timer);
+        if (res.ok) return res;
+      } catch {
+        window.clearTimeout(timer);
+      }
+      return new Response(OFFLINE_AQ_JSON, {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return window.fetch(input, init);
+  };
+}
+
+function syncHarkSkyScene(target: "live" | number) {
+  const hark = typeof window !== "undefined" ? window.hark : undefined;
+  if (!hark) return;
+  if (target === "live") {
+    hark.setLive?.(true);
+    hark.setTimeFlow?.(1);
+  } else {
+    hark.applyScene?.(target);
+  }
+}
+
+/* ---------------------------------------------------------------------------------------------
+ * 天空节流器：引擎所有的 requestAnimationFrame 都经过这里。
+ * ------------------------------------------------------------------------------------------- */
+const SKY_FRAME_MS = 66; // ≤ 15fps
+const SKY_IDLE_MS = 2500; // live：无操作 2.5s 后暂停
+const SKY_SNAPSHOT_MS = 2600; // 快照：引擎一次换场景的交叉渐变是 2.5s（FADE_DUR），加一点余量
+const SKY_FADE_HOLD_MS = 8000; // 渐变还没画完就一直醒着，但最多再撑这么久
+const SKY_RENDER_SCALE = 0.6;
+
+type SkyMode = "off" | "snapshot" | "live";
+
+const sky = {
+  mode: "snapshot" as SkyMode,
+  wakeUntil: 0,
+  queue: [] as FrameRequestCallback[],
+  pending: false,
+  /** 上一帧的真实 rAF 时间（节流用）。 */
+  last: 0,
+  /** 交给引擎的时间 = 真实时间 + skew；立即补画时为了躲开引擎 31ms 的最小帧间隔会往前拨一点。 */
+  skew: 0,
+  engineLast: 0,
+  /** 这一帧里引擎调了几次 drawArrays：≥2 说明正在交叉渐变（旧天空 + 新天空各画一遍）。 */
+  draws: 0,
+  fadeSince: 0,
+  listening: false,
+};
+
+function skyCanRun(now: number): boolean {
+  if (sky.mode === "off" || typeof document === "undefined" || document.hidden)
+    return false;
+  if (sky.mode === "live" && !document.hasFocus()) return false;
+  return now < sky.wakeUntil;
+}
+
+/** 跑一帧引擎。force：不管节流和 31ms 间隔，当帧必须画出来。 */
+function runSkyFrame(realTs: number, force: boolean) {
+  let ts = realTs + sky.skew;
+  if (force && ts < sky.engineLast + 32) {
+    sky.skew += sky.engineLast + 32 - ts;
+    ts = sky.engineLast + 32;
+  }
+  sky.last = realTs;
+  const callbacks = sky.queue;
+  sky.queue = [];
+  sky.draws = 0;
+  for (const cb of callbacks) cb(ts);
+  if (sky.draws > 0) sky.engineLast = ts;
+  // 换场景的渐变还在画：醒着直到画完，别停在半路（停在半路的样子再被下一次唤醒接上，看起来就是一跳）。
+  if (sky.draws >= 2) {
+    const now = performance.now();
+    if (!sky.fadeSince) sky.fadeSince = now;
+    if (now - sky.fadeSince < SKY_FADE_HOLD_MS) {
+      sky.wakeUntil = Math.max(sky.wakeUntil, now + SKY_FRAME_MS * 3);
+    }
+  } else if (sky.draws === 1) {
+    sky.fadeSince = 0;
+  }
+}
+
+function skyPump() {
+  if (sky.pending || sky.queue.length === 0) return;
+  if (!skyCanRun(performance.now())) return;
+  sky.pending = true;
+  const wait = Math.max(0, sky.last + SKY_FRAME_MS - performance.now() - 4);
+  window.setTimeout(() => {
+    window.requestAnimationFrame((ts) => {
+      sky.pending = false;
+      if (!skyCanRun(performance.now())) return;
+      runSkyFrame(ts, false);
+    });
+  }, wait);
+}
+
+/** 给引擎用的 requestAnimationFrame。 */
+function skyRaf(cb: FrameRequestCallback): number {
+  sky.queue.push(cb);
+  skyPump();
+  return 0;
+}
+
+/**
+ * 当帧立即画一帧，不等 66ms 的节流。
+ * 引擎的 resize() 改 canvas.width 会清空画布；页面从后台回来、天空从关闭（壁纸 / 性能模式）切回来时，
+ * 浏览器也可能已经丢掉了画布内容。没有 preserveDrawingBuffer，只要等节流的下一拍再画，
+ * 中间合成的那一帧就是空画布（GPU 实测：改窗口大小时闪一帧灰）。所以在同一个任务里补画。
+ * live 失焦时也补这一帧，不然画布会一直空到重新获得焦点。
+ */
+function drawSkyNow() {
+  if (sky.mode === "off" || document.hidden || sky.queue.length === 0) return;
+  runSkyFrame(performance.now(), true);
+}
+
+/** 让天空再跑 ms 毫秒（快照：画完这次变化；live：用户有操作）。 */
+function wakeSky(ms: number) {
+  if (sky.mode === "off") return;
+  sky.wakeUntil = Math.max(sky.wakeUntil, performance.now() + ms);
+  skyPump();
+}
+
+function setSkyMode(mode: SkyMode) {
+  if (sky.mode === mode) return;
+  const wasOff = sky.mode === "off";
+  sky.mode = mode;
+  if (mode === "off") {
+    sky.wakeUntil = 0;
+    document.documentElement.setAttribute("data-sky-off", "");
+    return;
+  }
+  // 从关闭切回来：画布还藏着的时候先当帧画好，再在同一个任务里露出来，中间不会有空帧。
+  // 引擎还没启动（队列是空的）时，露出来的是 #skyph 占位，等第一帧画完再撤。
+  if (wasOff) drawSkyNow();
+  document.documentElement.removeAttribute("data-sky-off");
+  wakeSky(SKY_SNAPSHOT_MS);
+}
+
+function listenForSkyWakeups() {
+  if (sky.listening) return;
+  sky.listening = true;
+  const onInput = () => {
+    if (sky.mode === "live") wakeSky(SKY_IDLE_MS);
+  };
+  for (const ev of [
+    "pointermove",
+    "pointerdown",
+    "keydown",
+    "wheel",
+    "touchstart",
+  ]) {
+    window.addEventListener(ev, onInput, { passive: true, capture: true });
+  }
+  // 引擎改画布尺寸会清空画布：快照也要补画（当帧那一下在 drawSkyNow，见引擎启动处）。
+  window.addEventListener("resize", () => wakeSky(SKY_SNAPSHOT_MS));
+  window.addEventListener("focus", () => onInput());
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) return;
+    drawSkyNow();
+    if (sky.mode === "live") wakeSky(SKY_IDLE_MS);
+    else skyPump();
+  });
+}
+
+/** 系统「减少动态效果」：动态天空退回快照（只画一帧就停）。 */
+function prefersReducedMotion(): boolean {
+  return (
+    typeof window !== "undefined" &&
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches
   );
 }
 
-/** Keeps the sky custom properties in step with the clock, the theme and the preference. */
-/**
- * The sky only fades (1.6s) right after the user changes the sky itself: 「背景随时间变化」 on/off or
- * the settings slider. A dark/light switch and the minute tick apply in one frame — a fading sky
- * makes every glass pane re-blur for the whole fade (CB-024, DESIGN.md §7.4).
- */
-const SKY_EASE_MS = 1700;
-let easeTimer: number | undefined;
-export function easeNextSkyChange(root: HTMLElement = document.documentElement) {
-  root.setAttribute("data-sky-ease", "");
-  window.clearTimeout(easeTimer);
-  easeTimer = window.setTimeout(() => root.removeAttribute("data-sky-ease"), SKY_EASE_MS);
+function resolveSkyMode(opts: {
+  perf: boolean;
+  wallpaper: boolean;
+  live: boolean;
+}): SkyMode {
+  if (opts.perf || opts.wallpaper) return "off";
+  return opts.live && !prefersReducedMotion() ? "live" : "snapshot";
 }
 
 export function SkyBackground() {
   const { dark } = useTheme();
-  const { enabled, preview } = useSkyState();
-  const last = useRef<{ enabled: boolean; preview: number | null } | null>(null);
+  const appearance = useAppearance();
+  const desiredSceneRef = useRef<"live" | number>(
+    resolveEffectiveHarkScene(appearance, dark),
+  );
+  desiredSceneRef.current = resolveEffectiveHarkScene(appearance, dark);
 
+  // 1. 同步 HTML data-theme、data-palette、data-glass 与 CSS 预渲染垫片变量
   useEffect(() => {
+    applyAppearanceToDocument(appearance);
     const root = document.documentElement;
-    const prev = last.current;
-    last.current = { enabled, preview };
-    if (prev && (prev.enabled !== enabled || prev.preview !== preview)) easeNextSkyChange(root);
-    if (!enabled) {
-      applySky(null);
-      root.removeAttribute("data-sky");
+    root.setAttribute("data-theme", dark ? "dark" : "light");
+
+    const customSky = computePaletteSky(appearance.palette, dark);
+    if (customSky) {
+      for (const [k, v] of Object.entries(customSky.body)) {
+        document.body.style.setProperty(k, v);
+      }
+      for (const [k, v] of Object.entries(customSky.root)) {
+        root.style.setProperty(k, v);
+      }
+    } else {
+      for (const k of [
+        "--sky-0",
+        "--sky-1",
+        "--sky-2",
+        "--sky-3",
+        "--sky-glow",
+        "--sky-glow-a",
+      ]) {
+        document.body.style.removeProperty(k);
+      }
+      root.style.removeProperty("--glass-sky");
+    }
+  }, [dark, appearance]);
+
+  const perf = usePerfMode();
+  const wallpaperCss = resolveActiveWallpaperCss(appearance);
+  const skyMode = resolveSkyMode({
+    perf,
+    wallpaper: wallpaperCss !== null,
+    live: appearance.harkScene === "live",
+  });
+
+  // 2. 启动 Hark 原生 WebGL 动态天空引擎（/wallpaper_core.html）；壁纸 / 性能模式下不启动。
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    setSkyMode(skyMode);
+    if (skyMode === "off") return;
+    listenForSkyWakeups();
+    if (window.hark) {
+      syncHarkSkyScene(desiredSceneRef.current);
+      wakeSky(SKY_SNAPSHOT_MS);
       return;
     }
-    root.setAttribute("data-sky", "time");
-    const paint = () =>
-      applySky(computeSky(preview ?? currentMinuteOfDay(), dark));
-    paint();
-    if (preview !== null) return;
+    if (window.__harkBooting) return;
+    window.__harkBooting = true;
 
-    // Once a minute, aligned to the minute boundary; catch up at once when the tab comes back.
-    let timer: number | undefined;
-    const schedule = () => {
-      const now = new Date();
-      timer = window.setTimeout(
-        () => {
-          paint();
-          schedule();
+    const glCanvas = document.getElementById("gl") as HTMLCanvasElement | null;
+    if (glCanvas) {
+      const origGetContext = glCanvas.getContext.bind(glCanvas);
+      let hooked = false;
+      glCanvas.getContext = ((contextId: string, options?: unknown) => {
+        const ctx = origGetContext(
+          contextId as "webgl",
+          options as WebGLContextAttributes,
+        );
+        if (
+          ctx &&
+          !hooked &&
+          (contextId === "webgl" || contextId === "experimental-webgl")
+        ) {
+          hooked = true;
+          const origDrawArrays = ctx.drawArrays.bind(ctx);
+          let painted = false;
+          ctx.drawArrays = (mode: number, first: number, count: number) => {
+            origDrawArrays(mode, first, count);
+            sky.draws++;
+            if (!painted) {
+              painted = true;
+              // 第一帧上屏之后再撤占位图（下一帧），不靠 preserveDrawingBuffer。
+              window.requestAnimationFrame(() => {
+                document.documentElement.setAttribute("data-sky-painted", "");
+              });
+            }
+          };
+        }
+        return ctx;
+      }) as typeof glCanvas.getContext;
+    }
+
+    window.webkit = {
+      messageHandlers: {
+        hark: {
+          postMessage: () => {
+            // Hark 状态回调（lum / day / dot 等由宿主主题与场景统一管理）
+          },
         },
-        60_000 - (now.getSeconds() * 1000 + now.getMilliseconds()) + 50,
-      );
+      },
     };
-    schedule();
-    const onVisible = () => {
-      if (document.visibilityState === "visible") paint();
-    };
-    document.addEventListener("visibilitychange", onVisible);
-    return () => {
-      window.clearTimeout(timer);
-      document.removeEventListener("visibilitychange", onVisible);
-    };
-  }, [enabled, preview, dark]);
 
-  return null;
+    const baseFetch = createHarkFetch();
+    // 换场景后引擎会去取那个地方的天气，回来时天空还要再变一次：这时候天空可能已经停了，再叫醒一次把这段渐变画完。
+    const harkFetch = (input: RequestInfo | URL, init?: RequestInit) =>
+      baseFetch(input, init).then((res) => {
+        const url =
+          typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input.url;
+        if (url.includes("open-meteo.com")) wakeSky(SKY_SNAPSHOT_MS);
+        return res;
+      });
+
+    window
+      .fetch("/wallpaper_core.html")
+      .then((r) =>
+        r.ok ? r.text() : Promise.reject(new Error(`HTTP ${r.status}`)),
+      )
+      .then((html) => {
+        const match = /<script>([\s\S]*?)<\/script>/.exec(html);
+        if (!match?.[1]) return;
+        const runner = new Function(
+          "fetch",
+          "requestAnimationFrame",
+          "window",
+          match[1],
+        );
+        wakeSky(SKY_SNAPSHOT_MS);
+        runner(harkFetch, skyRaf, createSkyWindow(window, SKY_RENDER_SCALE));
+        // 必须注册在引擎自己的 resize 监听之后：先改尺寸，再在同一个事件里补画。
+        window.addEventListener("resize", drawSkyNow);
+        syncHarkSkyScene(desiredSceneRef.current);
+      })
+      .catch(() => {
+        window.__harkBooting = false;
+      });
+  }, [skyMode]);
+
+  // 3. 当主题亮暗、配色方案或用户指定的 Hark 场景变化时，立即切换 WebGL 天空场景
+  const targetScene = resolveEffectiveHarkScene(appearance, dark);
+  useEffect(() => {
+    syncHarkSkyScene(targetScene);
+    wakeSky(SKY_SNAPSHOT_MS);
+  }, [targetScene]);
+
+  return (
+    <div aria-hidden="true" id="sky-root">
+      <div id="skyph" />
+      <canvas id="gl" />
+      <canvas id="skyfreeze" />
+      <p id="glfail" />
+      <div className="chisabot-ambient-orbs" />
+      {wallpaperCss ? (
+        <div className="chisabot-wallpaper" data-testid="chisabot-wallpaper">
+          <div
+            className="chisabot-wallpaper-img"
+            style={{
+              backgroundImage: wallpaperCss,
+              filter:
+                appearance.wallpaperBlur > 0
+                  ? `blur(${appearance.wallpaperBlur}px)`
+                  : undefined,
+              transform:
+                appearance.wallpaperBlur > 0 ? "scale(1.06)" : undefined,
+            }}
+          />
+          <div
+            className="chisabot-wallpaper-dim"
+            style={{
+              opacity: Math.max(
+                0,
+                Math.min(0.85, appearance.wallpaperDim / 100),
+              ),
+            }}
+          />
+        </div>
+      ) : null}
+    </div>
+  );
 }

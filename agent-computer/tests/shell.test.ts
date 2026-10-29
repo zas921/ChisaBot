@@ -3,6 +3,7 @@ import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createShell, environmentForCommand } from "../src/shell";
+import { egressFor, startEgressFilter, stopEgressFilter } from "../src/egress";
 
 /**
  * What a command on the computer is allowed to see.
@@ -228,6 +229,20 @@ describe("the command that actually runs", () => {
 
   afterEach(async () => {
     await rm(root, { recursive: true, force: true });
+  });
+
+  test("a named Bot's actual command receives only its own egress identity", async () => {
+    await startEgressFilter({ env: {}, forShell: true });
+    try {
+      const expected = egressFor("named-bot", {})?.password;
+      expect(expected).toBeTruthy();
+      const result = await createShell(root, source()).run({ command: "printenv HTTP_PROXY", botId: "named-bot" });
+      expect(result.exitCode).toBe(0);
+      const proxy = new URL(result.stdout.trim());
+      expect(decodeURIComponent(proxy.username)).toBe("named-bot");
+      expect(decodeURIComponent(proxy.password)).toBe(expected);
+      expect(decodeURIComponent(proxy.password)).not.toBe(egressFor("other-bot", {})?.password);
+    } finally { await stopEgressFilter(); }
   });
 
   test("env in the child does not list a secret from the parent", async () => {

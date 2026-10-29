@@ -18,6 +18,8 @@ ChisaBot 现在要做什么、接下来做什么、以后做什么。这一页�
 | [成熟度 Maturity](https://github.com/ChisaAlter/ChisaBot/milestone/4) | 全量体验扫查 + 已知缺陷 / 性能尾巴 | 第 1、2、3 轮已上线（#115、#122、#124、#125；第 3 轮非聊天页面 #142、#144、#145）；10-16 一轮 CB-069…CB-083 全部上线 |
 | [0.2.0 release](https://github.com/ChisaAlter/ChisaBot/milestone/5) | 下一次大版本，真机验证 | 0.1.x 已发到 v0.1.15（Android 原生、PC 同步）；等真机验证（CB-017 / CB-018） |
 
+个人版 0.1.63：[CB-099](BACKLOG.md#cb-099) 长任务自动续跑及兼容上游安全修复，本地实现完成，正在发布与验证。
+
 ## 现在（进行中）
 
 | 条目 | 内容 | 里程碑 | 分支 |
