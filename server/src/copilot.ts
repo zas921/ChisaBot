@@ -12,6 +12,7 @@ import { createCopilotHonoHandler } from "@copilotkit/runtime/v2/hono";
 import type { Observable } from "rxjs";
 import { defer, finalize, from, fromEvent, switchMap, takeUntil } from "rxjs";
 import { z } from "zod";
+import { currentGoalContinuation, goalContinuationModel } from "./agents/goal-context";
 import {
   ACTION_GUIDANCE,
   botIdentityGuidance,
@@ -601,10 +602,10 @@ export function builtInAgentConfiguration(
     // 每一步开始前看收件箱：机器人回答期间用户又发来的话、后台任务的结果在步与步之间读进去（thread-inbox.ts）。
     // 计划模型（PlanModel）自己转发整段对话，不插话；它照样能吃到段与段之间读进来的消息。
     model: planModel
-      ? planModel
-      : model.baseUrl || model.useApiKey === false
+      ? goalContinuationModel(planModel)
+      : model.baseUrl || model.useApiKey === false || currentGoalContinuation()
         ? // 每一步的用量记到当前运行的计量器（输入框的「上下文」读数，context-usage.ts）。
-          steerLanguageModel(meterLanguageModel(fallbackConnectionModel(model, apiKey), { botId: agent.id }))
+          steerLanguageModel(goalContinuationModel(meterLanguageModel(fallbackConnectionModel(model, apiKey), { botId: agent.id })))
         : `${model.provider}/${model.defaultModel}`,
     /*
      * The package's role, then the person's own standing instructions, then what this Bot actually
