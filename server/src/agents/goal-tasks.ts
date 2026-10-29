@@ -9,6 +9,7 @@ import type { Database } from "../db/client";
 import type { GrantedTool } from "../plugins/tools";
 import { REFUSAL_MARKER } from "../plugins/tools";
 import type { TurnRunner } from "../turns/types";
+import { withGoalContinuation } from "./goal-context";
 
 const automatic = [
   "active",
@@ -222,6 +223,7 @@ export function jobsFromMessages(
 export function goalInstruction(task: GoalTask): string {
   return [
     "这是用户明确授权的持续任务恢复，不是新用户消息，也不是定时提醒。沿用当前对话的已完成结果，不重放已完成操作。",
+    "当前是一个新的服务器恢复回合。历史中的‘本回合只启动后台后结束’或‘下一轮再做’仅描述已经结束的旧回合，不是停止整个持续目标的指令。后台状态以下面的服务器记录为准；exited 表示原进程已经结束，不能再说仍在运行或继续空等。现在实际执行尚未完成的目标。",
     `任务 ID：${task.id}\n目标：${task.objective}`,
     "全部验收项：",
     ...task.criteria.map(
@@ -839,17 +841,19 @@ export function createGoalTasks(options: {
         "/* goal-26 */ UPDATE chisabot_goal_tasks SET status='running',rounds=rounds+1,last_run_id=$3,detail='正在自动执行下一阶段。',updated_at=now() WHERE id=$1 AND lease_token=$2",
         [row.id, token, runId],
       );
-      await options.runTurn({
-        ...scope,
-        routineId: `goal:${row.id}`,
-        runId,
-        instruction: goalInstruction(view(fresh)),
-        automationContext: goalInstruction(view(fresh)),
-        forwardedProps: {
-          goalTaskContinuation: { id: row.id, generation: row.generation },
-        },
-        initiator: { kind: "routine", id: `goal:${row.id}` },
-      });
+      await withGoalContinuation(goalInstruction(view(fresh)), () =>
+        options.runTurn({
+          ...scope,
+          routineId: `goal:${row.id}`,
+          runId,
+          instruction: goalInstruction(view(fresh)),
+          automationContext: goalInstruction(view(fresh)),
+          forwardedProps: {
+            goalTaskContinuation: { id: row.id, generation: row.generation },
+          },
+          initiator: { kind: "routine", id: `goal:${row.id}` },
+        }),
+      );
       const after = await byId(row.id, scope.ownerUserId);
       if (
         !after ||

@@ -114,7 +114,7 @@ jobs:
       - name: Persistent goals with real background processes and acceptance commands
         env:
           TEST_DATABASE_URL: postgres://test:test@127.0.0.1:5432/openbot_test
-        run: bun test server/tests/goal-tasks.test.ts server/tests/goal-tasks.integration.test.ts --timeout 30000
+        run: bun test server/tests/goal-context.test.ts server/tests/goal-tasks.test.ts server/tests/goal-tasks.integration.test.ts --timeout 30000
       - name: Cloud browser native select (DESIGN.md §100)
         working-directory: agent-computer
         run: bun install --frozen-lockfile && bun test tests/native-select.test.ts tests/aria-snapshot.test.ts
