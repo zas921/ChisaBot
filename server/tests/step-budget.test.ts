@@ -1,56 +1,448 @@
 import { describe, expect, test } from "bun:test";
-import { withStepBudgetNote } from "../src/copilot";
+import {
+  EventType,
+  type BaseEvent,
+  type RunAgentInput,
+  type RunFinishedEvent,
+} from "@ag-ui/client";
+import { lastValueFrom, of, toArray } from "rxjs";
+import { z } from "zod";
+import { continueToolRuns } from "../src/agents/tool-continuation";
+import { withConfirmTurn, withToolAbort } from "../src/confirmations/context";
+import { buildAgents } from "../src/copilot";
+import { newSteerSession, withSteering } from "../src/thread-inbox";
 
-describe("step budget note (§101)", () => {
-  test("adds a wrap-up note to the last three tool results of a run only", () => {
-    const turn = {};
-    const out: unknown[] = [];
-    for (let i = 0; i < 12; i++) out.push(withStepBudgetNote(`r${i}`, turn));
-    expect(out.slice(0, 9).every((r) => !String(r).includes("系统提示"))).toBe(true);
-    expect(String(out[9])).toContain("最多还能再调 2 次");
-    expect(String(out[11])).toContain("最多还能再调 0 次");
-    // 普通对象结果加 systemNote，别的不动
-    expect((withStepBudgetNote({ ok: true }, turn) as { systemNote?: string }).systemNote).toContain("停止调用工具");
-    // 另一轮重新计数
-    expect(withStepBudgetNote("x", {})).toBe("x");
-    // 没有 run 上下文：原样返回
-    expect(withStepBudgetNote("y", undefined)).toBe("y");
+describe("real built-in SDK tool segments", () => {
+  test.each([
+    ["probe", 49],
+    ["panel_update", 61],
+  ] as const)(
+    "%s continues through several budgets and answers once",
+    async (name, count) => {
+      const f = await fixture(name, count);
+      try {
+        await f.run();
+        expect(f.executions).toEqual(
+          Array.from({ length: count }, (_, index) => index + 1),
+        );
+        expect(f.requests).toHaveLength(count + 1);
+        expect(
+          f.agent.messages.filter((message) => message.role === "user"),
+        ).toHaveLength(1);
+        expect(f.agent.messages.at(-1)).toMatchObject({
+          role: "assistant",
+          content: "Task complete",
+        });
+        expect(
+          f.events.filter((event) => event.type === EventType.RUN_STARTED),
+        ).toHaveLength(1);
+        const finished = f.events.filter(
+          (event) => event.type === EventType.RUN_FINISHED,
+        ) as RunFinishedEvent[];
+        expect(finished).toHaveLength(1);
+        expect(
+          finished[0]?.usage?.reduce(
+            (sum, usage) => sum + (usage.inputTokens ?? 0),
+            0,
+          ),
+        ).toBe((count + 1) * 10);
+        expect(JSON.stringify(f.requests)).not.toContain("工具步数快用完");
+      } finally {
+        f.close();
+      }
+    },
+  );
+
+  test.each([12, 24])(
+    "Stop at native batch boundary %s prevents the next model request",
+    async (stopAt) => {
+      const f = await fixture("probe", 49, stopAt);
+      try {
+        await f.run();
+        expect(f.executions).toHaveLength(stopAt);
+        expect(f.requests).toHaveLength(stopAt);
+      } finally {
+        f.close();
+      }
+    },
+  );
+
+  test("a correction received mid-task remains visible across native batch boundaries", async () => {
+    const f = await fixture("probe", 25);
+    const queue = [
+      {
+        id: "correction",
+        role: "user" as const,
+        content: "Keep the requested correction",
+      },
+    ];
+    const session = newSteerSession(
+      async () => (f.executions.length >= 5 ? queue.splice(0) : []),
+      () => {},
+    );
+    try {
+      await withSteering(session, () => f.run());
+      for (const request of f.requests.slice(5)) {
+        expect(
+          request.messages.filter((message) =>
+            JSON.stringify(message.content).includes(
+              "Keep the requested correction",
+            ),
+          ),
+        ).toHaveLength(1);
+      }
+      expect(f.executions).toHaveLength(25);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("an approved tool result survives later native batches without executing the approved action again", async () => {
+    const f = await fixture("probe", 25);
+    f.agent.addMessage({
+      id: "approved-message",
+      role: "assistant",
+      content: "",
+      toolCalls: [
+        {
+          id: "approved-call",
+          type: "function",
+          function: { name: "probe", arguments: '{"n":1}' },
+        },
+      ],
+    });
+    try {
+      await f.run([
+        {
+          interruptId: "approved-call",
+          status: "resolved",
+          payload: { completed: 1 },
+        },
+      ]);
+      expect(f.executions).toEqual(
+        Array.from({ length: 24 }, (_, index) => index + 2),
+      );
+      expect(f.agent.messages.at(-1)).toMatchObject({
+        role: "assistant",
+        content: "Task complete",
+      });
+      for (const request of f.requests) {
+        expect(
+          request.messages.filter(
+            (message) =>
+              message.role === "tool" &&
+              message.tool_call_id === "approved-call",
+          ),
+        ).toHaveLength(1);
+        expect(
+          request.messages.filter((message) => message.role === "tool"),
+        ).toHaveLength(f.requests.indexOf(request) + 1);
+      }
+    } finally {
+      f.close();
+    }
   });
 });
 
-/*
- * 2026-10-21：在客户端里让写面板经常写不出来。12 步里交不上面板时，以前的提醒让模型「停止调用工具」，
- * 卡片永远停在「正在搭建」。面板建了还没交上合格规范时按 20 步算，提醒改成马上 panel_update。
- */
-describe("step budget while a panel is being built", () => {
-  test("after panel_create the budget is 20 and the note asks for panel_update", () => {
-    const turn = {};
-    withStepBudgetNote("面板已建", turn, { tool: "panel_create" });
-    const out: unknown[] = [];
-    for (let i = 1; i < 20; i++) out.push(withStepBudgetNote(`r${i}`, turn, { tool: "web_fetch" }));
-    // used 2..20：剩 2 次时（used 18）才提醒
-    expect(out.slice(0, 16).every((r) => !String(r).includes("系统提示"))).toBe(true);
-    expect(String(out[16])).toContain("panel_update");
-    expect(String(out[16])).not.toContain("停止调用工具");
+async function fixture(name: string, count: number, stopAt?: number) {
+  const requests: {
+    messages: { role: string; content: unknown; tool_call_id?: string }[];
+  }[] = [];
+  const executions: number[] = [];
+  const events: BaseEvent[] = [];
+  let stopped = false;
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      const body = await request.json();
+      requests.push(body);
+      const done = body.messages.filter(
+        (message: { role: string }) => message.role === "tool",
+      ).length;
+      const chunk = (delta: unknown, finish_reason: string | null = null) => ({
+        id: `completion-${requests.length}`,
+        object: "chat.completion.chunk",
+        created: 0,
+        model: "fixture-tool-model",
+        choices: [{ index: 0, delta, finish_reason }],
+        ...(finish_reason
+          ? {
+              usage: {
+                prompt_tokens: 10,
+                completion_tokens: 2,
+                total_tokens: 12,
+              },
+            }
+          : {}),
+      });
+      const chunks =
+        done < count
+          ? [
+              chunk({
+                role: "assistant",
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: `call-${done + 1}`,
+                    type: "function",
+                    function: {
+                      name,
+                      arguments: JSON.stringify({ n: done + 1 }),
+                    },
+                  },
+                ],
+              }),
+              chunk({}, "tool_calls"),
+            ]
+          : [
+              chunk({ role: "assistant", content: "Task complete" }),
+              chunk({}, "stop"),
+            ];
+      return new Response(
+        `${chunks.map((part) => `data: ${JSON.stringify(part)}\n\n`).join("")}data: [DONE]\n\n`,
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    },
+  });
+  try {
+    const agents = await buildAgents(
+      [
+        {
+          id: "bot",
+          name: "Bot",
+          type: "built_in",
+          systemPrompt: "Complete the task.",
+        },
+      ],
+      {
+        provider: "openai",
+        defaultModel: "fixture-tool-model",
+        baseUrl: `http://127.0.0.1:${server.port}/v1`,
+      },
+      "fixture-key",
+      undefined,
+      async () => [
+        {
+          name,
+          ref: "fixture/probe",
+          description: "Complete one step",
+          parameters: z.object({ n: z.number() }),
+          execute: async ({ n }: { n: number }) => {
+            executions.push(n);
+            if (n === stopAt) stopped = true;
+            return { completed: n };
+          },
+        },
+      ],
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      // Cover attachment preparation too; it must happen before segment continuation.
+      name === "panel_update" ? async () => null : undefined,
+    );
+    const agent = agents.bot!.clone();
+    agent.threadId = "long-task";
+    agent.setMessages([
+      { id: "user", role: "user", content: "Complete all requested steps" },
+    ]);
+    const controller = new AbortController();
+    return {
+      agent,
+      requests,
+      executions,
+      events,
+      run: (resume?: RunAgentInput["resume"]) =>
+        withConfirmTurn(
+          { threadId: "long-task", runId: "one-run", stopped: () => stopped },
+          () =>
+            withToolAbort(controller.signal, () =>
+              agent.runAgent(
+                { runId: "one-run", resume },
+                {
+                  onEvent: ({ event }) => {
+                    events.push(event);
+                  },
+                },
+              ),
+            ),
+        ),
+      close: () => server.stop(true),
+    };
+  } catch (error) {
+    server.stop(true);
+    throw error;
+  }
+}
+
+const input: RunAgentInput = {
+  threadId: "thread",
+  runId: "run",
+  messages: [{ id: "user", role: "user", content: "one task" }],
+  state: {},
+  tools: [],
+  context: [],
+  forwardedProps: {},
+};
+function segment(
+  overrides: Partial<RunFinishedEvent> = {},
+  result = "ok",
+): BaseEvent[] {
+  return [
+    { type: EventType.RUN_STARTED, threadId: "thread", runId: "run" },
+    {
+      type: EventType.TOOL_CALL_START,
+      toolCallId: "call",
+      toolCallName: "probe",
+      parentMessageId: "message",
+    },
+    { type: EventType.TOOL_CALL_ARGS, toolCallId: "call", delta: "{}" },
+    { type: EventType.TOOL_CALL_END, toolCallId: "call" },
+    {
+      type: EventType.TOOL_CALL_RESULT,
+      toolCallId: "call",
+      messageId: "result",
+      role: "tool",
+      content: result,
+    },
+    {
+      type: EventType.RUN_FINISHED,
+      threadId: "thread",
+      runId: "run",
+      metadata: { finishReason: "tool-calls" },
+      ...overrides,
+    },
+  ];
+}
+
+describe("native continuation boundaries", () => {
+  test.each([
+    ["normal completion", { metadata: { finishReason: "stop" } }, "ok"],
+    ["cancelled", { outcome: { type: "cancelled" } }, "ok"],
+    [
+      "pending client tool",
+      { outcome: { type: "success", pendingToolCallIds: ["external"] } },
+      "ok",
+    ],
+    [
+      "approval",
+      {
+        outcome: {
+          type: "interrupt",
+          interrupts: [{ id: "call", reason: "human_input" }],
+        },
+      },
+      "ok",
+    ],
+    ["tool error", {}, "Error: unavailable"],
+    ["JSON encoded refusal", {}, JSON.stringify("Refused. Not allowed")],
+    ["waiting", {}, '{"waiting":true}'],
+    ["failed result", {}, '{"ok":false,"error":"unavailable"}'],
+  ] as const)(
+    "%s does not start another segment",
+    async (_name, terminal, result) => {
+      let calls = 0;
+      const events = await lastValueFrom(
+        continueToolRuns(input, () => {
+          calls++;
+          return of(...segment(terminal as Partial<RunFinishedEvent>, result));
+        }).pipe(toArray()),
+      );
+      expect(calls).toBe(1);
+      expect(events.at(-1)?.type).toBe(EventType.RUN_FINISHED);
+    },
+  );
+
+  test("unanswered frontend tools are left for their executor", async () => {
+    let calls = 0;
+    const events = segment().filter(
+      (event) => event.type !== EventType.TOOL_CALL_RESULT,
+    );
+    await lastValueFrom(
+      continueToolRuns(input, () => {
+        calls++;
+        return of(...events);
+      }).pipe(toArray()),
+    );
+    expect(calls).toBe(1);
   });
 
-  test("a refused panel_update keeps the panel pending; a saved one ends it", () => {
-    const turn = {};
-    withStepBudgetNote("ok", turn, { tool: "panel_create" });
-    withStepBudgetNote("Refused. 面板没有保存", turn, { tool: "panel_update" });
-    for (let i = 0; i < 8; i++) withStepBudgetNote("r", turn, { tool: "web_fetch" });
-    // used 11：面板仍欠着，按 20 算，不提醒
-    expect(String(withStepBudgetNote("r", turn, { tool: "web_fetch" }))).not.toContain("系统提示");
-    withStepBudgetNote("面板「X」已更新", turn, { tool: "panel_update" });
-    // used 13：面板交上了，回到 12 步，提醒收尾
-    expect(String(withStepBudgetNote("r", turn, { tool: "web_fetch" }))).toContain("停止调用工具");
+  test("no-progress and error segments cannot spin", async () => {
+    for (const events of [
+      segment().filter(
+        (event) =>
+          event.type === EventType.RUN_STARTED ||
+          event.type === EventType.RUN_FINISHED,
+      ),
+      [{ type: EventType.RUN_ERROR, message: "model failed" } as BaseEvent],
+    ]) {
+      let calls = 0;
+      await lastValueFrom(
+        continueToolRuns(input, () => {
+          calls++;
+          return of(...events);
+        }).pipe(toArray()),
+      );
+      expect(calls).toBe(1);
+    }
   });
 
-  test("a background panel refresh owes a panel_update from the first step", () => {
-    const turn = {};
-    const out: unknown[] = [];
-    for (let i = 0; i < 18; i++) out.push(withStepBudgetNote("r", turn, { tool: "web_fetch", panelRefresh: true }));
-    expect(out.slice(0, 17).every((r) => !String(r).includes("系统提示"))).toBe(true);
-    expect(String(out[17])).toContain("panel_update");
+  test("continuation keeps state, context and approval results, and adds no user message", async () => {
+    const requests: RunAgentInput[] = [];
+    await lastValueFrom(
+      continueToolRuns(
+        {
+          ...input,
+          context: [{ description: "project", value: "42" }],
+          forwardedProps: { model: "override" },
+          resume: [
+            { interruptId: "old", status: "resolved", payload: "saved" },
+          ],
+        },
+        (request) => {
+          requests.push(request);
+          return requests.length === 1
+            ? of(
+                ...[
+                  ...segment().slice(0, -1),
+                  {
+                    type: EventType.STATE_SNAPSHOT,
+                    snapshot: { completed: 1 },
+                  },
+                  segment().at(-1)!,
+                ],
+              )
+            : of({
+                type: EventType.RUN_FINISHED,
+                threadId: "thread",
+                runId: "run",
+                metadata: { finishReason: "stop" },
+              });
+        },
+      ).pipe(toArray()),
+    );
+    expect(requests).toHaveLength(2);
+    expect(requests[1]).toMatchObject({
+      threadId: "thread",
+      runId: "run",
+      state: { completed: 1 },
+      context: [{ description: "project", value: "42" }],
+      forwardedProps: { model: "override" },
+    });
+    expect(requests[1]?.resume).toEqual([
+      { interruptId: "old", status: "resolved", payload: "saved" },
+    ]);
+    expect(
+      requests[1]?.messages.filter((message) => message.role === "user"),
+    ).toHaveLength(1);
+    expect(requests[1]?.messages.at(-1)).toMatchObject({
+      role: "tool",
+      toolCallId: "call",
+    });
   });
 });

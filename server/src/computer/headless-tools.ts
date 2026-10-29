@@ -83,8 +83,6 @@ const UNATTENDED_NEED_HUMAN_ZH = (what: string) =>
   `没有执行：${what}。这一轮是定时任务 / 后台触发，用户不在场，没法请他接管浏览器或登录。告诉用户：在 ChisaBot 网页聊天里当面让你再做一次。`;
 
 
-const MAX_TOOL_SEGMENTS = 30;
-
 /**
  * Executes AG-UI client tools inside the Intelligence run. Backend results are
  * forwarded unchanged; only newly emitted unanswered calls can be executed.
@@ -122,7 +120,7 @@ export class HeadlessToolsMiddleware extends Middleware {
               .map((tool) => tool.definition),
           ],
         };
-        for (let segment = 0; segment <= MAX_TOOL_SEGMENTS; segment += 1) {
+        for (;;) {
           if (subscriber.closed) return;
           const historical = new Set(
             request.messages.flatMap((message) =>
@@ -178,6 +176,10 @@ export class HeadlessToolsMiddleware extends Middleware {
             throw new Error(
               "The headless agent ended without a terminal event (the model connection closed before the turn finished).",
             );
+          if (terminal.outcome?.type === "cancelled") {
+            subscriber.next(terminal);
+            return;
+          }
           const answered = new Set(
             messages.flatMap((message) =>
               message.role === "tool" ? [message.toolCallId] : [],
@@ -203,10 +205,6 @@ export class HeadlessToolsMiddleware extends Middleware {
             subscriber.next(terminal);
             return;
           }
-          if (segment === MAX_TOOL_SEGMENTS)
-            throw new Error(
-              "The headless tool continuation limit was reached.",
-            );
           const results = new Map<string, string>();
           for (const call of owned) {
             if (subscriber.closed) return;

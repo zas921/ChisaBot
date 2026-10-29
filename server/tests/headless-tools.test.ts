@@ -6,7 +6,7 @@ import {
   HttpAgent,
   type RunAgentInput,
 } from "@ag-ui/client";
-import { Observable } from "rxjs";
+import { Observable, lastValueFrom, toArray } from "rxjs";
 import { parseApprovalContinuation } from "../src/approvals/types";
 import type { AuditEventInput } from "../src/audit";
 import { createComputerGateway } from "../src/computer/gateway";
@@ -18,6 +18,35 @@ const definition = {
   description: "Snapshot the current browser page",
   parameters: { type: "object", properties: {} },
 };
+
+test("headless tasks continue beyond 30 tool segments without replaying completed calls", async () => {
+  const remote = remoteTurn((input, index) => lifecycle(input,
+    index < 65 ? toolCall(definition.name, "{}", `long-call-${index}`) : reply("All 65 steps complete.")));
+  let executions = 0;
+  const { run, persisted } = turnHarness(remote.agent, async () => [{
+    definition, execute: async () => { executions++; return { ok: true }; },
+  }]);
+  await expect(run()).resolves.toEqual({ replyText: "All 65 steps complete." });
+  expect(executions).toBe(65);
+  expect(remote.requests).toHaveLength(66);
+  expect(remote.requests.every((request) => request.messages.filter((message) => message.role === "user").length === 1)).toBe(true);
+  const results = persisted.filter((event) => event.type === EventType.TOOL_CALL_RESULT);
+  expect(new Set(results.map((event) => event.toolCallId)).size).toBe(65);
+  expect(persisted.filter((event) => event.type === EventType.RUN_FINISHED)).toHaveLength(1);
+});
+
+test("a cancelled headless segment executes no pending tools and does not resume", async () => {
+  const remote = remoteTurn((input) => lifecycle(input, toolCall()).map((event) =>
+    event.type === EventType.RUN_FINISHED ? { ...event, outcome: { type: "cancelled" } } : event));
+  let executions = 0;
+  const input: RunAgentInput = { threadId: "thread", runId: "run", state: {}, context: [], forwardedProps: {}, messages: [], tools: [] };
+  const events = await lastValueFrom(new headless.HeadlessToolsMiddleware([{
+    definition, execute: async () => { executions++; return "ok"; },
+  }]).run(input, remote.agent).pipe(toArray()));
+  expect(executions).toBe(0);
+  expect(remote.requests).toHaveLength(1);
+  expect(events.at(-1)).toMatchObject({ type: EventType.RUN_FINISHED, outcome: { type: "cancelled" } });
+});
 
 function remoteTurn(
   events: (input: RunAgentInput, index: number) => BaseEvent[],

@@ -53,6 +53,7 @@ import { HeadlessToolsMiddleware } from "./computer/headless-tools";
 import type { DeploymentConfig } from "./config";
 import { meterLanguageModel, meterRun } from "./context-usage";
 import { steerLanguageModel } from "./thread-inbox";
+import { continueToolRuns, LONG_TASK_GUIDANCE } from "./agents/tool-continuation";
 import { observeModelConnection } from "./desktop-connection-failure";
 import { desktopTelemetryProperties } from "./desktop-telemetry";
 import { observeIntelligenceAuthentication } from "./intelligence-client";
@@ -595,9 +596,6 @@ export function builtInAgentConfiguration(
 
   const standing = standingInstructionsGuidance(standingInstructions);
   const allTools = [...tools];
-  // 后台刷新面板的回合只拿到 panel_update / panel_fail（没有 panel_create）：它从第一步起就欠一次 panel_update。
-  const panelRefreshRun =
-    allTools.some((tool) => tool.name === "panel_update") && !allTools.some((tool) => tool.name === "panel_create");
 
   return {
     // 每一步开始前看收件箱：机器人回答期间用户又发来的话、后台任务的结果在步与步之间读进去（thread-inbox.ts）。
@@ -637,6 +635,7 @@ export function builtInAgentConfiguration(
       WORK_STYLE_GUIDANCE,
       // 行动优先：手里有工具时，先把事做了再回话；不许在调用工具之前说“我没有权限”。
       ...(tools.length > 0 ? [ACTION_GUIDANCE] : []),
+      ...(tools.length > 0 ? [LONG_TASK_GUIDANCE] : []),
       // 机器人的名字（不然它会自称模型名，DESIGN.md §69）。
       botIdentityGuidance(agent.name),
       ...(tools.some((tool) => tool.name === "web_search") ? [WEB_GUIDANCE] : []),
@@ -670,7 +669,7 @@ export function builtInAgentConfiguration(
               // FIX-04：用户已按停止 → 立刻拒绝，不再开新工具；并把 signal 传给 web_search 等长操作。
               const signal = execution?.abortSignal ?? currentToolAbort();
               if (signal?.aborted || currentConfirmTurn()?.stopped()) {
-                return withStepBudgetNote(`${REFUSAL_MARKER} ${TOOL_STOPPED_ZH}`);
+                return `${REFUSAL_MARKER} ${TOOL_STOPPED_ZH}`;
               }
               // 确认卡片要画在这条工具调用下面：把 toolCallId 带给 server/src/confirmations。
               let result: Awaited<ReturnType<typeof tool.execute>>;
@@ -689,8 +688,7 @@ export function builtInAgentConfiguration(
                 throw error;
               }
               if (typeof result === "string" && result.startsWith(REFUSAL_MARKER)) noteToolFailure(tool.name, result);
-              // 步数快用完时提醒收尾（§101）；面板还没交上去时提醒的是「马上 panel_update」（2026-10-21）。
-              return withStepBudgetNote(result, undefined, { tool: tool.name, panelRefresh: panelRefreshRun });
+              return result;
             },
           })),
           maxSteps: allTools.some((tool) => tool.name === "panel_update") ? PANEL_TOOL_STEPS : TOOL_STEPS,
@@ -712,59 +710,16 @@ export function noteToolFailure(tool: string, failure: unknown): void {
 }
 
 /**
- * How many turns of the tool loop one run may take.
- *
- * Enough for a Bot to search, read what came back, search again on a better term, and answer.
- * Beyond that a model is not making progress, and every extra step is somebody's money.
+ * How many steps one SDK segment may take. continueToolRuns carries successful native tool
+ * results into the next segment until the model finishes or the run is stopped.
  */
 const TOOL_STEPS = 12;
 
 /**
- * 做面板的回合可以多走几步（2026-10-21，用户：在客户端里让写面板经常写不出来）。
- *
- * 做一张面板最少是 panel_create → web_search → web_fetch → panel_update，设计规范不合格还会被退回重交
- * （最多 3 次，结构问题不限次数）。12 步里常常交不上：以前到倒数第三步就提醒「停止调用工具、直接回答」，
- * 模型照做，卡片永远停在「正在搭建」。所以手里有面板工具的回合硬上限放到 20 步；面板建了还没交上合格规范时
- * 按 20 步算余量，提醒改成「别再搜了，用已有数据马上 panel_update」。普通回合仍按 12 步提醒收尾。
+ * 面板批次保留 20 步，减少构建过程中的分段次数。普通批次为 12 步；
+ * 两者都自动续跑，不再向模型注入提前收尾指令（DESIGN.md §101.4）。
  */
 const PANEL_TOOL_STEPS = 20;
-
-/**
- * 步数快用完时提醒模型收尾（DESIGN.md §101）。
- *
- * 到了 TOOL_STEPS 这一轮就硬停：模型最后一步还在调工具，就没有最终回答，界面只能显示「这一轮没有做完」
- * （2026-10-18 实测：搜了 11 次新闻，一句结论都没给）。这里按这一轮（同一个 run）已经执行的工具次数，
- * 从倒数第三次起在工具结果后面加一句「停止调用工具，直接回答」。只加在字符串 / 普通对象结果上，不改别的。
- */
-const stepCounts = new WeakMap<object, number>();
-/** 这一轮有没有「建了卡片、还没交上合格规范」的面板。 */
-const panelPending = new WeakMap<object, boolean>();
-const STEP_NOTE = (left: number) =>
-  `【系统提示】这一轮的工具步数快用完了（最多还能再调 ${left} 次）。现在停止调用工具，用已经拿到的信息直接给用户完整的回答；信息不全就说明缺什么。`;
-const PANEL_STEP_NOTE = (left: number) =>
-  `【系统提示】这一轮的工具步数快用完了（最多还能再调 ${left} 次），面板还没有交上去。不要再搜索或读网页：现在就用已经取到的数据调用 panel_update（数据不全就少放几项）；实在没有数据就调用 panel_fail 写明原因。`;
-export function withStepBudgetNote<T>(
-  result: T,
-  turn: object | undefined = currentConfirmTurn(),
-  /** 刚执行的工具，以及这是不是后台刷新面板的回合（它一开始就欠一次 panel_update）。 */
-  options: { tool?: string; panelRefresh?: boolean } = {},
-): T {
-  if (!turn) return result;
-  const used = (stepCounts.get(turn) ?? 0) + 1;
-  stepCounts.set(turn, used);
-  const refused = typeof result === "string" && result.startsWith(REFUSAL_MARKER);
-  let pending = panelPending.get(turn) ?? options.panelRefresh === true;
-  if (options.tool === "panel_create" && !refused) pending = true;
-  if (options.tool === "panel_update" || options.tool === "panel_fail") pending = refused;
-  panelPending.set(turn, pending);
-  const left = (pending ? PANEL_TOOL_STEPS : TOOL_STEPS) - used;
-  if (left > 2) return result;
-  const note = (pending ? PANEL_STEP_NOTE : STEP_NOTE)(Math.max(left, 0));
-  if (typeof result === "string") return `${result}\n\n${note}` as T;
-  if (result && typeof result === "object" && !Array.isArray(result) && Object.getPrototypeOf(result) === Object.prototype)
-    return { ...(result as Record<string, unknown>), systemNote: note } as T;
-  return result;
-}
 
 /**
  * Build the built-in and remote AG-UI agent map the runtime serves.
@@ -1937,9 +1892,8 @@ class BuiltInAgentWithSaneHistory extends BuiltInAgent {
      */
     if (!load)
       return meterRun(() =>
-        nativeApprovalRun({ ...input, messages: history }, () =>
-          observeModelConnection(super.run({ ...input, messages: history })),
-        ),
+        continueToolRuns({ ...input, messages: history }, (segment) =>
+          nativeApprovalRun(segment, () => observeModelConnection(super.run(segment)))),
       );
     /*
      * Deferred, because `run` has to answer with a stream straight away and reading the bytes is a
@@ -1958,9 +1912,8 @@ class BuiltInAgentWithSaneHistory extends BuiltInAgent {
           ),
         ).pipe(
           switchMap((messages) =>
-            nativeApprovalRun({ ...input, messages }, () =>
-              observeModelConnection(super.run({ ...input, messages })),
-            ),
+            continueToolRuns({ ...input, messages }, (segment) =>
+              nativeApprovalRun(segment, () => observeModelConnection(super.run(segment)))),
           ),
         ),
       ),

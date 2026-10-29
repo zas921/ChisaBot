@@ -96,6 +96,8 @@ import { createRoleRepository } from "./auth/guards";
 import { type OpenBotRole, setRole } from "./auth/roles";
 import {
   createGatewayRequireUser,
+  GatewayReplayCache,
+  isReplayedGatewayIdentity,
   gatewaySecretFromEnvironment,
   resolveGatewayRequest,
 } from "./auth/gateway-identity";
@@ -3869,11 +3871,17 @@ const isProxiedStream = (data: SocketData): data is StreamData =>
 const asChannelSocket = (ws: { data: SocketData }) =>
   ws as unknown as ChannelSocket;
 
+// 审计 #5：网关身份头一次性（每个进来的 HTTP 请求在这里消费一次）。
+const gatewayReplayCache = new GatewayReplayCache();
+
 serve<SocketData>({
   port,
   // Disable Bun's default 128 MiB request-body cap for file transfers.
   maxRequestBodySize: Number.POSITIVE_INFINITY,
   async fetch(request, server) {
+    if (gatewaySecret && isReplayedGatewayIdentity(gatewaySecret, request.headers, gatewayReplayCache)) {
+      return Response.json({ ok: false, error: "请先登录。", openbotAuthRequired: true }, { status: 401 });
+    }
     const url = new URL(request.url);
     if (request.method === "POST" && (url.pathname === "/api/chat-files" || /^\/api\/channels\/[^/]+\/attachments$/.test(url.pathname))) server.timeout(request, 0);
     if (url.pathname === "/api/audio/transcriptions") {

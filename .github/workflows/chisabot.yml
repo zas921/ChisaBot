@@ -71,6 +71,19 @@ jobs:
           server/tests/model-settings-routes.test.ts
           server/tests/model-settings.test.ts
           server/tests/computer-tool-outcome.test.ts
+      - name: Long task continuation and security regressions
+        run: >-
+          bun test server/tests/step-budget.test.ts server/tests/headless-tools.test.ts
+          server/tests/approvals-native.test.ts server/tests/context-usage.test.ts
+          server/tests/gateway-identity.test.ts shared/content-security-policy.test.ts --timeout 30000
+      - name: Appearance and SVG rendering regressions
+        working-directory: app
+        env:
+          NODE_ENV: test
+        run: >-
+          bun test tests/appearance-preferences.test.ts tests/render-budget.test.ts
+          tests/sky-window.test.ts tests/svg-card-sanitize.test.ts
+          tests/continue-agent.test.ts tests/sw-navigation.test.ts tests/serve.test.ts --timeout 30000
       # The chat regression set every ChisaBot PR runs on the server (the older model-chooser DOM tests
       # need a live API and never ran here while typecheck was failing; see docs/slimming.md P3).
       - name: Chat UI checks

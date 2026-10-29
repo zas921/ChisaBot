@@ -757,7 +757,7 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
               <div className="glass-sec">
                 <span>{`搜索“${search.trim()}”`}</span>
               </div>
-              <div ref={scrollRoot} className="glass-side-scroll scroll-fade-b">
+              <div ref={scrollRoot} className="glass-side-scroll">
                 <SidebarMenu>
                   <SidebarGroup className="gap-px p-0">
                     {searchFailed ? (
@@ -848,7 +848,7 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
             </>
           ) : (
             <>
-              <div className="glass-side-scroll glass-bot-scroll scroll-fade-b">
+              <div className="glass-side-scroll glass-bot-scroll">
                 <HiddenChatBotRow
                   known={new Set(roster.map((bot) => bot.id))}
                 />
@@ -950,7 +950,7 @@ function BotMiniRail({
         </button>
       </RailTip>
       <div className="glass-card glass-mini-card">
-        <div className="glass-mini-scroll scroll-fade-b">
+        <div className="glass-mini-scroll">
           <HiddenChatMiniBot known={new Set(bots.map((bot) => bot.id))} />
           {bots.map((bot) => (
             <MiniBot

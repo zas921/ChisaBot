@@ -37,6 +37,7 @@ ChisaBot 是 CopilotKit/OpenBot 的中文私人助手分支：一台云端服务
   数据表和 DESIGN 章节、常用运行时开关。
 - [数据模型](data-model.md)：全部 `chisabot_*` 表、本地对话表、仍在用的上游表、网关 SQLite、浏览器本地存储。
 - [流式回复：从模型到屏幕](streaming.md)
+- [长任务自动续跑](long-tasks.md) · [个人版 0.1.63 同步与验证](pipeline-runs/20261028-auto-continuation-upstream.md)
 - [分支与能力边界](chisabot.md)：本地模式、第三方推理、数据兼容和客户端状态。
 - [OpenBot 原始架构](openbot-architecture.md)（上游参考；其中很多部分已瘦身掉，见 [slimming.md](slimming.md)）
 
