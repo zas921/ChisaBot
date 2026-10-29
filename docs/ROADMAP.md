@@ -22,6 +22,8 @@ ChisaBot 现在要做什么、接下来做什么、以后做什么。这一页�
 
 ## 现在（进行中）
 
+个人版 CB-100：`fix/durable-goal-continuation` 持续目标、后台完成恢复与实际验收，正在发布验证。
+
 | 条目 | 内容 | 里程碑 | 分支 |
 |---|---|---|---|
 | [CB-088](BACKLOG.md#cb-088) | 代理 IP 证书校验与好友包首次构建（个人 Fork 独立分支，23 项相关测试通过；完整检查待完成） | 成熟度 | `fix/proxy-tls-friend-bootstrap` |

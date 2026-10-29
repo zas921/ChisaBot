@@ -167,3 +167,7 @@ ChisaBot 自己的表大多在服务启动时 `CREATE TABLE IF NOT EXISTS`（不
 | `CHISABOT_MAX_OUTPUT_TOKENS` | 单次输出上限（默认按模型目录，封顶 32000） |
 | `CHISABOT_GITHUB_API_BASE` | GitHub Enterprise 或测试替身 |
 | `CHISABOT_LINK_PREVIEW_SHOTS=1` | 没有 og:image 时截图做链接卡缩略图 |
+
+## 持续目标（CB-100）
+
+GoalTasks → PostgreSQL chisabot_goal_tasks → 原 TurnRunner / 设备 Hub。三秒扫描、租约互斥、后台作业状态轮询，固定命令最终复验；CHISABOT_GOAL_TASKS=0 关闭扫描。见 [设计](goal-tasks.md) 与 ADR-0015。

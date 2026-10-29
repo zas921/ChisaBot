@@ -1,3 +1,6 @@
+import { createGoalTasks, decodeGoalResult } from "./agents/goal-tasks";
+import { currentConfirmTurn } from "./confirmations/context";
+import type { TurnRunner } from "./turns/types";
 import { createHash, randomUUID } from "node:crypto";
 import { PanelError, type PanelCapability } from "../../shared/panels/types";
 import { createPanelServices } from "./panels/service";
@@ -1214,6 +1217,8 @@ if (process.env.CHISABOT_DEVICE_ASK_DEFAULTS !== "0") {
     console.warn("adopting device ask defaults failed", error);
   }
 }
+let goalTasks: ReturnType<typeof createGoalTasks> | undefined;
+let goalRunTurn: TurnRunner | undefined;
 const deviceToolsFor = async (
   actorId: string,
   botId: string,
@@ -1250,7 +1255,7 @@ const deviceToolsFor = async (
           },
         }
       : undefined;
-    return [...deviceTools({
+    const available = [...deviceTools({
       store: deviceStore,
       hub: deviceHub,
       botId,
@@ -1260,6 +1265,17 @@ const deviceToolsFor = async (
       ...(initiator ? { initiator } : {}),
       ...(workspace ? { workspace } : {}),
     }), ...(repairs?.tools(actorId, botId) ?? [])];
+    return available.map((tool) => ({ ...tool, execute: async (args: unknown, ctx?: import("./plugins/tools").ToolExecuteContext) => {
+      const turn = currentConfirmTurn();
+      const scope = turn ? { ownerUserId: actorId, agentId: botId, threadId: turn.threadId } : null;
+      const release = scope ? await goalTasks?.operation(scope) : null;
+      try {
+        const actualArgs = scope && goalTasks ? await goalTasks.prepareDeviceCall(scope, tool.name, args) : args;
+        const result = await tool.execute(actualArgs, ctx);
+        if (scope) await goalTasks?.observe(scope, tool.name, actualArgs, result);
+        return result;
+      } finally { await release?.(); }
+    } }));
   } catch (error) {
     console.error(
       JSON.stringify({
@@ -1376,6 +1392,42 @@ const loadPersonalMemoryForActor = (ownerUserId: string) => async (botId: string
     .join("\n\n");
 // Follow-ups a Bot schedules for itself, on the shared work queue. See agents/wake-up.ts.
 const wakeUpStore = createWakeUpStore(database, { auditStore: bootAuditStore });
+if (localBackend) {
+  goalTasks = createGoalTasks({
+    database,
+    runTurn: (input) => { if (!goalRunTurn) throw new Error("Goal runner not ready"); return goalRunTurn(input); },
+    executeCheck: async (scope, check) => {
+      const tool = (await deviceToolsFor(scope.ownerUserId, scope.agentId, { kind: "routine", id: "goal:verification" })).find((t) => t.name === check.tool);
+      if (!tool) throw new Error("设备离线或验收命令权限未开启。");
+      return tool.execute(check.args);
+    },
+    pollJob: async (scope, job) => {
+      const tool = (await deviceToolsFor(scope.ownerUserId, scope.agentId, { kind: "routine", id: "goal:background-poll" })).find((t) => t.name === "device_shell_output");
+      if (!tool) return "设备离线，等待重连。";
+      if (job.status === "launching") {
+        const listed = decodeGoalResult(await tool.execute({ deviceId: job.deviceId }));
+        if (listed && typeof listed === "object" && "jobs" in listed && Array.isArray(listed.jobs)) {
+          const found = listed.jobs.filter((j: unknown) => j && typeof j === "object" && "command" in j && typeof j.command === "string" && j.command.includes("# chisabot-goal-operation:" + job.launchMarker));
+          if (found.length === 1) return found[0];
+          if (found.length > 1) return { status: "unknown", error: "作业标识出现多个结果，需要检查实际进程与产物，不能重新启动相同命令。" };
+          return { status: "unknown", error: "未找到已登记的作业；先检查实际进程、日志和产物，禁止盲目重跑。" };
+        }
+        return listed;
+      }
+      return tool.execute({ deviceId: job.deviceId, jobId: job.jobId, waitSec: 0 });
+    },
+    devicesReady: async (scope, ids) => { const devices = await deviceStore.forOwner(scope.ownerUserId); return ids.every((id) => devices.some((d) => [d.id, d.name].some((n) => n.toLowerCase() === id.toLowerCase()) && deviceHub.isOnline(d.id) && !d.paused)); },
+    isPaused: (threadId) => localBackend.inbox.isPaused(threadId),
+    clearPause: (threadId) => localBackend.inbox.startExplicitTurn(threadId),
+    stopRun: async (threadId) => { await localBackend.inbox.pause(threadId); return localBackend.runner.stop({ threadId }); },
+    botPaused: async (scope) => (await createBotLifecycleStore(database).get(scope.ownerUserId, scope.agentId)).paused,
+    canUse: async (ownerUserId, agentId) => {
+      const p = await agentProfileStore.get(await actorFor(ownerUserId), agentId);
+      return Boolean(p && (p.ownerUserId === ownerUserId || p.systemOwned));
+    },
+  });
+  await goalTasks.ensure();
+}
 /** Team Bots: published Bots, their audiences, and teammates' consent to their own accounts. */
 const teamBots = createTeamBots({
   database,
@@ -1399,6 +1451,7 @@ const loadToolsForActor =
     const imDevices = !imConnection || imService?.allowsDevices(imConnection) === true;
     // 有后果的工具（删除 / 付款 / 对外发消息）按审批偏好先出确认卡片（server/src/confirmations）。
     return confirmations.wrap([
+    ...(goalTasks?.tools(actorId, botId) ?? []),
     ...(initiator.kind === "routine" && initiator.id.startsWith("lp_") ? [] : confirmations.tools(actorId, botId, initiator)),
     ...wakeUpTools({
       store: wakeUpStore,
@@ -3044,6 +3097,20 @@ const deliveryStore = createDeliveryStore(database);
  * Follow-ups a Bot scheduled for itself: one headless turn each, through the same turn runner as a
  * routine, into the person's conversation with that Bot. See agents/wake-up.ts.
  */
+goalRunTurn = createTurnRunner({
+  intelligence: routineIntelligence, runner: routineAgentRunner, buildAgentFor, turnTimeoutMs: 0,
+  components: { store: componentStore, auditStore: bootAuditStore },
+  toolsForTurn: async ({ ownerUserId, agentId, initiator }) => {
+    if (!computerGateway) return [];
+    const actor = await actorFor(ownerUserId); const profile = await agentProfileStore.get(actor, agentId);
+    if (!profile || !canUseComputer(profile, actor)) return [];
+    return createHeadlessComputerTools({ gateway: computerGateway, botId: agentId, actor: { id: actor.id, userId: actor.id, initiator }, auditStore: bootAuditStore, ...(signInService ? { signIn: signInService } : {}) });
+  },
+});
+const goalTaskSweep = repeatAfterEach(async () => {
+  if (process.env.CHISABOT_GOAL_TASKS === "0") return;
+  await goalTasks?.sweep().catch((error: unknown) => console.error("goal-task-sweep", reasonWithoutStatement(error)));
+}, 3_000);
 const wakeUpQueue = createWorkQueue(database);
 const wakeUpRunner = createWakeUpRunner({
   queue: wakeUpQueue,
@@ -3692,6 +3759,7 @@ const app = createApp(
     modelCatalogRefreshMinutes,
     ...(gatewaySecret ? { singleUserGuard: createGatewayRequireUser(gatewaySecret, provisionGatewayUser) } : {}),
     extraRoutes: ({ requireUser }) => [
+      ...(goalTasks ? [["/api/goal-tasks", goalTasks.routes(requireUser)] satisfies [string, unknown]] : []),
       [
         "/api/admin/smoke",
         createAdminSmokeRoutes({

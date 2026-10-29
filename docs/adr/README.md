@@ -5,6 +5,7 @@
 
 | ADR | 决定 | 状态 |
 |---|---|---|
+| [0015](0015-durable-goal-tasks.md) | 持续目标独立于模型回合，后台与验收持久化 | 已采纳 |
 | [0001](0001-bots-only-left-column.md) | 左栏只列机器人，没有对话列表 | 已采纳（ADR-0014 修订：左栏可切换到 Claude Code） |
 | [0002](0002-devices-belong-to-account.md) | 设备属于账号，不属于某个机器人 | 已采纳 |
 | [0003](0003-cloud-agent-device-nodes.md) | 默认云端 agent + 设备节点，本地 agent 运行时可选 | 已采纳（本地 agent 见 ADR-0010） |

@@ -324,6 +324,7 @@ export function createTurnRunner(options: {
     agentId,
     threadId,
     instruction,
+    automationContext,
     initiator: suppliedInitiator,
     continuation,
     signal,
@@ -413,7 +414,7 @@ export function createTurnRunner(options: {
             ...continuation.result,
           },
         ])
-      : [...seeded, turn];
+      : automationContext ? seeded : [...seeded, turn];
 
     /*
      * WHAT THIS RUN IS ALLOWED TO PERSIST, and it is mandatory.
@@ -485,7 +486,7 @@ export function createTurnRunner(options: {
       tools: headlessTools
         .filter((tool) => !tool.hidden)
         .map((tool) => tool.definition),
-      context: continuation?.snapshot.context ?? [],
+      context: continuation?.snapshot.context ?? (automationContext ? [{ description: "用户已授权的持续任务调度", value: automationContext }] : []),
       forwardedProps:
         continuation?.snapshot.forwardedProps ?? suppliedForwardedProps,
       ...(continuation
@@ -644,6 +645,7 @@ export function createTurnRunner(options: {
       });
 
       const timeout = new Promise<never>((_resolve, reject) => {
+        if (turnTimeoutMs <= 0) return;
         deadline = setTimeout(() => {
           stopped = true;
           stopTurn();
