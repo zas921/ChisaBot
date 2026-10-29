@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -38,6 +38,7 @@ suite(
     afterAll(async () => {
       for (const process of processes) {
         try {
+          if (process.exitCode === null) process.kill();
           await process.exited;
         } catch {}
       }
@@ -66,6 +67,7 @@ suite(
       dirs.push(directory);
       const one = join(directory, "phase-one.txt"),
         two = join(directory, "phase-two.txt");
+      const releaseFile = join(directory, "release-background");
       const threadId = crypto.randomUUID(),
         agentId = `goal-agent-${crypto.randomUUID()}`;
       const scope: GoalScope = { ownerUserId: owner, agentId, threadId };
@@ -155,7 +157,7 @@ suite(
                       [
                         process.execPath,
                         "-e",
-                        `setTimeout(()=>{require('node:fs').writeFileSync(${JSON.stringify(one)},'PHASE_ONE_REAL')},${delay})`,
+                        `const f=require('node:fs');setTimeout(()=>{const timer=setInterval(()=>{if(f.existsSync(${JSON.stringify(releaseFile)})){clearInterval(timer);f.writeFileSync(${JSON.stringify(one)},'PHASE_ONE_REAL')}},20)},${delay});setTimeout(()=>process.exit(124),30000).unref()`,
                       ],
                       { stdout: "ignore", stderr: "ignore" },
                     );
@@ -277,6 +279,7 @@ suite(
         two,
         contexts,
         options,
+        releaseBackground: () => writeFile(releaseFile, "released"),
         stats: () => ({ invocations, launches, stage }),
         controller: () => controller,
         restart: () => {
@@ -296,6 +299,7 @@ suite(
       });
       expect(r.stats()).toMatchObject({ invocations: 1, launches: 1 });
       r.restart(); // App scheduler restart: durable rows, same device process and original thread.
+      await r.releaseBackground();
       const completed = await until(async () => {
         await r.tick();
         const task = await r.state();
@@ -327,6 +331,7 @@ suite(
       });
       await r.controller().pause(r.task.id, owner);
       r.restart();
+      await r.releaseBackground();
       await Bun.sleep(900);
       for (let i = 0; i < 5; i++) {
         await r.tick();
@@ -397,7 +402,9 @@ suite(
       const second = r.restart();
       await until(async () => {
         await Promise.all([r.tick(), second.sweep()]);
-        return (await r.state())?.status === "completed";
+        const task = await r.state();
+        if (task?.status === "waiting_background") await r.releaseBackground();
+        return task?.status === "completed";
       });
       await until(
         async () =>
