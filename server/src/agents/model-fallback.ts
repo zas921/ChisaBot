@@ -14,6 +14,7 @@
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash } from "node:crypto";
 
 type Model = Record<string, unknown> & { modelId?: string };
 
@@ -49,10 +50,22 @@ export type FallbackDeps = {
   log?: (line: Record<string, unknown>) => void;
   /**
    * 主模型多久没有任何输出就当它卡住了、换备用模型（毫秒；0 = 不限）。doStream 算到第一段真正的内容
-   * （stream-start 不算），doGenerate 算到整个结果。只在有备用模型可换时生效。默认 {@link FIRST_OUTPUT_MS}。
+   * （元数据与空开头事件不算），doGenerate 算到整个结果。只在有备用模型可换时生效。默认 {@link FIRST_OUTPUT_MS}。
    */
   firstOutputMs?: number;
+  /** A non-secret connection fingerprint. Omit to isolate this model instance's cooldowns. */
+  cooldownScope?: string;
 };
+
+/** Never use the credential itself as a cache key or expose it in logs. */
+export function modelCooldownScope(connection: {
+  provider: string; baseUrl?: string; useApiKey?: boolean;
+}, apiKey: string | null): string {
+  return createHash("sha256").update(JSON.stringify([
+    connection.provider, connection.baseUrl ?? "", connection.useApiKey !== false,
+    connection.useApiKey === false ? "" : apiKey ?? "",
+  ])).digest("hex");
+}
 
 /**
  * 静默可能是上游隐藏了思考过程，不能默认 30 秒就中止主模型并切换。
@@ -72,26 +85,68 @@ class FirstOutputTimeout extends Error {
   }
 }
 
-type StreamResult = { stream: ReadableStream<{ type?: string }> } & Record<string, unknown>;
+type StreamPart = { type?: string; error?: unknown; delta?: unknown } & Record<string, unknown>;
+type StreamResult = { stream: ReadableStream<StreamPart> } & Record<string, unknown>;
+
+/** SSE errors arrive as JSON, not rejected fetches (the HTTP response was already 200). */
+function streamError(value: unknown): Error {
+  if (value instanceof Error) return value;
+  const body = typeof value === "string" ? value : JSON.stringify(value ?? "Model stream failed") ?? String(value);
+  let detail = value;
+  let statusCode: number | undefined;
+  let code = "";
+  for (let depth = 0; detail && typeof detail === "object" && depth < 5; depth++) {
+    const item = detail as Record<string, unknown>;
+    const status = item.statusCode ?? item.status ?? item.status_code;
+    if (typeof status === "number") statusCode ??= status;
+    if (typeof item.code === "string") code = item.code;
+    else if (typeof item.type === "string") code = item.type;
+    const response = item.response as Record<string, unknown> | undefined;
+    const next = item.error ?? response?.error;
+    if (!next) break;
+    detail = next;
+  }
+  const message = typeof detail === "object" && detail && typeof (detail as Record<string, unknown>).message === "string"
+    ? (detail as { message: string }).message
+    : providerReason(body);
+  return Object.assign(new Error(message || "Model stream failed"), { statusCode, code, responseBody: body });
+}
+
+/** Metadata and empty opening markers cannot prove that the model has started answering. */
+function hasOutput(part: StreamPart): boolean {
+  if (["stream-start", "response-metadata", "text-start", "reasoning-start", "text-end", "reasoning-end", "finish"].includes(part.type ?? "")) return false;
+  if (part.type === "text-delta" || part.type === "reasoning-delta") return typeof part.delta === "string" && part.delta.length > 0;
+  // Tool input, tool results, sources and any unfamiliar event are conservatively committed.
+  return true;
+}
 
 /**
- * 带「第一段输出」期限地调用主模型。到期就中止这次请求、抛 FirstOutputTimeout；调用方自己的中止（用户点了停止）
- * 原样传下去、不当成超时。流式结果把已经读到的几段放回流的开头，下游看到的是同一条流。
+ * 在内容出现前检查 SSE 错误；可选的首输出期限为 0 时无限等待，保留长思考。
+ * 一旦有文本、推理或工具内容就交还原流，后续错误只透传，绝不重放已有输出/工具。
  */
-async function withFirstOutputDeadline(
+async function withStreamPreflight(
   call: (options: unknown) => Promise<unknown>,
   options: unknown,
   property: "doStream" | "doGenerate",
   ms: number,
+  modelId: string,
 ): Promise<unknown> {
+  if (property === "doGenerate" && ms <= 0) return call(options);
   const parent = (options as { abortSignal?: AbortSignal } | null)?.abortSignal;
   const controller = new AbortController();
-  const forward = () => controller.abort(parent?.reason);
+  let rejectAbort!: (reason: unknown) => void;
+  const aborted = new Promise<never>((_, reject) => { rejectAbort = reject; });
+  aborted.catch(() => {});
+  const forward = () => {
+    controller.abort(parent?.reason);
+    rejectAbort(parent?.reason ?? new DOMException("Stopped by user", "AbortError"));
+  };
   if (parent?.aborted) forward();
   else parent?.addEventListener("abort", forward, { once: true });
   let timer: ReturnType<typeof setTimeout> | undefined;
   let timedOut = false;
   const deadline = new Promise<never>((_, reject) => {
+    if (ms <= 0) return;
     timer = setTimeout(() => {
       timedOut = true;
       controller.abort(new FirstOutputTimeout(ms));
@@ -100,6 +155,7 @@ async function withFirstOutputDeadline(
   });
   deadline.catch(() => {});
   let streaming = false;
+  let reader: ReadableStreamDefaultReader<StreamPart> | undefined;
   const cleanupParent = () => parent?.removeEventListener("abort", forward);
   const callOptions =
     options && typeof options === "object" && "abortSignal" in options
@@ -111,7 +167,8 @@ async function withFirstOutputDeadline(
           writable: true,
         });
   try {
-    const result = await Promise.race([call(callOptions), deadline]);
+    if (parent?.aborted) throw parent.reason;
+    const result = await Promise.race([call(callOptions), deadline, aborted]);
     if (
       property !== "doStream" ||
       !result ||
@@ -120,20 +177,22 @@ async function withFirstOutputDeadline(
     )
       return result;
     const streamed = result as StreamResult;
-    const reader = streamed.stream.getReader();
-    const head: { type?: string }[] = [];
+    reader = streamed.stream.getReader();
+    const streamReader = reader;
+    const head: StreamPart[] = [];
     let done = false;
     for (;;) {
-      const next = await Promise.race([reader.read(), deadline]);
+      const next = await Promise.race([streamReader.read(), deadline, aborted]);
       if (next.done) {
         done = true;
         break;
       }
+      if (next.value?.type === "error") throw streamError(next.value.error);
       head.push(next.value);
-      if (next.value?.type !== "stream-start") break;
+      if (hasOutput(next.value) || next.value.type === "finish") break;
     }
     if (!done) streaming = true;
-    const stream = new ReadableStream<{ type?: string }>({
+    const stream = new ReadableStream<StreamPart>({
       start(out) {
         for (const part of head) out.enqueue(part);
         if (done) {
@@ -143,25 +202,33 @@ async function withFirstOutputDeadline(
       },
       async pull(out) {
         try {
-          const next = await reader.read();
+          const next = await Promise.race([streamReader.read(), aborted]);
           if (next.done) {
             cleanupParent();
             out.close();
           } else {
-            out.enqueue(next.value);
+            if (next.value?.type === "error") {
+              const error = streamError(next.value.error);
+              explainModelError(error, modelId);
+              out.enqueue({ ...next.value, error });
+            } else out.enqueue(next.value);
           }
         } catch (err) {
           cleanupParent();
+          if (!parent?.aborted) explainModelError(err, modelId);
           throw err;
         }
       },
       cancel(reason) {
         cleanupParent();
-        return reader.cancel(reason);
+        controller.abort(reason);
+        return streamReader.cancel(reason);
       },
     });
     return { ...streamed, stream };
   } catch (error) {
+    controller.abort(error);
+    void reader?.cancel(error).catch(() => {});
     if (timedOut && !parent?.aborted) throw new FirstOutputTimeout(ms);
     throw error;
   } finally {
@@ -170,21 +237,28 @@ async function withFirstOutputDeadline(
   }
 }
 
-const cooldown = new Map<string, number>();
-/** 冷却的原因（后续回合直接跳过它时，提示仍然说得对）。 */
-const cooledReason = new Map<string, FallbackReason>();
+type Cooldown = { modelId: string; until: number; reason: FallbackReason; statusCode?: number };
+const cooldown = new Map<string, Cooldown>();
+const modelScopes = new WeakMap<object, string>();
+let nextModelScope = 0;
+const cooldownKey = (scope: string, modelId: string) => JSON.stringify([scope, modelId]);
 export function resetModelCooldowns() {
   cooldown.clear();
-  cooledReason.clear();
 }
-export function coolingDown(modelId: string, now = Date.now()): boolean {
-  const until = cooldown.get(modelId);
-  if (!until) return false;
-  if (until <= now) {
-    cooldown.delete(modelId);
-    return false;
+/** Without a scope this is a diagnostic query only; calls always use their own connection scope. */
+export function coolingDown(modelId: string, now = Date.now(), scope?: string): boolean {
+  if (scope !== undefined) {
+    const key = cooldownKey(scope, modelId);
+    const entry = cooldown.get(key);
+    if (entry && entry.until <= now) cooldown.delete(key);
+    return Boolean(entry && entry.until > now);
   }
-  return true;
+  let active = false;
+  for (const [key, entry] of cooldown) {
+    if (entry.until <= now) cooldown.delete(key);
+    else if (entry.modelId === modelId) active = true;
+  }
+  return active;
 }
 
 function errorParts(error: unknown): { status?: number; text: string } {
@@ -197,7 +271,7 @@ function errorParts(error: unknown): { status?: number; text: string } {
     seen.add(current);
     const e = current as Record<string, unknown>;
     if (typeof e.statusCode === "number" && status === undefined) status = e.statusCode;
-    for (const key of ["message", "responseBody"]) if (typeof e[key] === "string") texts.push(e[key] as string);
+    for (const key of ["message", "responseBody", "code"]) if (typeof e[key] === "string") texts.push(e[key] as string);
     current = e.lastError ?? e.cause;
   }
   return { status, text: texts.join(" ") };
@@ -257,7 +331,7 @@ export function explainModelError(error: unknown, modelId: string): void {
   reason = maskSecrets(reason).slice(0, 300);
   const where = [`模型 ${modelId}`, status !== undefined ? `HTTP ${status}` : ""].filter(Boolean).join(" · ");
   try {
-    error.message = `${error.message.trim() || "模型调用失败"}（${where}${reason ? `：${reason}` : ""}）`;
+    error.message = maskSecrets(`${error.message.trim() || "模型调用失败"}（${where}${reason ? `：${reason}` : ""}）`);
     Object.defineProperty(error, EXPLAINED, { value: true });
   } catch {
     // 只读 / 冻结的错误对象：保持原样。
@@ -267,7 +341,7 @@ export function explainModelError(error: unknown, modelId: string): void {
 /** 日志里留一小段原始错误，事后能看出主模型到底为什么被拒。 */
 function errorSnippet(error: unknown): string {
   const { status, text } = errorParts(error);
-  return `${status ?? ""} ${text}`.replace(/\s+/g, " ").trim().slice(0, 240);
+  return maskSecrets(`${status ?? ""} ${text}`).replace(/\s+/g, " ").trim().slice(0, 240);
 }
 
 const QUOTA_TEXT = /quota|rate.?limit|daily.*limit|free (tier|limit)|limit reached|insufficient.*(credit|balance)|exceeded|额度|限额|余额/i;
@@ -290,6 +364,8 @@ export function fallbackReason(error: unknown): FallbackReason | null {
   if (isQuotaError(error)) return "quota";
   const { status, text } = errorParts(error);
   if (status !== undefined && (status === 529 || (status >= 500 && status <= 504))) return "unavailable";
+  // A successful HTTP response can carry a provider-side SSE failure without an HTTP error status.
+  if (status === undefined && /\b(server_error|internal_server_error|overloaded_error)\b/i.test(text)) return "unavailable";
   if (status === undefined && /\b(50[0234]|529)\b/.test(text) && UNAVAILABLE_TEXT.test(text)) return "unavailable";
   return null;
 }
@@ -326,6 +402,23 @@ export function fallbackLanguageModel<T>(model: T, primaryId: string, deps: Fall
   const now = deps.now ?? Date.now;
   const log = deps.log ?? ((line) => console.log(JSON.stringify(line)));
   const target = model as unknown as Model;
+  let scope = deps.cooldownScope;
+  if (scope === undefined) {
+    scope = modelScopes.get(model);
+    if (scope === undefined) {
+      scope = `instance:${++nextModelScope}`;
+      modelScopes.set(model, scope);
+    }
+  }
+  const connectionScope = scope;
+  const remember = (id: string, ms: number, reason: FallbackReason, error: unknown) => {
+    const time = now();
+    // Discard expired connections too, so repeatedly rotating credentials does not grow the cache.
+    for (const [key, entry] of cooldown) if (entry.until <= time) cooldown.delete(key);
+    const { status } = errorParts(error);
+    // Connections can be shared by several conversations. Never retain one request's error text.
+    cooldown.set(cooldownKey(connectionScope, id), { modelId: id, until: time + ms, reason, statusCode: status });
+  };
   const wrap = (property: "doStream" | "doGenerate") => async (options: unknown) => {
     try {
       return await attempt(property, options);
@@ -341,16 +434,16 @@ export function fallbackLanguageModel<T>(model: T, primaryId: string, deps: Fall
     let reason: FallbackReason = "quota";
     const list = await deps.candidates(primaryId).catch(() => [] as string[]);
     const deadlineMs = deps.firstOutputMs ?? FIRST_OUTPUT_MS;
-    if (!coolingDown(primaryId, now())) {
+    if (!coolingDown(primaryId, now(), connectionScope)) {
       try {
         // 有备用模型可换时才给主模型设「第一段输出」期限（§101.10）；没得换就照旧等它。
-        if (deadlineMs > 0 && list.some((id) => id !== primaryId)) return await withFirstOutputDeadline(primaryCall, options, property, deadlineMs);
-        return await primaryCall(options);
+        return await withStreamPreflight(primaryCall, options, property,
+          list.some((id) => id !== primaryId) ? deadlineMs : 0, primaryId);
       } catch (error) {
+        if ((options as { abortSignal?: AbortSignal } | null)?.abortSignal?.aborted) throw error;
         if (error instanceof FirstOutputTimeout) {
           const ms = 60_000;
-          cooldown.set(primaryId, now() + ms);
-          cooledReason.set(primaryId, "unavailable");
+          remember(primaryId, ms, "unavailable", error);
           firstError = error;
           reason = "unavailable";
           log({ type: "model-fallback", event: "primary-timeout", model: primaryId, cooldownSeconds: Math.round(ms / 1000), error: error.message });
@@ -359,26 +452,27 @@ export function fallbackLanguageModel<T>(model: T, primaryId: string, deps: Fall
         if (!why) throw error;
         if (!firstError) {
           const ms = cooldownFor(error, why);
-          cooldown.set(primaryId, now() + ms);
+          remember(primaryId, ms, why, error);
           firstError = error;
           reason = why;
           log({ type: "model-fallback", event: why === "quota" ? "primary-quota" : "primary-unavailable", model: primaryId, cooldownSeconds: Math.round(ms / 1000), error: errorSnippet(error) });
         }
       }
     } else {
-      reason = cooledReason.get(primaryId) ?? "quota";
+      const prior = cooldown.get(cooldownKey(connectionScope, primaryId));
+      reason = prior?.reason ?? "quota";
+      const seconds = Math.max(1, Math.ceil(((prior?.until ?? now()) - now()) / 1000));
+      firstError = Object.assign(new Error(
+        `${reason === "quota" ? "上游额度不足或限流" : "上游暂时不可用"}，当前模型冷却中，请约 ${seconds} 秒后重试`,
+      ), { statusCode: prior?.statusCode });
     }
-    if (firstError) cooledReason.set(primaryId, reason);
-    for (const id of list) {
-      if (id === primaryId || coolingDown(id, now())) continue;
+    for (const id of new Set(list)) {
+      if (id === primaryId || coolingDown(id, now(), connectionScope)) continue;
       const other = deps.build(id) as Model | null;
       const call = other && typeof other[property] === "function" ? (other[property] as Call).bind(other) : null;
       if (!call) continue;
       try {
-        const result =
-          deadlineMs > 0
-            ? await withFirstOutputDeadline(call, options, property, deadlineMs)
-            : await call(options);
+        const result = await withStreamPreflight(call, options, property, deadlineMs, id);
         log({ type: "model-fallback", event: "used", model: primaryId, fallback: id });
         announce({ from: primaryId, to: id, reason });
         return result;
@@ -387,13 +481,11 @@ export function fallbackLanguageModel<T>(model: T, primaryId: string, deps: Fall
         if (parentSignal?.aborted) throw error;
         // 备用模型的任何错误都不该挡住下一个候选（以前 404「model not found」直接抛出，后面的候选和主模型都没机会，§101）。
         const why = error instanceof FirstOutputTimeout ? "unavailable" : fallbackReason(error);
-        cooldown.set(id, now() + (why ? cooldownFor(error, why) : BROKEN_CANDIDATE_MS));
-        cooledReason.set(id, why ?? "unavailable");
+        remember(id, why ? cooldownFor(error, why) : BROKEN_CANDIDATE_MS, why ?? "unavailable", error);
         log({ type: "model-fallback", event: "candidate-failed", model: primaryId, fallback: id, reason: why ?? "broken", error: errorSnippet(error) });
       }
     }
-    // 这一次主模型是因为冷却被跳过的（没真的试）：候选都不行就再试一次主模型，它可能已经恢复了。
-    if (!firstError) return primaryCall(options);
+    // 没有可用候选也遵守冷却；否则连续点击或 SDK 重试又会在同一故障上等一分钟。
     throw firstError;
   };
   return new Proxy(model as unknown as object, {

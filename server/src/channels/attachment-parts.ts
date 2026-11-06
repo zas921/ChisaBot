@@ -327,7 +327,13 @@ function unreadableNote(
  * how much of a thread a turn replays, and nothing in a browser can observe
  * it.
  */
-export const MAX_INLINED_BYTES_PER_RUN = 32 * 1024 * 1024;
+/** 单轮附件内联上限。32MB 曾让 vision 上下文爆炸；可用 CHISABOT_MAX_INLINED_BYTES 覆盖。 */
+export const MAX_INLINED_BYTES_PER_RUN = (() => {
+  const raw = process.env.CHISABOT_MAX_INLINED_BYTES?.trim();
+  const n = raw ? Number(raw) : NaN;
+  if (Number.isFinite(n) && n > 0) return Math.trunc(n);
+  return 8 * 1024 * 1024;
+})();
 
 /**
  * What one run has left to spend, threaded through every message in it.

@@ -2083,6 +2083,8 @@ html[data-sky-ease] body::before {
 }
 /* CB-100c：首屏加载中的可见说明（没有按钮，左右留白一样）。 */
 .sky-skel-hint.is-loading { padding: 8px 16px; animation-delay: 0.25s; }
+html[data-auth-loop-open] .sky-skel-hint.is-loading,
+html[data-auth-loop-open] #chisabot-startup-loading { display: none; }
 .sky-skel-spinner {
   width: 14px;
   height: 14px;
@@ -6612,16 +6614,20 @@ body[data-install-hint="open"] [data-slot="sidebar-container"].glass-sidebar-con
 /* §42.6 历史对话（机器人 ⋯ → 历史对话）：小弹窗里一列对话，点一条切换。行高 52、圆角 12、14/12 字号、4 的倍数间距；
  * 悬停只换底色（不位移）。当前那条蓝色小标签。加载用三条骨架（反馈第 ② 级）。 */
 .bot-history-list { display: flex; flex-direction: column; gap: 4px; margin: 12px -8px 0; max-height: min(60vh, 420px); overflow-y: auto; overscroll-behavior: contain; padding: 0 4px; }
-.bot-history-row { display: flex; align-items: center; gap: 12px; width: 100%; min-height: 52px; padding: 8px 12px; border-radius: 12px; text-align: left; color: var(--glass-ink-2); background: transparent; transition: background-color var(--dur-0, 120ms) linear; }
-.bot-history-row:hover, .bot-history-row:focus-visible { background: rgba(22, 24, 29, 0.05); color: var(--glass-ink); outline: none; }
-.bot-history-row:focus-visible { box-shadow: 0 0 0 2px var(--focus); }
-.dark .bot-history-row:hover, .dark .bot-history-row:focus-visible { background: rgba(255, 255, 255, 0.07); }
+.bot-history-row { display: flex; align-items: stretch; gap: 4px; width: 100%; min-height: 52px; padding: 4px 4px 4px 8px; border-radius: 12px; color: var(--glass-ink-2); background: transparent; transition: background-color var(--dur-0, 120ms) linear; }
+.bot-history-row:hover { background: rgba(22, 24, 29, 0.05); color: var(--glass-ink); }
+.dark .bot-history-row:hover { background: rgba(255, 255, 255, 0.07); }
 .bot-history-row.is-current { background: var(--accent-blue-soft); color: var(--glass-ink); }
+.bot-history-open { display: flex; align-items: center; gap: 12px; min-width: 0; flex: 1; padding: 4px 8px; border: 0; border-radius: 10px; text-align: left; color: inherit; background: transparent; cursor: pointer; }
+.bot-history-open:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--focus); }
 .bot-history-icon { width: 18px; height: 18px; flex-shrink: 0; opacity: 0.7; }
 .bot-history-main { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 2px; }
 .bot-history-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; line-height: 20px; }
 .bot-history-sub { font-size: 12px; line-height: 16px; color: var(--glass-ink-4); }
 .bot-history-badge { flex-shrink: 0; padding: 2px 8px; border-radius: 999px; font-size: 12px; line-height: 16px; color: var(--accent-blue-ink); background: var(--accent-blue-soft); }
+.bot-history-delete { display: inline-flex; align-items: center; justify-content: center; width: 36px; flex-shrink: 0; border: 0; border-radius: 10px; color: var(--glass-ink-4); background: transparent; cursor: pointer; }
+.bot-history-delete:hover, .bot-history-delete:focus-visible { color: var(--destructive, #b42318); background: rgba(180, 35, 24, 0.08); outline: none; }
+.bot-history-delete:disabled { opacity: 0.4; cursor: default; }
 .bot-history-skel { height: 52px; border-radius: 12px; background: rgba(22, 24, 29, 0.05); animation: bot-history-pulse 1.2s ease-in-out infinite alternate; }
 @keyframes bot-history-pulse { from { opacity: 1; } to { opacity: 0.45; } }
 .dark .bot-history-skel { background: rgba(255, 255, 255, 0.06); }
@@ -9179,56 +9185,188 @@ html[data-theme="dark"] #sky-root::after {
   );
 }
 
-/* 1. 精选 6 款主题配色令牌覆盖（支持浅色与深色高对比度） */
+/* 1. 精选 8 款主题配色。accent-blue 继续驱动现有控件；其余令牌留给已经改读它们的表面。 */
 html[data-palette="aurora"] {
   --accent-blue: #7c3aed;
   --accent-blue-ink: #6d28d9;
   --accent-blue-soft: rgba(124, 58, 237, 0.14);
+  --accent-color: #7c3aed;
+  --accent-soft: rgba(124, 58, 237, 0.14);
+  --ink-primary: #6d28d9;
+  --ink-primary-hover: #5b21b6;
+  --on-primary: #ffffff;
+  --focus: rgba(124, 58, 237, 0.24);
+  --focus-line: rgba(124, 58, 237, 0.6);
+  --glass-tint: rgba(124, 58, 237, 0.08);
 }
 html.dark[data-palette="aurora"] {
   --accent-blue: #b197fc;
-  --accent-blue-ink: #d0bfff;
+  --accent-blue-ink: #c4b5fd;
   --accent-blue-soft: rgba(177, 151, 252, 0.2);
+  --accent-color: #b197fc;
+  --accent-soft: rgba(177, 151, 252, 0.2);
+  --ink-primary: #c4b5fd;
+  --ink-primary-hover: #ddd6fe;
+  --on-primary: #0b1020;
+  --focus: rgba(177, 151, 252, 0.28);
+  --focus-line: rgba(177, 151, 252, 0.7);
+  --glass-tint: rgba(177, 151, 252, 0.1);
 }
 html[data-palette="emerald"] {
-  --accent-blue: #059669;
-  --accent-blue-ink: #047857;
-  --accent-blue-soft: rgba(5, 150, 105, 0.14);
+  --accent-blue: #047857;
+  --accent-blue-ink: #065f46;
+  --accent-blue-soft: rgba(4, 120, 87, 0.14);
+  --accent-color: #047857;
+  --accent-soft: rgba(4, 120, 87, 0.14);
+  --ink-primary: #065f46;
+  --ink-primary-hover: #064e3b;
+  --on-primary: #ffffff;
+  --focus: rgba(4, 120, 87, 0.24);
+  --focus-line: rgba(4, 120, 87, 0.6);
+  --glass-tint: rgba(4, 120, 87, 0.08);
 }
 html.dark[data-palette="emerald"] {
   --accent-blue: #38d9a9;
   --accent-blue-ink: #63e6be;
   --accent-blue-soft: rgba(56, 217, 169, 0.2);
+  --accent-color: #38d9a9;
+  --accent-soft: rgba(56, 217, 169, 0.2);
+  --ink-primary: #63e6be;
+  --ink-primary-hover: #96f2d7;
+  --on-primary: #0b1020;
+  --focus: rgba(56, 217, 169, 0.28);
+  --focus-line: rgba(56, 217, 169, 0.7);
+  --glass-tint: rgba(56, 217, 169, 0.1);
 }
 html[data-palette="sakura"] {
-  --accent-blue: #db2777;
-  --accent-blue-ink: #be185d;
-  --accent-blue-soft: rgba(219, 39, 119, 0.14);
+  --accent-blue: #be185d;
+  --accent-blue-ink: #9d174d;
+  --accent-blue-soft: rgba(190, 24, 93, 0.14);
+  --accent-color: #be185d;
+  --accent-soft: rgba(190, 24, 93, 0.14);
+  --ink-primary: #9d174d;
+  --ink-primary-hover: #831843;
+  --on-primary: #ffffff;
+  --focus: rgba(190, 24, 93, 0.24);
+  --focus-line: rgba(190, 24, 93, 0.6);
+  --glass-tint: rgba(190, 24, 93, 0.08);
 }
 html.dark[data-palette="sakura"] {
   --accent-blue: #f783ac;
   --accent-blue-ink: #faa2c1;
   --accent-blue-soft: rgba(247, 131, 172, 0.2);
+  --accent-color: #f783ac;
+  --accent-soft: rgba(247, 131, 172, 0.2);
+  --ink-primary: #faa2c1;
+  --ink-primary-hover: #fcc2d7;
+  --on-primary: #0b1020;
+  --focus: rgba(247, 131, 172, 0.28);
+  --focus-line: rgba(247, 131, 172, 0.7);
+  --glass-tint: rgba(247, 131, 172, 0.1);
 }
 html[data-palette="ocean"] {
-  --accent-blue: #0284c7;
-  --accent-blue-ink: #0369a1;
-  --accent-blue-soft: rgba(2, 132, 199, 0.14);
+  --accent-blue: #0369a1;
+  --accent-blue-ink: #075985;
+  --accent-blue-soft: rgba(3, 105, 161, 0.14);
+  --accent-color: #0369a1;
+  --accent-soft: rgba(3, 105, 161, 0.14);
+  --ink-primary: #075985;
+  --ink-primary-hover: #0c4a6e;
+  --on-primary: #ffffff;
+  --focus: rgba(3, 105, 161, 0.24);
+  --focus-line: rgba(3, 105, 161, 0.6);
+  --glass-tint: rgba(3, 105, 161, 0.08);
 }
 html.dark[data-palette="ocean"] {
   --accent-blue: #4dabf7;
   --accent-blue-ink: #74c0fc;
   --accent-blue-soft: rgba(77, 171, 247, 0.2);
+  --accent-color: #4dabf7;
+  --accent-soft: rgba(77, 171, 247, 0.2);
+  --ink-primary: #74c0fc;
+  --ink-primary-hover: #a5d8ff;
+  --on-primary: #0b1020;
+  --focus: rgba(77, 171, 247, 0.28);
+  --focus-line: rgba(77, 171, 247, 0.7);
+  --glass-tint: rgba(77, 171, 247, 0.1);
 }
 html[data-palette="sunset"] {
-  --accent-blue: #d97706;
-  --accent-blue-ink: #b45309;
-  --accent-blue-soft: rgba(217, 119, 6, 0.14);
+  --accent-blue: #b45309;
+  --accent-blue-ink: #92400e;
+  --accent-blue-soft: rgba(180, 83, 9, 0.14);
+  --accent-color: #b45309;
+  --accent-soft: rgba(180, 83, 9, 0.14);
+  --ink-primary: #92400e;
+  --ink-primary-hover: #78350f;
+  --on-primary: #ffffff;
+  --focus: rgba(180, 83, 9, 0.24);
+  --focus-line: rgba(180, 83, 9, 0.6);
+  --glass-tint: rgba(180, 83, 9, 0.08);
 }
 html.dark[data-palette="sunset"] {
   --accent-blue: #ffc048;
   --accent-blue-ink: #ffd37a;
   --accent-blue-soft: rgba(255, 192, 72, 0.2);
+  --accent-color: #ffc048;
+  --accent-soft: rgba(255, 192, 72, 0.2);
+  --ink-primary: #ffd37a;
+  --ink-primary-hover: #ffe3a3;
+  --on-primary: #0b1020;
+  --focus: rgba(255, 192, 72, 0.28);
+  --focus-line: rgba(255, 192, 72, 0.7);
+  --glass-tint: rgba(255, 192, 72, 0.1);
+}
+html[data-palette="gold"] {
+  --accent-blue: #a16207;
+  --accent-blue-ink: #854d0e;
+  --accent-blue-soft: rgba(161, 98, 7, 0.14);
+  --accent-color: #a16207;
+  --accent-soft: rgba(161, 98, 7, 0.14);
+  --ink-primary: #854d0e;
+  --ink-primary-hover: #713f12;
+  --on-primary: #ffffff;
+  --focus: rgba(161, 98, 7, 0.24);
+  --focus-line: rgba(161, 98, 7, 0.6);
+  --glass-tint: rgba(161, 98, 7, 0.08);
+}
+html.dark[data-palette="gold"] {
+  --accent-blue: #facc15;
+  --accent-blue-ink: #fde047;
+  --accent-blue-soft: rgba(250, 204, 21, 0.2);
+  --accent-color: #facc15;
+  --accent-soft: rgba(250, 204, 21, 0.2);
+  --ink-primary: #fde047;
+  --ink-primary-hover: #fef08a;
+  --on-primary: #0b1020;
+  --focus: rgba(250, 204, 21, 0.28);
+  --focus-line: rgba(250, 204, 21, 0.7);
+  --glass-tint: rgba(250, 204, 21, 0.1);
+}
+html[data-palette="ruby"] {
+  --accent-blue: #dc2626;
+  --accent-blue-ink: #b91c1c;
+  --accent-blue-soft: rgba(220, 38, 38, 0.14);
+  --accent-color: #dc2626;
+  --accent-soft: rgba(220, 38, 38, 0.14);
+  --ink-primary: #b91c1c;
+  --ink-primary-hover: #991b1b;
+  --on-primary: #ffffff;
+  --focus: rgba(220, 38, 38, 0.24);
+  --focus-line: rgba(220, 38, 38, 0.6);
+  --glass-tint: rgba(220, 38, 38, 0.08);
+}
+html.dark[data-palette="ruby"] {
+  --accent-blue: #f87171;
+  --accent-blue-ink: #fca5a5;
+  --accent-blue-soft: rgba(248, 113, 113, 0.2);
+  --accent-color: #f87171;
+  --accent-soft: rgba(248, 113, 113, 0.2);
+  --ink-primary: #fca5a5;
+  --ink-primary-hover: #fecaca;
+  --on-primary: #0b1020;
+  --focus: rgba(248, 113, 113, 0.28);
+  --focus-line: rgba(248, 113, 113, 0.7);
+  --glass-tint: rgba(248, 113, 113, 0.1);
 }
 
 /* 2. 环境流光层、自定义壁纸层与容器层级（彻底消除祖先 animation 导致的 Chromium Backdrop Root 采样阻断） */
@@ -9279,6 +9417,9 @@ html.dark .chisabot-ambient-orbs {
   background-size: cover;
   transition: filter 0.25s ease, transform 0.25s ease;
 }
+.chisabot-wallpaper-img[data-blur] {
+  filter: blur(var(--wallpaper-blur, 0px));
+}
 .chisabot-wallpaper-dim {
   position: absolute;
   inset: 0;
@@ -9289,12 +9430,12 @@ html:not(.dark) .chisabot-wallpaper-dim {
   background: radial-gradient(circle at 50% 45%, rgba(244, 248, 255, 0.46) 0%, rgba(228, 238, 252, 0.58) 100%);
 }
 
+/* Resolve alpha-dependent gradients on each glass surface, where the slider writes --lg-alpha. */
 /* 3. 三档无边框高通透光学玻璃材质（liquid 液态玻璃 / crystal 晶莹全透 / frosted 柔光磨砂）
  * 注意：严禁在此手写 -webkit-backdrop-filter，只写标准 backdrop-filter，否则压缩器会丢弃标准属性导致模糊失效。 */
 /* 3.1 液态玻璃（liquid）：温润通透的凝脂光学玻璃，兼顾流云透光感与极佳的正文对比度 */
-:root,
-html[data-glass="liquid"] {
-  --lg-alpha: 0.16;
+:root :where(.glass-side-card, .acct-card, .acct-mini-card, .glass-mini-card, .rail-card, .glass-seg, .glass-search, .glass-pill, .glass-newchat, .glass-icon-btn, .glass-mini-new, .glass-composer, [data-slot="bubble-content"], .jr-card, .page-rows, .sg-card, .page-section > form, .page .border),
+html[data-glass="liquid"] :where(.glass-side-card, .acct-card, .acct-mini-card, .glass-mini-card, .rail-card, .glass-seg, .glass-search, .glass-pill, .glass-newchat, .glass-icon-btn, .glass-mini-new, .glass-composer, [data-slot="bubble-content"], .jr-card, .page-rows, .sg-card, .page-section > form, .page .border) {
   --lg-blur: blur(20px) saturate(180%);
   --lg-surface: linear-gradient(
     135deg,
@@ -9313,8 +9454,8 @@ html[data-glass="liquid"] {
   --lg-shadow: var(--card-shadow);
 }
 
-html.dark,
-html.dark[data-glass="liquid"] {
+html.dark :where(.glass-side-card, .acct-card, .acct-mini-card, .glass-mini-card, .rail-card, .glass-seg, .glass-search, .glass-pill, .glass-newchat, .glass-icon-btn, .glass-mini-new, .glass-composer, [data-slot="bubble-content"], .jr-card, .page-rows, .sg-card, .page-section > form, .page .border),
+html.dark[data-glass="liquid"] :where(.glass-side-card, .acct-card, .acct-mini-card, .glass-mini-card, .rail-card, .glass-seg, .glass-search, .glass-pill, .glass-newchat, .glass-icon-btn, .glass-mini-new, .glass-composer, [data-slot="bubble-content"], .jr-card, .page-rows, .sg-card, .page-section > form, .page .border) {
   --lg-blur: blur(20px) saturate(180%);
   --lg-surface: linear-gradient(
     135deg,
@@ -9334,7 +9475,7 @@ html.dark[data-glass="liquid"] {
 }
 
 /* 3.2 晶莹全透（crystal）：轻薄透明晶片，最大化透出底层 WebGL 天空与流云，同时保证文字清晰可读 */
-html[data-glass="crystal"] {
+html[data-glass="crystal"] :where(.glass-side-card, .acct-card, .acct-mini-card, .glass-mini-card, .rail-card, .glass-seg, .glass-search, .glass-pill, .glass-newchat, .glass-icon-btn, .glass-mini-new, .glass-composer, [data-slot="bubble-content"], .jr-card, .page-rows, .sg-card, .page-section > form, .page .border) {
   --lg-blur: blur(12px) saturate(170%);
   --lg-surface: linear-gradient(
     135deg,
@@ -9350,7 +9491,7 @@ html[data-glass="crystal"] {
   --lg-rim: 0 0 0 transparent;
   --lg-shadow: 0 8px 28px rgba(15, 23, 42, 0.07);
 }
-html.dark[data-glass="crystal"] {
+html.dark[data-glass="crystal"] :where(.glass-side-card, .acct-card, .acct-mini-card, .glass-mini-card, .rail-card, .glass-seg, .glass-search, .glass-pill, .glass-newchat, .glass-icon-btn, .glass-mini-new, .glass-composer, [data-slot="bubble-content"], .jr-card, .page-rows, .sg-card, .page-section > form, .page .border) {
   --lg-blur: blur(12px) saturate(170%);
   --lg-surface: linear-gradient(
     135deg,
@@ -9367,8 +9508,46 @@ html.dark[data-glass="crystal"] {
   --lg-shadow: 0 10px 32px rgba(0, 0, 0, 0.34);
 }
 
+@property --lg-alpha { syntax: "<number>"; inherits: false; initial-value: 0.16; }
+
+/* 薄雾玻璃：液态玻璃重写前的默认材质，没有边缘透镜。 */
+html[data-glass="mist"] :where(.glass-side-card, .acct-card, .acct-mini-card, .glass-mini-card, .rail-card, .glass-seg, .glass-search, .glass-pill, .glass-newchat, .glass-icon-btn, .glass-mini-new, .glass-composer, [data-slot="bubble-content"], .jr-card, .page-rows, .sg-card, .page-section > form, .page .border) {
+  --lg-blur: blur(20px) saturate(180%);
+  --lg-surface: linear-gradient(
+    135deg,
+    rgba(255, 255, 255, clamp(0.38, calc(var(--lg-alpha, 0.16) * 2.65), 0.7)) 0%,
+    rgba(255, 255, 255, clamp(0.28, calc(var(--lg-alpha, 0.16) * 2.05), 0.58)) 52%,
+    rgba(255, 255, 255, clamp(0.34, calc(var(--lg-alpha, 0.16) * 2.35), 0.64)) 100%
+  );
+  --lg-surface-strong: linear-gradient(
+    135deg,
+    rgba(255, 255, 255, clamp(0.46, calc(var(--lg-alpha, 0.16) * 3.1), 0.78)) 0%,
+    rgba(255, 255, 255, clamp(0.36, calc(var(--lg-alpha, 0.16) * 2.5), 0.68)) 54%,
+    rgba(255, 255, 255, clamp(0.42, calc(var(--lg-alpha, 0.16) * 2.85), 0.74)) 100%
+  );
+  --lg-border: transparent;
+  --lg-shadow: var(--card-shadow);
+}
+html.dark[data-glass="mist"] :where(.glass-side-card, .acct-card, .acct-mini-card, .glass-mini-card, .rail-card, .glass-seg, .glass-search, .glass-pill, .glass-newchat, .glass-icon-btn, .glass-mini-new, .glass-composer, [data-slot="bubble-content"], .jr-card, .page-rows, .sg-card, .page-section > form, .page .border) {
+  --lg-blur: blur(20px) saturate(180%);
+  --lg-surface: linear-gradient(
+    135deg,
+    rgba(14, 21, 36, clamp(0.38, calc(var(--lg-alpha, 0.16) * 2.6), 0.7)) 0%,
+    rgba(9, 14, 26, clamp(0.28, calc(var(--lg-alpha, 0.16) * 2.0), 0.58)) 54%,
+    rgba(12, 18, 32, clamp(0.34, calc(var(--lg-alpha, 0.16) * 2.35), 0.64)) 100%
+  );
+  --lg-surface-strong: linear-gradient(
+    135deg,
+    rgba(16, 24, 42, clamp(0.46, calc(var(--lg-alpha, 0.16) * 3.0), 0.78)) 0%,
+    rgba(11, 17, 30, clamp(0.36, calc(var(--lg-alpha, 0.16) * 2.45), 0.68)) 54%,
+    rgba(14, 21, 38, clamp(0.42, calc(var(--lg-alpha, 0.16) * 2.75), 0.74)) 100%
+  );
+  --lg-border: transparent;
+  --lg-shadow: var(--card-shadow);
+}
+
 /* 3.3 柔光磨砂（frosted）：细腻丝滑半透明亚克力磨砂（28px 柔焦 + 高可读性雾面） */
-html[data-glass="frosted"] {
+html[data-glass="frosted"] :where(.glass-side-card, .acct-card, .acct-mini-card, .glass-mini-card, .rail-card, .glass-seg, .glass-search, .glass-pill, .glass-newchat, .glass-icon-btn, .glass-mini-new, .glass-composer, [data-slot="bubble-content"], .jr-card, .page-rows, .sg-card, .page-section > form, .page .border) {
   --lg-blur: blur(28px) saturate(185%);
   --lg-surface: linear-gradient(
     180deg,
@@ -9384,7 +9563,7 @@ html[data-glass="frosted"] {
   --lg-rim: 0 0 0 transparent;
   --lg-shadow: var(--card-shadow);
 }
-html.dark[data-glass="frosted"] {
+html.dark[data-glass="frosted"] :where(.glass-side-card, .acct-card, .acct-mini-card, .glass-mini-card, .rail-card, .glass-seg, .glass-search, .glass-pill, .glass-newchat, .glass-icon-btn, .glass-mini-new, .glass-composer, [data-slot="bubble-content"], .jr-card, .page-rows, .sg-card, .page-section > form, .page .border) {
   --lg-blur: blur(28px) saturate(185%);
   --lg-surface: linear-gradient(
     180deg,
@@ -11287,4 +11466,9 @@ a.cc-pill { text-decoration: none; }
 .cc-tree.is-page .cc-ws-actions { top: 4px; }
 .cc-tree .cc-ws-actions .cc-ws-more, .cc-tree .cc-ws-add { width: 44px; height: 44px; border-radius: 10px; }
 .cc-tree .cc-ws:has(> .cc-ws-actions) > .cc-ws-head { padding-right: 94px; }
+}
+
+/* Non-default palettes use their theme gradient while the WebGL engine is off. */
+html[data-palette]:not([data-palette="default"]) #sky-root #skyph {
+  background: linear-gradient(to bottom, var(--palette-sky-0) 0%, var(--palette-sky-1) 36%, var(--palette-sky-2) 72%, var(--palette-sky-3) 100%);
 }

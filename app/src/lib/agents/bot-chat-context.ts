@@ -21,6 +21,9 @@ export type BotChatContext = {
   /** 「历史对话」（DESIGN.md §42.6）：只有正在打开的机器人对话页登记了才有。 */
   canHistory?: boolean;
   openHistory?: () => void;
+  /** 删除当前这条对话（含消息与事件）；空话题没有可删内容。 */
+  canDeleteThread?: boolean;
+  deleteThread?: () => void;
   toggleSettings: () => void;
   toggleComputer: () => void;
   newTopic: () => void;

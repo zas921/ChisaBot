@@ -27,6 +27,7 @@ import {
   CoworkerUnavailableError,
 } from "./agents/agent-resolver";
 import { sanitizeSeededHistory } from "./agents/history-sanitize";
+import { compactHistoryForModel } from "./agents/model-context";
 import {
   PLAN_RUN_COMPLETED,
   PlanModel,
@@ -37,7 +38,7 @@ import type { AgentActor } from "./agents/profile-types";
 import { modelOverrideFromValue } from "./agents/model-selection";
 import { thinkTagLanguageModel } from "./agents/think-tags";
 import { currentConfirmTurn, currentToolAbort, TOOL_STOPPED_ZH, withConfirmToolCall } from "./confirmations/context";
-import { fallbackCandidates, fallbackLanguageModel } from "./agents/model-fallback";
+import { fallbackCandidates, fallbackLanguageModel, modelCooldownScope } from "./agents/model-fallback";
 import {
   executeNativeApprovalTool,
   nativeApprovalRun,
@@ -269,6 +270,7 @@ export function setModelFallbackList(list: () => Promise<string[]>): void {
 /** 聊天回合用的模型：额度用完（429 等）时自动换同平台的其它模型重发（DESIGN.md §60）。 */
 export function fallbackConnectionModel(model: RuntimeModel, apiKey: string | null) {
   return fallbackLanguageModel(connectionLanguageModel(model, apiKey), model.defaultModel, {
+    cooldownScope: modelCooldownScope(model, apiKey),
     candidates: fallbackCandidates(() => fallbackCatalog(), process.env, () => fallbackConfigured()),
     build: (id) => connectionLanguageModel({ ...model, defaultModel: id }, apiKey),
   });
@@ -1589,14 +1591,16 @@ function remoteAgentWithStandingRole(
     const answeredByResume = new Set(
       (input.resume ?? []).map((entry) => entry.interruptId),
     );
-    const history = sanitizeSeededHistory(
-      input.messages.filter(
-        (message) =>
-          message.id !== agent.standingMessage.id &&
-          message.id !== holdingsMessage?.id,
+    const history = compactHistoryForModel(
+      sanitizeSeededHistory(
+        input.messages.filter(
+          (message) =>
+            message.id !== agent.standingMessage.id &&
+            message.id !== holdingsMessage?.id,
+        ),
+        answeredByResume,
       ),
-      answeredByResume,
-    );
+    ).messages;
     /*
      * And the attached files, inlined here for the same reason that guard is here: this middleware
      * is the last thing between the browser's `input.messages` and the endpoint, and `run` skips
@@ -1624,7 +1628,7 @@ function remoteAgentWithStandingRole(
           messages: [
             agent.standingMessage,
             ...(holdingsMessage ? [holdingsMessage] : []),
-            ...messages,
+            ...compactHistoryForModel(messages).messages,
           ],
           /*
            * The Bot's own grants, added to whatever the surface offered.
@@ -1880,7 +1884,11 @@ class BuiltInAgentWithSaneHistory extends BuiltInAgent {
     const answeredByResume = new Set(
       (input.resume ?? []).map((entry) => entry.interruptId),
     );
-    const history = sanitizeSeededHistory(input.messages, answeredByResume);
+    // compactHistoryForModel runs again inside continueToolRuns per segment; this first
+    // pass keeps a resume / no-load path from shipping an already-huge seed.
+    const history = compactHistoryForModel(
+      sanitizeSeededHistory(input.messages, answeredByResume),
+    ).messages;
     const load = this.loadAttachment;
     /*
      * ALONGSIDE THE GUARD ABOVE, NOT INSTEAD OF IT. One drops a conversation the model provider is
@@ -1913,8 +1921,13 @@ class BuiltInAgentWithSaneHistory extends BuiltInAgent {
           ),
         ).pipe(
           switchMap((messages) =>
-            continueToolRuns({ ...input, messages }, (segment) =>
-              nativeApprovalRun(segment, () => observeModelConnection(super.run(segment)))),
+            continueToolRuns(
+              { ...input, messages: compactHistoryForModel(messages).messages },
+              (segment) =>
+                nativeApprovalRun(segment, () =>
+                  observeModelConnection(super.run(segment)),
+                ),
+            ),
           ),
         ),
       ),

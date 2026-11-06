@@ -271,16 +271,19 @@ export function createGoalTasks(options: {
       active_calls jsonb NOT NULL DEFAULT '[]', lease_token text, lease_until timestamptz,
       next_check_at timestamptz NOT NULL DEFAULT now(), created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now()
     )`);
+    // 活任务 = 未完成且未放弃。cancelled 与 completed 同等释放「每对话一条」槽位。
+    await sql.unsafe("/* goal-02a */ DROP INDEX IF EXISTS chisabot_goal_one_live_thread");
     await sql.unsafe(
-      "/* goal-02 */ CREATE UNIQUE INDEX IF NOT EXISTS chisabot_goal_one_live_thread ON chisabot_goal_tasks(thread_id) WHERE status <> 'completed'",
+      "/* goal-02 */ CREATE UNIQUE INDEX IF NOT EXISTS chisabot_goal_one_live_thread ON chisabot_goal_tasks(thread_id) WHERE status <> ALL (ARRAY['completed','cancelled'])",
     );
+    await sql.unsafe("/* goal-03a */ DROP INDEX IF EXISTS chisabot_goal_due");
     await sql.unsafe(
-      "/* goal-03 */ CREATE INDEX IF NOT EXISTS chisabot_goal_due ON chisabot_goal_tasks(next_check_at) WHERE status <> 'completed'",
+      "/* goal-03 */ CREATE INDEX IF NOT EXISTS chisabot_goal_due ON chisabot_goal_tasks(next_check_at) WHERE status <> ALL (ARRAY['completed','cancelled'])",
     );
   }
   async function owned(scope: GoalScope): Promise<Row | null> {
     const [row] = await rows(
-      "/* goal-04 */ SELECT * FROM chisabot_goal_tasks WHERE owner_user_id=$1 AND agent_id=$2 AND thread_id=$3 AND status <> 'completed' ORDER BY created_at DESC LIMIT 1",
+      "/* goal-04 */ SELECT * FROM chisabot_goal_tasks WHERE owner_user_id=$1 AND agent_id=$2 AND thread_id=$3 AND status <> ALL (ARRAY['completed','cancelled']) ORDER BY created_at DESC LIMIT 1",
       [scope.ownerUserId, scope.agentId, scope.threadId],
     );
     return row ?? null;
@@ -310,7 +313,7 @@ export function createGoalTasks(options: {
       agentId: input.agentId,
       threadId: input.threadId,
     });
-    if (existing) throw new Error("此对话已有持续任务，请读取或恢复该任务。");
+    if (existing) throw new Error("此对话已有持续任务，请读取、恢复或放弃该任务后再登记新目标。");
     const [row] = await rows(
       `/* goal-07 */ INSERT INTO chisabot_goal_tasks(id,owner_user_id,agent_id,thread_id,objective,criteria,jobs,message_cursor)
       VALUES($1,$2,$3,$4,$5,$6::text::jsonb,$7::text::jsonb,$8) RETURNING *`,
@@ -333,17 +336,17 @@ export function createGoalTasks(options: {
   }
   async function pause(id: string, ownerUserId: string) {
     const [row] = await rows(
-      "/* goal-08 */ UPDATE chisabot_goal_tasks SET status='paused', detail='用户已暂停持续任务。', generation=generation+1, lease_token=NULL, lease_until=NULL, updated_at=now() WHERE id=$1 AND owner_user_id=$2 AND status <> 'completed' RETURNING *",
+      "/* goal-08 */ UPDATE chisabot_goal_tasks SET status='paused', detail='用户已暂停持续任务。', generation=generation+1, lease_token=NULL, lease_until=NULL, updated_at=now() WHERE id=$1 AND owner_user_id=$2 AND status <> ALL (ARRAY['completed','cancelled']) RETURNING *",
       [id, ownerUserId],
     );
-    if (!row) throw new Error("持续任务不存在或已完成。");
+    if (!row) throw new Error("持续任务不存在、已完成或已放弃。");
     await options.stopRun(row.thread_id);
     return view(row);
   }
   async function resume(id: string, ownerUserId: string) {
     const row = await byId(id, ownerUserId);
-    if (!row || row.status === "completed")
-      throw new Error("持续任务不存在或已完成。");
+    if (!row || row.status === "completed" || row.status === "cancelled")
+      throw new Error("持续任务不存在、已完成或已放弃。");
     await options.clearPause(row.thread_id);
     const [fresh] = await rows(
       "/* goal-09 */ UPDATE chisabot_goal_tasks SET status='active',waiting_since=NULL, detail='用户恢复了持续任务。',generation=generation+1,active_calls='[]',lease_token=NULL,lease_until=NULL,next_check_at=now(),updated_at=now() WHERE id=$1 AND owner_user_id=$2 RETURNING *",
@@ -351,6 +354,17 @@ export function createGoalTasks(options: {
     );
     if (!fresh) throw new Error("持续任务未恢复。");
     return view(fresh);
+  }
+  /** 用户放弃目标：释放本对话槽位，之后可重新 goal_start。与「验收通过 completed」区分。 */
+  async function cancel(id: string, ownerUserId: string) {
+    const [row] = await rows(
+      "/* goal-08c */ UPDATE chisabot_goal_tasks SET status='cancelled', detail='用户已放弃持续任务。', generation=generation+1, lease_token=NULL, lease_until=NULL, active_calls='[]'::jsonb, updated_at=now() WHERE id=$1 AND owner_user_id=$2 AND status <> ALL (ARRAY['completed','cancelled']) RETURNING *",
+      [id, ownerUserId],
+    );
+    if (!row) throw new Error("持续任务不存在、已完成或已放弃。");
+    await options.stopRun(row.thread_id);
+    await options.clearPause(row.thread_id);
+    return view(row);
   }
   async function observe(
     scope: GoalScope,
@@ -987,14 +1001,15 @@ export function createGoalTasks(options: {
         const id = c.req.param("id");
         if (!(await byId(id, c.var.actor.id)))
           return c.json({ error: "Task not found" }, 404);
-        if (action !== "pause" && action !== "resume")
+        if (action !== "pause" && action !== "resume" && action !== "cancel")
           return c.json({ error: "Unknown task action" }, 400);
-        return c.json({
-          task:
-            action === "pause"
-              ? await pause(id, c.var.actor.id)
-              : await resume(id, c.var.actor.id),
-        });
+        const task =
+          action === "pause"
+            ? await pause(id, c.var.actor.id)
+            : action === "resume"
+              ? await resume(id, c.var.actor.id)
+              : await cancel(id, c.var.actor.id);
+        return c.json({ task });
       } catch (e) {
         return c.json(
           { error: e instanceof Error ? e.message : String(e) },
@@ -1009,6 +1024,7 @@ export function createGoalTasks(options: {
     create,
     pause,
     resume,
+    cancel,
     tools,
     sweep,
     routes,

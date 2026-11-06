@@ -18,6 +18,7 @@ import { concatMap } from "rxjs/operators";
 import { capConnectMessages } from "../../shared/connect-snapshot";
 import { fallbackNotice } from "./agents/model-fallback";
 import { withConfirmTurn, withToolAbort } from "./confirmations/context";
+import { compactHistoryForModel } from "./agents/model-context";
 import {
   estimateTokens,
   readingFromRunFinished,
@@ -1601,7 +1602,9 @@ export async function createLocalConversations(
     sweepTimer.unref?.();
   }
   /*
-   * 输入框「上下文」读数（DESIGN.md §25）：最近一次带用量的 RUN_FINISHED；一条都没有就按消息文字粗估。
+   * 输入框「上下文」读数（DESIGN.md §25）：最近一次带用量的 RUN_FINISHED；一条都没有就按
+   * 「进模型前压缩后」的消息文字粗估。长对话若按全文估算会虚高到接近窗口上限（复刻镜曾到 97%），
+   * 但实际发给模型的是 compactHistoryForModel 之后的视图，读数必须跟那份一致。
    * 只读一行（按 thread_id + sequence 索引倒序），不扫整张事件表。
    */
   const contextReading = async (
@@ -1620,7 +1623,11 @@ export async function createLocalConversations(
     const measured = rows[0] ? readingFromRunFinished(rows[0]) : undefined;
     if (measured) return measured;
     if (!messages.length) return null;
-    return { tokens: estimateTokens(messages), source: "estimate" };
+    const compacted = compactHistoryForModel(messages as Message[]);
+    return {
+      tokens: compacted.estimatedTokens || estimateTokens(compacted.messages),
+      source: "estimate",
+    };
   };
 
   /**
@@ -1836,6 +1843,14 @@ export async function createLocalConversations(
         if (!found[0] || found[0].owner_user_id !== actorId)
           return Response.json(EMPTY_THREAD_READS[operation]);
       }
+      // 页面有一轮在进行时的心跳（见 RELAY_STALE_MS）：每 20 秒一次，只查归属，不读整段对话；其余只动内存里的时刻。
+      if (operation === "relay-alive" && request.method === "POST") {
+        const [owned] = await database.$client.unsafe<{ id: string }[]>(
+          "SELECT id FROM openbot_local_threads WHERE id = $1 AND owner_user_id = $2", [threadId, actorId],
+        );
+        if (!owned) throw new LocalConversationError("Thread not found", 404);
+        return Response.json({ alive: runner.touchRelay(threadId), live: runner.isLive(threadId) });
+      }
       // Inbox polling needs identity and queue rows, never the growing transcript JSON.
       if (operation === "inbox" && request.method === "GET") {
         const [identity] = await database.$client.unsafe<{ agent_id: string }[]>(
@@ -1891,10 +1906,6 @@ export async function createLocalConversations(
             workers: workers ? await workers.list(threadId, actorId) : [],
           });
         if (!operation) return Response.json({ thread: record(row) });
-      }
-      if (operation === "relay-alive" && request.method === "POST") {
-        // 页面有一轮在进行时的心跳（见 RELAY_STALE_MS）：只更新内存里的时刻，不碰数据库。
-        return Response.json({ alive: runner.touchRelay(threadId), live: runner.isLive(threadId) });
       }
       if (operation === "truncate" && request.method === "POST") {
         // 重新生成 / 编辑后重发（DESIGN.md §67，CB-042）：从这条用户消息起截掉，客户端随后照常发新的一轮。

@@ -191,6 +191,8 @@ export const BOT_DELETED = "机器人已删除";
 
 export function createLivePanelService(deps: {
   store: LivePanelStore;
+  /** Server-owned data sources can refresh without a model call. False uses the agent flow. */
+  refreshData?: (row: LivePanelRow, signal: AbortSignal) => Promise<boolean>;
   /** 在一个用完即删的对话里，以面板主人的身份跑这个机器人的一个无头回合（工作流同一条路）。 */
   runHeadless(input: { ownerUserId: string; botId: string; instruction: string; panelId: string; signal: AbortSignal }): Promise<void>;
   log?: (event: Record<string, unknown>) => void;
@@ -230,7 +232,8 @@ export function createLivePanelService(deps: {
     const self: { job?: Promise<void> } = {};
     const job = (async () => {
       try {
-        await deps.runHeadless({ ownerUserId, botId: row.botId, instruction: refreshPrompt(row, !row.spec), panelId: id, signal: controller.signal });
+        if (!(await deps.refreshData?.(row, controller.signal)))
+          await deps.runHeadless({ ownerUserId, botId: row.botId, instruction: refreshPrompt(row, !row.spec), panelId: id, signal: controller.signal });
         const after = await store.get(ownerUserId, id);
         const updated = after.refreshedAt && after.refreshedAt.getTime() >= startedAt;
         if (!updated && takeHumanControlBlock(id, startedAt)) {

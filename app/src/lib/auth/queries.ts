@@ -1,5 +1,14 @@
 import { queryOptions } from "@tanstack/react-query";
+import { type AuthenticatedUser, authKeys } from "@/lib/auth/keys";
+import {
+  clearLoginRedirectMark,
+  goToLogin,
+  isGatewayLoginRequired,
+} from "@/lib/auth/login-redirect";
 import { client, tryClient } from "@/lib/client";
+
+export type { AuthenticatedUser, OnboardingStatus } from "@/lib/auth/keys";
+export { authKeys };
 
 /**
  * Where this person is in first-run onboarding.
@@ -7,33 +16,11 @@ import { client, tryClient } from "@/lib/client";
  * On the user rather than its own query, so the `_authed` gate learns it from the request it
  * already makes. A null `completedAt` is what sends the app to /onboarding.
  */
-export type OnboardingStatus = {
-  step: number;
-  completedAt: string | null;
-};
-
-export type AuthenticatedUser = {
-  id: string;
-  email: string;
-  name?: string | null;
-  image?: string | null;
-  role: "admin" | "user";
-  /** 名称还没设置（空或仍是邮箱）：进入应用前先弹「首次设置」。 */
-  profileNeedsSetup?: boolean;
-  /** Null means this deployment does not track onboarding, which reads as nothing to finish. */
-  onboarding: OnboardingStatus | null;
-};
 
 /** Whether the gate holds: there is an onboarding to do and this person has not finished it. */
 export function needsOnboarding(user: AuthenticatedUser): boolean {
   return user.onboarding !== null && user.onboarding.completedAt === null;
 }
-
-export const authKeys = {
-  all: ["auth"] as const,
-  currentUser: () => [...authKeys.all, "current-user"] as const,
-  providers: () => [...authKeys.all, "providers"] as const,
-};
 
 /** An identity provider this deployment can sign somebody in with. */
 export type AuthProviderId = "google" | "microsoft" | "okta";
@@ -93,9 +80,16 @@ async function currentUser({ signal }: { signal: AbortSignal }): Promise<Authent
       (async () => {
         /* A 401 is the signed-out state, rather than a failed request. */
         const response = await tryClient("/api/me", { signal: request.signal });
-        if (response.status === 401) return null;
+        if (response.status === 401) {
+          // Behind the public gateway its own /login is the sign-in page: go there with the way
+          // back, rather than to the app's /sign (main.tsx installs the same check for every fetch).
+          if (typeof window !== "undefined" && (await isGatewayLoginRequired(response))) goToLogin();
+          return null;
+        }
         if (!response.ok) throw new Error(`无法加载当前用户 (${response.status})`);
         const body = (await response.json()) as { user: AuthenticatedUser };
+        // 登录确认有效：重置 /login 循环保护的 30 秒窗口（见 login-redirect.ts）。
+        if (typeof window !== "undefined") clearLoginRedirectMark();
         return body.user;
       })(),
       aborted,

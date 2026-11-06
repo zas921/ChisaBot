@@ -26,7 +26,16 @@ const labels: Record<string, string> = {
   waiting_approval: "等待审批或输入",
   paused: "已暂停",
   completed: "全部验收通过",
+  cancelled: "已放弃",
 };
+const liveStatuses = new Set([
+  "active",
+  "running",
+  "waiting_background",
+  "waiting_device",
+  "waiting_approval",
+  "paused",
+]);
 
 /** A fixed-size composer control: changing task phases never moves the transcript. */
 export function GoalTaskStatus({ threadId }: { threadId: string }) {
@@ -44,9 +53,9 @@ export function GoalTaskStatus({ threadId }: { threadId: string }) {
     refetchInterval: 3000,
     staleTime: 1000,
   });
-  const task = data?.[0];
+  const task = data?.find((row) => liveStatuses.has(row.status));
   const change = useMutation({
-    mutationFn: (action: "pause" | "resume") =>
+    mutationFn: (action: "pause" | "resume" | "cancel") =>
       client(`/api/goal-tasks/${task?.id}/${action}`, {
         method: "POST",
         fallback: "无法修改持续任务状态",
@@ -104,22 +113,39 @@ export function GoalTaskStatus({ threadId }: { threadId: string }) {
               {change.error.message}
             </p>
           ) : null}
-          {task.status !== "completed" ? (
-            <Button
-              data-testid="goal-task-toggle"
-              disabled={change.isPending}
-              onClick={() =>
-                change.mutate(
-                  task.status === "paused" || task.status === "waiting_approval"
-                    ? "resume"
-                    : "pause",
-                )
-              }
-            >
-              {task.status === "paused" || task.status === "waiting_approval"
-                ? "恢复持续任务"
-                : "停止持续任务"}
-            </Button>
+          {liveStatuses.has(task.status) ? (
+            <div className="flex flex-col gap-2 sm:flex-row">
+              <Button
+                data-testid="goal-task-toggle"
+                disabled={change.isPending}
+                onClick={() =>
+                  change.mutate(
+                    task.status === "paused" || task.status === "waiting_approval"
+                      ? "resume"
+                      : "pause",
+                  )
+                }
+              >
+                {task.status === "paused" || task.status === "waiting_approval"
+                  ? "恢复持续任务"
+                  : "停止持续任务"}
+              </Button>
+              <Button
+                data-testid="goal-task-cancel"
+                disabled={change.isPending}
+                onClick={() => {
+                  if (
+                    window.confirm(
+                      "放弃后将释放本对话的任务槽位，可以重新登记新目标。已完成的步骤不会撤销。确定放弃？",
+                    )
+                  )
+                    change.mutate("cancel");
+                }}
+                variant="outline"
+              >
+                {"放弃任务"}
+              </Button>
+            </div>
           ) : null}
         </DialogContent>
       </Dialog>

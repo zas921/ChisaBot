@@ -1147,9 +1147,18 @@ export function Composer({
   );
 
   const isBusy = pending || isSubmitting;
+  // Keep prompt-area's value-sync inputs stable while a response streams. Its
+  // effect otherwise restores a stale value over a keystroke from the same commit.
+  const agentsRef = useRef(agents);
+  agentsRef.current = agents;
+  const commandsRef = useRef(commands);
+  commandsRef.current = commands;
   const triggers = useMemo(
-    () => buildTriggers({ agents, commands }),
-    [agents, commands],
+    () => buildTriggers({
+      agents: () => agentsRef.current,
+      commands: () => commandsRef.current,
+    }),
+    [],
   );
   const draft = useMemo(() => toDraft(value, staged), [staged, value]);
   useEffect(
@@ -1190,7 +1199,7 @@ export function Composer({
       }
       const { segments, actions } = applyCommandChips(
         enforceSingleAgent(next),
-        commands,
+        commandsRef.current,
       );
       setValue(segments);
       // Run after the commit so an action that navigates or opens a panel is not fighting the
@@ -1199,7 +1208,7 @@ export function Composer({
         action();
       }
     },
-    [commands],
+    [],
   );
 
   /**
@@ -1214,13 +1223,13 @@ export function Composer({
     if (!next) return;
     const { segments, actions } = applyCommandChips(
       enforceSingleAgent(next),
-      commands,
+      commandsRef.current,
     );
     setValue(segments);
     for (const action of actions) {
       action();
     }
-  }, [commands]);
+  }, []);
 
   /**
    * COMPOSITION IS TRACKED ON THE DOM, NOT THROUGH REACT STATE, for the reason `composingRef`

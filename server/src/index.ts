@@ -259,6 +259,7 @@ import { createTurnRunner } from "./turns/run-turn";
 import { createWorkflowEngine, type WorkflowEngine } from "./workflows/engine";
 import { createLivePanelService } from "./live-panels/service";
 import { createModelUsageLedger } from "./model-usage/ledger";
+import { createUsagePanelRefresh } from "./model-usage/panel";
 import { setModelUsageSink } from "./model-usage/sink";
 import { createLivePanelStore } from "./live-panels/store";
 import { webTools } from "./web/tools";
@@ -2563,6 +2564,7 @@ const linkPreviews = await createLinkPreviews(database, {
 const livePanelStore = createLivePanelStore(database);
 const livePanelService = createLivePanelService({
   store: livePanelStore,
+  refreshData: createUsagePanelRefresh({ summary: modelUsage.summary, update: livePanelStore.update }),
   runHeadless: async ({ ownerUserId, botId, instruction, panelId, signal }) => {
     const actor = await actorFor(ownerUserId);
     const channel = await channelStore.create(actor, [botId]);

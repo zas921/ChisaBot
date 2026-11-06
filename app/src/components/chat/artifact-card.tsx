@@ -1,5 +1,5 @@
 import DOMPurify from "dompurify";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { IconCode, IconEye, IconMaximize } from "@tabler/icons-react";
 import { SmoothStreamdown } from "@/components/chat/smooth-markdown";
 import { CopyButton } from "@/components/ui/copy-button";
@@ -16,6 +16,8 @@ type ParsedArtifactFence = {
   title: string;
   code: string;
   rawMarkdown: string;
+  /** 围栏结尾的 ``` 还没到（流式写到一半）时为 false，先显示源码，不画半张图。 */
+  closed: boolean;
 };
 
 export function parseArtifactFence(
@@ -49,10 +51,18 @@ export function parseArtifactFence(
   if (lang !== "mermaid" && lang !== "svg" && lang !== "html") return null;
 
   const bodyLines = lines.slice(fenceStart + 1);
+  while (
+    bodyLines.length > 0 &&
+    (bodyLines[bodyLines.length - 1] ?? "").trim() === ""
+  ) {
+    bodyLines.pop();
+  }
+  let closed = false;
   if (bodyLines.length > 0) {
     const last = (bodyLines[bodyLines.length - 1] ?? "").trim();
     if (last.length >= marker.length && last.replace(/[`~]/g, "") === "") {
       bodyLines.pop();
+      closed = true;
     }
   }
 
@@ -87,6 +97,7 @@ export function parseArtifactFence(
     title: title || defaultTitle,
     code,
     rawMarkdown: rawText,
+    closed,
   };
 }
 
@@ -245,8 +256,15 @@ export function ArtifactCard({
   artifact: ParsedArtifactFence;
   components: Record<string, unknown>;
 }) {
-  const [tab, setTab] = useState<"preview" | "code">("preview");
+  const [tab, setTab] = useState<"preview" | "code">(
+    artifact.closed ? "preview" : "code",
+  );
   const [open, setOpen] = useState(false);
+  const wasClosed = useRef(artifact.closed);
+  useEffect(() => {
+    if (!wasClosed.current && artifact.closed) setTab("preview");
+    wasClosed.current = artifact.closed;
+  }, [artifact.closed]);
 
   const renderedSvg = useMemo(() => {
     if (artifact.lang === "mermaid") {

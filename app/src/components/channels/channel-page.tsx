@@ -28,6 +28,7 @@ import {
 } from "@/lib/channels/queries";
 import { setThreadUi, threadUi } from "@/lib/chat/ui-memory";
 import { useBotComputerTab } from "@/lib/chat/use-bot-computer";
+import { deleteBotThread } from "@/lib/copilot/bot-thread";
 import { useComputerAutoWatch } from "@/lib/computers/auto-watch";
 import { useMarkBotHidden } from "@/lib/kept-visible";
 
@@ -175,6 +176,28 @@ export function ChannelPage({
             agentId={agentId}
             computerOpen={isWatching}
             onComputerChange={setWatching}
+            onDeleteThread={
+              agentId && channel.data?.threadId
+                ? () => {
+                    const threadId = channel.data!.threadId!;
+                    void (async () => {
+                      const result = await deleteBotThread(threadId);
+                      if (result === "busy") {
+                        window.alert("对话还在回答，请先停止再删除。");
+                        return;
+                      }
+                      if (result !== "ok" && result !== "missing") {
+                        window.alert("删除失败，请稍后再试。");
+                        return;
+                      }
+                      void navigate({
+                        to: "/channel/new",
+                        search: { agent: agentId, topic: "new" },
+                      });
+                    })();
+                  }
+                : undefined
+            }
             onNewTopic={() =>
               agentId
                 ? void navigate({
@@ -199,6 +222,12 @@ export function ChannelPage({
           <LazyBotThreadHistoryDialog
             agentId={agentId}
             currentThreadId={channel.data?.threadId}
+            onDeletedCurrent={() =>
+              void navigate({
+                to: "/channel/new",
+                search: { agent: agentId, topic: "new" },
+              })
+            }
             onOpenChange={setHistoryOpen}
             onPick={(threadId) => void openThread(agentId, threadId)}
             open={historyOpen}

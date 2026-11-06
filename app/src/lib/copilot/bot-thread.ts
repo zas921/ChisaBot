@@ -86,3 +86,22 @@ export async function readThreadHistory(agentId: string): Promise<BotThreadSumma
   if (body === "unsupported") return body;
   return Array.isArray(body.threads) ? body.threads : [];
 }
+
+/**
+ * 删除一条对话（含消息、事件日志里的思考片段、级联的持续任务行）。
+ * 对话仍在跑时服务器返回 409，需先停止。
+ */
+export async function deleteBotThread(threadId: string): Promise<"ok" | "busy" | "missing" | "error"> {
+  try {
+    const response = await tryClient(`/api/copilotkit/threads/${encodeURIComponent(threadId)}`, {
+      method: "DELETE",
+      fallback: "无法删除对话",
+    });
+    if (response.status === 204 || response.status === 200) return "ok";
+    if (response.status === 409) return "busy";
+    if (response.status === 404) return "missing";
+    return "error";
+  } catch {
+    return "error";
+  }
+}

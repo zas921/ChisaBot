@@ -59,6 +59,7 @@ import { NOT_SHOWN } from "../../../shared/component-markers";
 import { frameFiring } from "../../../shared/routine-firing";
 import { withModelConnectionScope } from "../model-connection-context";
 import { sanitizeSeededHistory } from "../agents/history-sanitize";
+import { compactHistoryForModel } from "../agents/model-context";
 import { guardBotTurn } from "../agents/lifecycle";
 import { OPENBOT_WAITING_METADATA } from "../approvals/native-context";
 import type { AuditInitiator, AuditStore } from "../audit";
@@ -391,7 +392,9 @@ export function createTurnRunner(options: {
       { messages: [] as ThreadHistoryMessage[] },
     );
 
-    const seeded = sanitizeSeededHistory(history.messages.map(toAgentMessage));
+    const seeded = compactHistoryForModel(
+      sanitizeSeededHistory(history.messages.map(toAgentMessage)),
+    ).messages;
     /*
      * This turn's own message — and the ONLY message that is framed. See {@link frameFiring} for the
      * firing it did nothing on. The seeded history above is untouched, which is what keeps a previous
@@ -405,16 +408,20 @@ export function createTurnRunner(options: {
         content: frameFiring(instruction),
       } as Message);
     const messages: Message[] = continuation
-      ? sanitizeSeededHistory([
-          ...continuation.snapshot.messages,
-          {
-            id: continuation.messageId,
-            role: "tool",
-            toolCallId: continuation.snapshot.toolCallId,
-            ...continuation.result,
-          },
-        ])
-      : automationContext ? seeded : [...seeded, turn];
+      ? compactHistoryForModel(
+          sanitizeSeededHistory([
+            ...continuation.snapshot.messages,
+            {
+              id: continuation.messageId,
+              role: "tool",
+              toolCallId: continuation.snapshot.toolCallId,
+              ...continuation.result,
+            },
+          ]),
+        ).messages
+      : automationContext
+        ? seeded
+        : compactHistoryForModel([...seeded, turn]).messages;
 
     /*
      * WHAT THIS RUN IS ALLOWED TO PERSIST, and it is mandatory.

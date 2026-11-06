@@ -10,6 +10,10 @@ import {
 import { Observable, type Subscription } from "rxjs";
 import { currentConfirmTurn, currentToolAbort } from "../confirmations/context";
 import { REFUSAL_MARKER } from "../plugins/tools";
+import {
+  compactHistoryForModel,
+  shouldContinueToolSegments,
+} from "./model-context";
 
 export const LONG_TASK_GUIDANCE =
   "长任务持续执行：按用户要求完成所有步骤并验证结果，再给最终答复。工具步数只是内部批次，达到批次边界后系统会自动从已有结果续跑；不要因为本轮步数结束而收尾，也不要要求用户说‘继续’。用户明确要求长任务持续到全部目标验收通过时，先用 goal_start 登记目标与实际验收命令；已有任务用 goal_status 沿用，不重复登记。后台作业完成和正常回复结束后，由持续任务调度恢复原对话，全部实际验收通过后用 goal_finish 结束。已完成的操作不要重复执行。需要审批、登录或关键资料时等待用户；用户停止时立即停止。";
@@ -74,7 +78,41 @@ class ToolContinuationMiddleware extends Middleware {
       let started = false;
       const work = async () => {
         let request = input;
+        let segmentsCompleted = 0;
+        let cumulativeEstimatedTokens = 0;
+        let heldTerminal: RunFinishedEvent | undefined;
         while (!stopped()) {
+          const compacted = compactHistoryForModel(request.messages);
+          const gate = shouldContinueToolSegments({
+            segmentsCompleted,
+            cumulativeEstimatedTokens,
+            nextSegmentEstimatedTokens: compacted.estimatedTokens,
+          });
+          // First segment always runs; later segments obey the fuse.
+          if (segmentsCompleted > 0 && !gate.ok) {
+            console.warn(
+              JSON.stringify({
+                type: "model-context-continuation-stopped",
+                reason: gate.reason,
+                segmentsCompleted,
+                cumulativeEstimatedTokens,
+                nextSegmentEstimatedTokens: compacted.estimatedTokens,
+              }),
+            );
+            if (heldTerminal) {
+              out.next({
+                ...heldTerminal,
+                ...(usage.length ? { usage } : {}),
+                metadata: {
+                  ...(heldTerminal.metadata ?? {}),
+                  chisabotContextStop: gate.reason,
+                },
+              });
+            }
+            return;
+          }
+          request = { ...request, messages: compacted.messages };
+          cumulativeEstimatedTokens += compacted.estimatedTokens;
           let messages = request.messages;
           let state = request.state;
           let terminal: RunFinishedEvent | undefined;
@@ -108,6 +146,7 @@ class ToolContinuationMiddleware extends Middleware {
               complete: resolve,
             });
           });
+          segmentsCompleted += 1;
           if (out.closed || failed) return;
           if (!terminal) return;
           usage.push(...(terminal.usage ?? []));
@@ -155,6 +194,9 @@ class ToolContinuationMiddleware extends Middleware {
             out.next({ ...terminal, ...(usage.length ? { usage } : {}) });
             return;
           }
+          // Defer RUN_FINISHED while native tool segments continue; the fuse may
+          // still stop the next iteration and must emit this held terminal.
+          heldTerminal = terminal;
           // BuiltInAgent adds resume results to its model prompt without emitting
           // TOOL_CALL_RESULT. Keep those payloads so a later segment still sees
           // the approved result; the SDK skips any already answered call and
