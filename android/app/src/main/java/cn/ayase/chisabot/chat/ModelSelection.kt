@@ -10,12 +10,15 @@ data class ModelOption(val id: String, val label: String, val provider: String) 
 data class BotModelState(
     val agentId: String, val model: String, val overrideModel: String?, val defaultModel: String,
     val available: Boolean, val canManage: Boolean,
+    val reasoningEffort: String? = null, val fastMode: Boolean = false, val supportsRunOptions: Boolean = true,
 )
 
 fun parseModelState(o: JsonObject): BotModelState = BotModelState(
     agentId = o.s("agentId") ?: error("模型设置缺少机器人编号"),
     model = o.s("model").orEmpty(), overrideModel = o.s("overrideModel"), defaultModel = o.s("defaultModel").orEmpty(),
     available = o["available"]?.toString() == "true", canManage = o["canManage"]?.toString() == "true",
+    reasoningEffort = o.s("reasoningEffort"), fastMode = o["fastMode"]?.toString() == "true",
+    supportsRunOptions = o["supportsRunOptions"]?.toString() != "false",
 )
 
 fun parseModelOptions(o: JsonObject): List<ModelOption> = (o.a("models") ?: error("模型列表格式不正确")).mapNotNull { el ->

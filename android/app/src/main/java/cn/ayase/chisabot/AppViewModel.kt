@@ -341,23 +341,40 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun selectModel(model: String?) {
-        val bot = chatBot ?: return
-        val api = api ?: return
         val state = modelState ?: return
         if (running || turnPreparing || chatLoading || modelSaving || modelsLoading || !state.available || !state.canManage) return
         if (model != null && modelOptions?.none { it.id == model } != false) return
         if (model == state.overrideModel) return
+        saveModelSettings(buildJsonObject {
+            put("model", model?.let { JsonPrimitive(it) } ?: kotlinx.serialization.json.JsonNull)
+        })
+    }
+
+    fun selectReasoningEffort(effort: String?) {
+        if (effort != null && effort !in listOf("low", "medium", "high", "xhigh", "max")) return
+        if (modelState?.supportsRunOptions != true || modelState?.reasoningEffort == effort) return
+        saveModelSettings(buildJsonObject { put("reasoningEffort", effort?.let { JsonPrimitive(it) } ?: kotlinx.serialization.json.JsonNull) })
+    }
+
+    fun setFastMode(enabled: Boolean) {
+        if (modelState?.supportsRunOptions != true || modelState?.fastMode == enabled) return
+        saveModelSettings(buildJsonObject { put("fastMode", enabled) })
+    }
+
+    private fun saveModelSettings(body: JsonObject) {
+        val bot = chatBot ?: return
+        val api = api ?: return
+        val state = modelState ?: return
+        if (running || turnPreparing || chatLoading || modelSaving || modelsLoading || !state.available || !state.canManage) return
         val epoch = modelEpoch
         modelSaving = true
         modelsError = null
         viewModelScope.launch {
             try {
-                val saved = parseModelState(api.call("/api/agents/${Uri.encode(bot.id)}/model", "PUT", buildJsonObject {
-                    put("model", model?.let { JsonPrimitive(it) } ?: kotlinx.serialization.json.JsonNull)
-                }) as JsonObject)
+                val saved = parseModelState(api.call("/api/agents/${Uri.encode(bot.id)}/model", "PUT", body) as JsonObject)
                 if (epoch == modelEpoch && origin() == api.origin) {
                     modelState = saved
-                    notice = "模型已切换为 ${saved.model.substringAfterLast('/')}"
+                    notice = "模型设置已保存，下一轮生效"
                 }
             } catch (e: CancellationException) { throw e }
             catch (_: Unauthorized) { if (epoch == modelEpoch && origin() == api.origin) expired() }

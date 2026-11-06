@@ -37,8 +37,8 @@ function setup(role: "admin" | "user" | null = "user", fail = false) {
       if (fail) throw new Error("key=private-secret");
       return state;
     },
-    set: async (actor: unknown, id: string, model: unknown) => {
-      calls.push({ actor, id, model });
+    set: async (actor: unknown, id: string, model: unknown, options: unknown) => {
+      calls.push({ actor, id, model, options });
       if (fail) throw new Error("key=private-secret");
       return {
         ...state,
@@ -120,6 +120,10 @@ test.each([
   '{"model":"bad model"}',
   '{"model":"x","role":"admin"}',
   '{"model":"x","baseUrl":"http://evil.test"}',
+  '{"reasoningEffort":"invalid"}',
+  '{"fastMode":"true"}',
+  '{"fastMode":null}',
+  '{"reasoningEffort":3}',
 ])("invalid model-only bodies never reach storage", async (body) => {
   const { app, calls } = setup();
   const res = await app.request("/api/agents/bot-a/model", {
@@ -137,5 +141,16 @@ test("upstream and persistence failures never reveal private exception contents"
     const res = await app.request(path);
     expect(res.status).toBe(503);
     expect(await res.text()).not.toContain("private-secret");
+  }
+});
+
+test("run-option partial updates preserve model inheritance and authenticated actor", async () => {
+  const { app, calls } = setup();
+  for (const body of [{ reasoningEffort: "xhigh", fastMode: true }, { reasoningEffort: null }, { fastMode: false }]) {
+    const response = await app.request("/api/agents/bot-a/model", {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    expect(response.status).toBe(200);
+    expect(calls.at(-1)).toMatchObject({ actor: { id: "owner", role: "user" }, id: "bot-a", model: undefined, options: body });
   }
 });

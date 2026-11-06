@@ -1,4 +1,5 @@
 import { markEventStreamUnbuffered } from "./event-stream-headers";
+import { isReasoningEffort } from "../../shared/model-selection";
 import type { Hono as HonoApp, MiddlewareHandler } from "hono";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
@@ -790,9 +791,11 @@ export function createApp(
         !body ||
         typeof body !== "object" ||
         Array.isArray(body) ||
-        Object.keys(body).length !== 1 ||
-        !("model" in body) ||
-        (body.model !== null &&
+        Object.keys(body).length === 0 ||
+        Object.keys(body).some((key) => !["model", "reasoningEffort", "fastMode"].includes(key)) ||
+        ("reasoningEffort" in body && body.reasoningEffort !== null && !isReasoningEffort(body.reasoningEffort)) ||
+        ("fastMode" in body && typeof body.fastMode !== "boolean") ||
+        ("model" in body && body.model !== null &&
           (typeof body.model !== "string" ||
             !body.model ||
             body.model.length > 200 ||
@@ -804,7 +807,11 @@ export function createApp(
           await agentModels.set(
             context.var.actor,
             context.req.param("agentId"),
-            body.model as string | null,
+            "model" in body ? body.model as string | null : undefined,
+            {
+              ...("reasoningEffort" in body ? { reasoningEffort: body.reasoningEffort as import("../../shared/model-selection").ReasoningEffort | null } : {}),
+              ...("fastMode" in body ? { fastMode: body.fastMode as boolean } : {}),
+            },
           ),
         );
       } catch (error) {

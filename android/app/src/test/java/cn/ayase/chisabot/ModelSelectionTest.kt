@@ -7,6 +7,17 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class ModelSelectionTest {
+    @Test fun readsRunOptionsAndLegacyDefaults() {
+        val base = """{"agentId":"bot","model":"vendor/model","available":true,"canManage":true}"""
+        val legacy = parseModelState(obj(base))
+        assertNull(legacy.reasoningEffort)
+        assertFalse(legacy.fastMode)
+        assertTrue(legacy.supportsRunOptions)
+        val state = parseModelState(obj(base.dropLast(1) + ""","reasoningEffort":"xhigh","fastMode":true,"supportsRunOptions":false}"""))
+        assertEquals("xhigh", state.reasoningEffort)
+        assertTrue(state.fastMode)
+        assertFalse(state.supportsRunOptions)
+    }
     private fun obj(text: String) = Json.parseToJsonElement(text) as JsonObject
 
     @Test fun readsServerStateAndNullDefault() {

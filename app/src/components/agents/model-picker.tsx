@@ -11,6 +11,7 @@ import { cn } from "@/lib/utils";
 import { FEEDBACK_PRESETS, useMutationFeedback } from "@/components/ui/async-action";
 import { AsyncContent } from "@/components/ui/button";
 import { toast } from "@/components/ui/toast";
+import { ModelRunOptions } from "@/components/agents/model-run-options";
 
 type Option = ModelCatalogEntry & { missing?: boolean; inherited?: boolean };
 type Health = "ok" | "bad" | "off" | "unknown";
@@ -212,6 +213,7 @@ export function ModelPicker({ agentId, disabled = false }: { agentId: string; di
                 </ComboboxPrimitive.Group>
               )}
             </ComboboxPrimitive.List>
+            <ModelRunOptions agentId={agentId} disabled={disabled} />
             <div className="model-popover-footer">
               <span className="truncate">{error ? <span className="text-destructive">{error}</span> : catalog.data ? `${catalog.data.source === "magpie" ? "Magpie · " : ""}共 ${models.length} 个模型${catalog.data.stale ? " · 网关暂不可用，显示上次列表" : " · 下一轮生效"}` : "正在加载模型列表…"}</span>
               <button

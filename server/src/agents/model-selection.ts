@@ -1,5 +1,9 @@
 import { and, eq, isNull } from "drizzle-orm";
-import type { AgentModelState } from "../../../shared/model-selection";
+import {
+  isReasoningEffort,
+  type AgentModelState,
+  type AgentRunOptions,
+} from "../../../shared/model-selection";
 import type { Database } from "../db/client";
 import { agentProfiles, agents } from "../db/schema";
 import type { ModelCatalogService } from "../model-catalog";
@@ -21,10 +25,14 @@ export type AgentModelService = {
   set(
     actor: AgentActor,
     id: string,
-    model: string | null,
+    model: string | null | undefined,
+    options?: AgentRunOptions,
   ): Promise<AgentModelState>;
   /** Internal runtime read. Visibility is checked by the actor's runtime roster first. */
   resolveModel(id: string): Promise<string | null>;
+  resolveSettings(
+    id: string,
+  ): Promise<AgentRunOptions & { model: string | null }>;
 };
 
 function record(value: unknown): Record<string, unknown> {
@@ -54,6 +62,16 @@ export function modelOverrideFromValue(value: unknown): string | null {
   return validModelId(model) ? model : null;
 }
 
+export function runOptionsFromValue(value: unknown): AgentRunOptions {
+  const row = record(value);
+  return {
+    ...(isReasoningEffort(row.reasoningEffort)
+      ? { reasoningEffort: row.reasoningEffort }
+      : {}),
+    ...(typeof row.fastMode === "boolean" ? { fastMode: row.fastMode } : {}),
+  };
+}
+
 function canSelect(actor: AgentActor, profile: AgentProfile): boolean {
   return (
     profile.deletedAt === null &&
@@ -81,6 +99,7 @@ function state(
   actor: AgentActor,
   profile: AgentProfile,
   available = true,
+  supportsRunOptions = true,
 ): AgentModelState {
   const overrideModel = available ? modelOverrideFromValue(override) : null;
   const model = overrideModel ?? defaultModel;
@@ -91,6 +110,11 @@ function state(
     defaultModel,
     canManage: available && canSelect(actor, profile),
     available,
+    reasoningEffort: available
+      ? (runOptionsFromValue(override).reasoningEffort ?? null)
+      : null,
+    fastMode: available && runOptionsFromValue(override).fastMode === true,
+    supportsRunOptions: available && supportsRunOptions,
   };
 }
 
@@ -98,6 +122,7 @@ export function createAgentModelService(options: {
   database: Database;
   profiles: AgentProfileStore;
   resolveDefaultModel: () => Promise<string>;
+  resolveProtocol?: () => Promise<"openai" | "anthropic">;
   catalog: ModelCatalogService;
 }): AgentModelService {
   const { database, profiles } = options;
@@ -128,11 +153,39 @@ export function createAgentModelService(options: {
         actor,
         profile,
         row.type === "built_in",
+        !options.resolveProtocol ||
+          (await options.resolveProtocol()) === "openai",
       );
     },
 
-    async set(actor, id, selected) {
-      if (selected !== null && !validModelId(selected)) {
+    async set(actor, id, selected, runOptions = {}) {
+      if (
+        (runOptions.reasoningEffort !== undefined &&
+          runOptions.reasoningEffort !== null &&
+          !isReasoningEffort(runOptions.reasoningEffort)) ||
+        (runOptions.fastMode !== undefined &&
+          typeof runOptions.fastMode !== "boolean")
+      )
+        throw new ModelSelectionError(
+          "请选择有效的思考深度和 Fast 模式。",
+          400,
+        );
+      const supportsRunOptions =
+        !options.resolveProtocol ||
+        (await options.resolveProtocol()) === "openai";
+      if (
+        !supportsRunOptions &&
+        (runOptions.reasoningEffort != null || runOptions.fastMode === true)
+      )
+        throw new ModelSelectionError(
+          "当前连接协议不支持思考深度和 Fast 模式。",
+          400,
+        );
+      if (
+        selected !== undefined &&
+        selected !== null &&
+        !validModelId(selected)
+      ) {
         throw new ModelSelectionError(
           "请选择模型列表中的模型，或使用默认模型。",
           400,
@@ -151,10 +204,10 @@ export function createAgentModelService(options: {
       // No network requests or second pooled reads while holding mutation locks.
       const [defaultModel, available] = await Promise.all([
         options.resolveDefaultModel(),
-        model === null ? undefined : catalog(),
+        model == null ? undefined : catalog(),
       ]);
       if (
-        model !== null &&
+        model != null &&
         !available?.models.some((entry) => entry.id === model)
       ) {
         throw new ModelSelectionError(
@@ -186,16 +239,34 @@ export function createAgentModelService(options: {
         local(row?.type);
         const override = { ...record(row?.override) };
         if (model === null) delete override.model;
-        else override.model = model;
+        else if (model !== undefined) override.model = model;
+        if (runOptions.reasoningEffort === null)
+          delete override.reasoningEffort;
+        else if (runOptions.reasoningEffort !== undefined)
+          override.reasoningEffort = runOptions.reasoningEffort;
+        if (runOptions.fastMode !== undefined)
+          override.fastMode = runOptions.fastMode;
         await transaction
           .update(agents)
           .set({ override, updatedAt: new Date() })
           .where(eq(agents.id, id));
-        return state(id, override, defaultModel, actor, profile);
+        return state(
+          id,
+          override,
+          defaultModel,
+          actor,
+          profile,
+          true,
+          supportsRunOptions,
+        );
       });
     },
 
     async resolveModel(id) {
+      return (await this.resolveSettings(id)).model;
+    },
+
+    async resolveSettings(id) {
       const [row] = await database
         .select({ override: agents.override })
         .from(agents)
@@ -207,7 +278,10 @@ export function createAgentModelService(options: {
             isNull(agentProfiles.deletedAt),
           ),
         );
-      return modelOverrideFromValue(row?.override);
+      return {
+        model: modelOverrideFromValue(row?.override),
+        ...runOptionsFromValue(row?.override),
+      };
     },
   };
 }

@@ -13,6 +13,10 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.Switch
+import androidx.compose.foundation.layout.Box
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Text
@@ -37,6 +41,7 @@ fun ModelPicker(vm: AppViewModel) {
     val sky = LocalSky.current
     var open by remember(vm.chatBot?.id) { mutableStateOf(false) }
     var query by remember(open) { mutableStateOf("") }
+    var effortMenu by remember(open) { mutableStateOf(false) }
     val state = vm.modelState
     val models = vm.modelOptions.orEmpty()
     val label = when {
@@ -76,6 +81,25 @@ fun ModelPicker(vm: AppViewModel) {
                     vm.modelsError?.let { Text(it, color = sky.danger, fontSize = 12.sp) }
                     if (vm.modelsStale) Text("当前显示上次成功获取的列表，可刷新重试。", fontSize = 12.sp)
                     LazyColumn(Modifier.fillMaxWidth().heightIn(max = 340.dp)) {
+                        if (state != null) item(key = "run-options") {
+                            val efforts = listOf(null to "模型默认", "low" to "低", "medium" to "中", "high" to "高", "xhigh" to "超高", "max" to "最高")
+                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+                                Text("思考深度", fontSize = 12.sp)
+                                Box {
+                                    TextButton({ effortMenu = true }, enabled = !locked && state.supportsRunOptions) { Text(efforts.find { it.first == state.reasoningEffort }?.second ?: "模型默认") }
+                                    DropdownMenu(expanded = effortMenu, onDismissRequest = { effortMenu = false }) {
+                                        efforts.forEach { (effort, name) ->
+                                            DropdownMenuItem(text = { Text(name) }, onClick = { effortMenu = false; vm.selectReasoningEffort(effort) })
+                                        }
+                                    }
+                                }
+                            }
+                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+                                Text("Fast 模式", fontSize = 12.sp)
+                                Switch(checked = state.fastMode, onCheckedChange = { vm.setFastMode(it) }, enabled = !locked && state.supportsRunOptions)
+                            }
+                            Text(if (state.supportsRunOptions) "下一轮生效；需模型与网关支持，Fast 可能增加费用。" else "当前连接协议不支持这些选项。", fontSize = 12.sp)
+                        }
                         if (state != null) item(key = "default") {
                             ModelChoice("部署默认", state.defaultModel, state.overrideModel == null, !locked) { vm.selectModel(null) }
                         }

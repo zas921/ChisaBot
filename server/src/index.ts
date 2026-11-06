@@ -1161,24 +1161,25 @@ const agentModels = createAgentModelService({
   profiles: agentProfileStore,
   resolveDefaultModel: async () =>
     (await resolveRuntimeConnection()).model.defaultModel,
+  resolveProtocol: async () => (await resolveRuntimeConnection()).model.provider,
   catalog: modelCatalog,
 });
 const resolveRuntimeConnectionForAgent = (agentId: string) =>
   resolveScopedAgentModelConnection(agentId, async () => {
     const [connection, selected] = await Promise.all([
       resolveRuntimeConnection(),
-      agentModels.resolveModel(agentId),
+      agentModels.resolveSettings(agentId),
     ]);
-    return selected === null
-      ? connection
-      : {
-          model: {
-            ...connection.model,
-            defaultModel: selected,
-            plan: undefined,
-          },
-          apiKey: connection.apiKey,
-        };
+    const { model: selectedModel, ...runOptions } = selected;
+    return {
+      model: {
+        ...connection.model,
+        ...runOptions,
+        defaultModel: selectedModel ?? connection.model.defaultModel,
+        ...(selectedModel ? { plan: undefined } : {}),
+      },
+      apiKey: connection.apiKey,
+    };
   });
 
 /**

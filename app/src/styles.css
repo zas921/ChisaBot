@@ -11472,3 +11472,8 @@ a.cc-pill { text-decoration: none; }
 html[data-palette]:not([data-palette="default"]) #sky-root #skyph {
   background: linear-gradient(to bottom, var(--palette-sky-0) 0%, var(--palette-sky-1) 36%, var(--palette-sky-2) 72%, var(--palette-sky-3) 100%);
 }
+.model-run-options { flex-shrink: 0; padding: 0.65rem 0; }
+.model-popover > .model-run-options { padding: 0.75rem; border-top: 1px solid var(--border); }
+.model-effort-select { min-height: 1.9rem; border: 1px solid var(--border); border-radius: 0.5rem; padding: 0.15rem 0.45rem; background: var(--background); color: var(--foreground); }
+.model-effort-select:disabled { opacity: 0.5; }
+.model-effort-select:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }

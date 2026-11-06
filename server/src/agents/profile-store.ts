@@ -26,7 +26,7 @@ import {
 import { teamBotPublications } from "../db/schema/team-bots";
 import { canDeleteAgent, canManageAgent } from "./profile-policy";
 import { deleteGrantsForAgent } from "../package-orphans";
-import { modelOverrideFromValue } from "./model-selection";
+import { modelOverrideFromValue, runOptionsFromValue } from "./model-selection";
 import type {
   AgentActor,
   AgentProfile,
@@ -733,13 +733,14 @@ export function createAgentProfileStore(
         }
         const duplicateId = newAgentId();
         const selectedModel = modelOverrideFromValue(stored.override);
+        const selectedRunOptions = runOptionsFromValue(stored.override);
         await transaction.insert(agents).values({
           id: duplicateId,
           name: source.name,
           type: run.type,
           configuration: run.configuration,
-          ...(run.type === "built_in" && selectedModel
-            ? { override: { model: selectedModel } }
+          ...(run.type === "built_in" && (selectedModel || Object.keys(selectedRunOptions).length > 0)
+            ? { override: { ...(selectedModel ? { model: selectedModel } : {}), ...selectedRunOptions } }
             : {}),
         });
         await transaction.insert(agentProfiles).values({

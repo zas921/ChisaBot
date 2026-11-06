@@ -1,5 +1,5 @@
 import { mutationOptions, type QueryClient } from "@tanstack/react-query";
-import type { AgentModelState } from "../../../../shared/model-selection";
+import type { AgentModelState, AgentModelUpdate } from "../../../../shared/model-selection";
 import { agentApiPath } from "@/lib/agents/queries";
 import { client } from "@/lib/client";
 import { loadModelCatalog, modelSelectionKeys } from "./queries";
@@ -9,9 +9,9 @@ export function saveAgentModelMutationOptions(queryClient: QueryClient, agentId:
   return mutationOptions({
     mutationKey: modelSelectionKeys.save(agentId),
     onMutate: () => queryClient.cancelQueries({ queryKey: modelSelectionKeys.agent(agentId) }),
-    mutationFn: async (model: string | null): Promise<AgentModelState> => {
+    mutationFn: async (model: string | null | AgentModelUpdate): Promise<AgentModelState> => {
       const response = await client(`${agentApiPath(agentId)}/model`, {
-        method: "PUT", body: { model }, fallback: "无法保存模型，请重试。",
+        method: "PUT", body: typeof model === "object" && model !== null ? model : { model }, fallback: "无法保存模型设置，请重试。",
       });
       return response.json();
     },

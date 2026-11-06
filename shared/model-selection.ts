@@ -58,6 +58,23 @@ export type MagpieOverview = {
   };
 };
 
+export const REASONING_EFFORTS = [
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+] as const;
+export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
+export type AgentRunOptions = {
+  reasoningEffort?: ReasoningEffort | null;
+  fastMode?: boolean;
+};
+export type AgentModelUpdate = AgentRunOptions & { model?: string | null };
+export function isReasoningEffort(value: unknown): value is ReasoningEffort {
+  return REASONING_EFFORTS.some((effort) => effort === value);
+}
+
 /** The effective model and its optional persistent override belong to one BOT. */
 export type AgentModelState = {
   agentId: string;
@@ -67,6 +84,9 @@ export type AgentModelState = {
   /** This deployment runs the BOT locally and can select its model; not catalog membership. */
   available: boolean;
   canManage: boolean;
+  reasoningEffort?: ReasoningEffort | null;
+  fastMode?: boolean;
+  supportsRunOptions?: boolean;
 };
 
 /**

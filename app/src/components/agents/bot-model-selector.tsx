@@ -8,6 +8,7 @@ import { useModelSelectionSaving, useModelSelectionSync } from "@/lib/model-sele
 import { refreshModelsMutationOptions, saveAgentModelMutationOptions } from "@/lib/model-selection/mutations";
 import { agentModelQueryOptions, modelCatalogQueryOptions, modelSelectionKeys } from "@/lib/model-selection/queries";
 import { ModelPicker } from "@/components/agents/model-picker";
+import { ModelRunOptions } from "@/components/agents/model-run-options";
 
 type ModelOption = ModelCatalogEntry & { missing?: boolean };
 const labelOf = (option: ModelOption) => !option.id ? option.label : option.label === option.id ? option.id : `${option.label} · ${option.id}`;
@@ -78,6 +79,7 @@ function BotModelSettingsRow({ agentId, disabled = false, bare = false }: { agen
         <Button aria-label="刷新模型列表" title="刷新 Magpie 模型列表" type="button" size="icon-xs" variant="ghost" disabled={disabled || saving || (refreshing && refresh.status !== "pending")} mutation={refresh} onClick={() => refresh.mutate()}><IconRefresh /></Button>
         {catalog.data && !bare ? <span className="shrink-0 text-xs text-muted-foreground">{catalog.data.models.length} 个模型</span> : null}
       </div>
+      <ModelRunOptions agentId={agentId} disabled={disabled} />
       {saving ? <p className="pt-1 text-xs text-muted-foreground" role="status">正在保存模型…</p> : null}
       {modelMissing ? <p className="pt-1 text-xs text-destructive" role="alert">当前模型 {state.data.model} 已不可用，请重新选择。</p> : null}
       {save.error || refresh.error || catalog.error || state.error ? <p className="pt-1 text-xs text-destructive" role="alert">{save.error?.message ?? refresh.error?.message ?? catalog.error?.message ?? state.error?.message}</p> : null}

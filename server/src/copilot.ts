@@ -35,7 +35,8 @@ import {
   planModelForEnvironment,
 } from "./agents/plan-model";
 import type { AgentActor } from "./agents/profile-types";
-import { modelOverrideFromValue } from "./agents/model-selection";
+import { modelOverrideFromValue, runOptionsFromValue } from "./agents/model-selection";
+import type { AgentRunOptions } from "../../shared/model-selection";
 import { thinkTagLanguageModel } from "./agents/think-tags";
 import { currentConfirmTurn, currentToolAbort, TOOL_STOPPED_ZH, withConfirmToolCall } from "./confirmations/context";
 import { fallbackCandidates, fallbackLanguageModel, modelCooldownScope } from "./agents/model-fallback";
@@ -90,7 +91,7 @@ export type IdentifyUser = (
   request: Request,
 ) => Promise<{ id: string; name: string }>;
 
-type RegisteredBuiltInAgent = {
+type RegisteredBuiltInAgent = AgentRunOptions & {
   id: string;
   name: string;
   type: "built_in";
@@ -189,7 +190,7 @@ export function standingRoleMessage(
   };
 }
 
-export type RuntimeModel = {
+export type RuntimeModel = AgentRunOptions & {
   provider: "openai" | "anthropic";
   defaultModel: string;
   plan?: PlanModelConfig;
@@ -217,7 +218,23 @@ export function connectionLanguageModel(
       headers.delete("x-api-key");
     }
     // An API endpoint cannot redirect a credential to a different host.
-    return fetch(input, { ...init, headers, redirect: "error" });
+    // Gateway-prefixed model IDs are unknown to the SDK capability table. Apply
+    // the explicit BOT settings after serialization so they are never discarded.
+    let body = init?.body;
+    if (model.provider === "openai" && typeof body === "string" &&
+        (model.reasoningEffort != null || model.fastMode !== undefined)) {
+      const path = new URL(input instanceof Request ? input.url : String(input)).pathname;
+      if (path.endsWith("/responses") || path.endsWith("/chat/completions")) {
+        const payload = JSON.parse(body);
+        if (model.reasoningEffort != null) {
+          if (path.endsWith("/responses")) payload.reasoning = { ...payload.reasoning, effort: model.reasoningEffort };
+          else payload.reasoning_effort = model.reasoningEffort;
+        }
+        if (model.fastMode !== undefined) payload.service_tier = model.fastMode ? "priority" : "default";
+        body = JSON.stringify(payload);
+      }
+    }
+    return fetch(input, { ...init, body, headers, redirect: "error" });
   }) as typeof fetch;
   const options = {
     apiKey: apiKey ?? "",
@@ -470,6 +487,7 @@ export function registeredAgentFromRow(
           type: "built_in",
           systemPrompt: trimmedSystemPrompt,
           ...(selectedModel ? { model: selectedModel } : {}),
+          ...runOptionsFromValue(row.override),
         }
       : null;
   }
@@ -605,7 +623,7 @@ export function builtInAgentConfiguration(
     // 计划模型（PlanModel）自己转发整段对话，不插话；它照样能吃到段与段之间读进来的消息。
     model: planModel
       ? goalContinuationModel(planModel)
-      : model.baseUrl || model.useApiKey === false || currentGoalContinuation()
+      : model.baseUrl || model.useApiKey === false || model.reasoningEffort != null || model.fastMode !== undefined || currentGoalContinuation()
         ? // 每一步的用量记到当前运行的计量器（输入框的「上下文」读数，context-usage.ts）。
           steerLanguageModel(goalContinuationModel(meterLanguageModel(fallbackConnectionModel(model, apiKey), { botId: agent.id })))
         : `${model.provider}/${model.defaultModel}`,
@@ -828,11 +846,14 @@ export async function buildAgents(
           agent.type === "built_in"
             ? await resolveConnectionForAgent?.(agent.id)
             : undefined;
-        const selectedModel =
+        const selectedConnectionModel =
           connection?.model ??
           (agent.type === "built_in" && agent.model
             ? { ...model, defaultModel: agent.model, plan: undefined }
             : model);
+        const selectedModel = !connection && agent.type === "built_in"
+          ? { ...selectedConnectionModel, ...runOptionsFromValue(agent) }
+          : selectedConnectionModel;
         const built = await buildAgent(
           agent,
           selectedModel,

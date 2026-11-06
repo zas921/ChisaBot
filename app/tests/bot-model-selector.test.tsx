@@ -45,8 +45,8 @@ beforeEach(() => {
     if (init?.method === "PUT") {
       if (holdSave) await new Promise<void>((resolve) => { finishSave = resolve; });
       if (saveError) return Response.json({ error: "模型保存失败" }, { status: 500 });
-      const { model } = JSON.parse(String(init.body));
-      states[id] = { ...states[id], overrideModel: model, model: model ?? states[id].defaultModel, available: true };
+      const update = JSON.parse(String(init.body));
+      states[id] = { ...states[id], ...update, ...("model" in update ? { overrideModel: update.model, model: update.model ?? states[id].defaultModel } : {}), available: true };
     }
     return Response.json(states[id]);
   }, { preconnect: originalFetch.preconnect });
@@ -195,4 +195,49 @@ test("a successful inherited-model reset stays synchronized", async () => {
   await user.click(await view.findByRole("option", { name: /部署默认/ }));
   await waitFor(() => expect(states["bot-a"].overrideModel).toBeNull());
   expect(within(view.getByTestId("settings")).getByRole("combobox", { name: "模型选择" }).textContent).toContain("部署默认");
+});
+
+test("thinking depth and Fast synchronize across surfaces without changing another BOT or the model", async () => {
+  const view = draw();
+  const user = userEvent.setup({ document: view.baseElement.ownerDocument });
+  const settings = within(view.getByTestId("settings"));
+  await user.selectOptions(await settings.findByRole("combobox", { name: "思考深度" }), "xhigh");
+  await waitFor(() => expect(states["bot-a"].reasoningEffort).toBe("xhigh"));
+  await waitFor(() => expect((settings.getByRole("switch", { name: "Fast 模式" }) as HTMLButtonElement).disabled).toBe(false));
+  await user.click(settings.getByRole("switch", { name: "Fast 模式" }));
+  await waitFor(() => expect(states["bot-a"].fastMode).toBe(true));
+  await waitFor(() => expect(pill(view, "composer").disabled).toBe(false));
+  await user.click(pill(view, "composer"));
+  const selectors = view.getAllByRole("combobox", { name: "思考深度" }) as HTMLSelectElement[];
+  expect(selectors.filter((item) => item.value === "xhigh")).toHaveLength(2);
+  expect(view.getAllByRole("switch", { name: "Fast 模式" }).filter((item) => item.getAttribute("aria-checked") === "true")).toHaveLength(2);
+  expect(states["bot-a"].model).toBe("vendor/first");
+  expect(states["bot-b"].reasoningEffort).toBeUndefined();
+  expect(states["bot-b"].fastMode).toBeUndefined();
+});
+
+test("run-option saves lock model selection and restore acknowledged settings on failure", async () => {
+  const view = draw();
+  const user = userEvent.setup({ document: view.baseElement.ownerDocument });
+  const settings = within(view.getByTestId("settings"));
+  const effort = await settings.findByRole("combobox", { name: "思考深度" }) as HTMLSelectElement;
+  holdSave = true;
+  saveError = true;
+  await user.selectOptions(effort, "high");
+  await waitFor(() => expect(finishSave).toBeDefined());
+  expect(pill(view, "composer").disabled).toBe(true);
+  expect(effort.disabled).toBe(true);
+  await act(async () => finishSave?.());
+  await waitFor(() => expect(effort.disabled).toBe(false));
+  expect(effort.value).toBe("");
+  expect(await settings.findByRole("alert")).toBeTruthy();
+});
+
+test("unsupported protocol and non-owner controls cannot change run options", async () => {
+  states["bot-a"].supportsRunOptions = false;
+  states["bot-b"].canManage = false;
+  const view = draw();
+  const efforts = await view.findAllByRole("combobox", { name: "思考深度" }) as HTMLSelectElement[];
+  expect(efforts.every((item) => item.disabled)).toBe(true);
+  expect(view.getAllByRole("switch", { name: "Fast 模式" }).every((item) => (item as HTMLButtonElement).disabled)).toBe(true);
 });
