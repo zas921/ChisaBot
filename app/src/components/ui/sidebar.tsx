@@ -13,6 +13,7 @@ import { Input } from "@/components/ui/input";
 import { Separator } from "@/components/ui/separator";
 import {
   Sheet,
+  SheetClose,
   SheetContent,
   SheetDescription,
   SheetHeader,
@@ -221,7 +222,24 @@ function Sidebar({
             <SheetTitle>{"侧边栏"}</SheetTitle>
             <SheetDescription>{"显示移动侧边栏。"}</SheetDescription>
           </SheetHeader>
-          <div className="flex h-full w-full flex-col">{children}</div>
+          <div className="flex h-full w-full flex-col">
+            <div className="sidebar-mobile-menu-close">
+              <SheetClose
+                render={
+                  <button
+                    aria-label="折叠菜单"
+                    className="glass-menu-toggle"
+                    data-sidebar-menu-close=""
+                    type="button"
+                  />
+                }
+              >
+                <IconLayoutSidebar aria-hidden className="glass-menu-toggle-icon" />
+                <span>折叠菜单</span>
+              </SheetClose>
+            </div>
+            {children}
+          </div>
         </SheetContent>
       </Sheet>
     );

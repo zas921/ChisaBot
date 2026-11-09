@@ -198,14 +198,21 @@ suite("local conversations on a dedicated PostgreSQL database", () => {
     stream.subscribe({ next: (event) => { if (event.type === EventType.TOOL_CALL_ARGS) argsSeen(); } });
     const completed = collect(stream);
     await reachedTool;
-    expect(() => backend.runner.run({ threadId: pausedThread, agent, input: { ...input, runId: randomUUID() } })).toThrow("Thread already running");
+    // Repeated browser sends now join the existing run instead of throwing synchronously.
+    const rejoined = collect(backend.runner.run({ threadId: pausedThread, agent, input: { ...input, runId: randomUUID() } }));
     expect(await backend.runner.stop({ threadId: pausedThread, runId: "stale-run" })).toBe(false);
     const joined = collect(backend.runner.connect({ threadId: pausedThread, agentId: bot }));
     expect(await backend.runner.stop({ threadId: pausedThread, runId: input.runId })).toBe(true);
     const stopped = await completed;
     const restored = await joined;
+    const repeated = await rejoined;
     expect(stopped.filter((event) => event.type === EventType.RUN_STARTED)).toHaveLength(1);
-    expect(restored.filter((event) => event.type === EventType.RUN_STARTED)).toHaveLength(1);
+    expect(repeated.filter((event) => event.type === EventType.RUN_STARTED)).toEqual(stopped.filter((event) => event.type === EventType.RUN_STARTED));
+    // Connect uses an authoritative snapshot plus its durable tail, not a second RUN_STARTED.
+    expect(restored.filter((event) => event.type === EventType.MESSAGES_SNAPSHOT)).toHaveLength(1);
+    expect(restored.filter((event) => event.type === EventType.RUN_STARTED)).toHaveLength(0);
+    const [runs] = await database.$client.unsafe("SELECT count(*)::int AS n FROM openbot_local_runs WHERE thread_id = $1", [pausedThread]);
+    expect(runs?.n).toBe(1);
     expect(stopped.some((event) => event.type === EventType.TEXT_MESSAGE_END)).toBe(true);
     expect(stopped.some((event) => event.type === EventType.TOOL_CALL_END)).toBe(true);
     expect(stopped.some((event) => event.type === EventType.TOOL_CALL_RESULT)).toBe(true);

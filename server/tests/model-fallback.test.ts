@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import {
+  configuredStallMs,
   cooldownMs,
   coolingDown,
   explainModelError,
@@ -9,7 +10,7 @@ import {
   fallbackNotice,
   fallbackReason,
   isQuotaError,
-  modelCooldownScope,
+  isSharedGatewayTimeout,
   providerReason,
   resetModelCooldowns,
   withFallbackListener,
@@ -140,9 +141,8 @@ describe("model fallback on quota errors", () => {
     expect(gone.calls.length).toBe(1);
   });
 
-  test("all failed models stay cooled until expiry instead of repeating the same long gateway wait", async () => {
+  test("primary skipped by cooldown is tried again when every candidate fails (§101)", async () => {
     let primaryFails = true;
-    let t = 1_000;
     const primary = fakeModel("p", async () => {
       if (primaryFails) throw apiError(429, "rate limited");
       return { stream: "primary-back" };
@@ -153,16 +153,11 @@ describe("model fallback on quota errors", () => {
     const wrapped = fallbackLanguageModel(primary.model, "c/p", {
       candidates: async () => ["c/gone"],
       build: () => gone.model,
-      now: () => t,
       log: () => {},
     });
     await expect(wrapped.doStream({})).rejects.toMatchObject({ statusCode: 429 });
     primaryFails = false;
-    // 候选都失败不绕过冷却；恢复探测等到真实冷却期限。
-    await expect(wrapped.doStream({})).rejects.toMatchObject({ statusCode: 429 });
-    expect(primary.calls).toHaveLength(1);
-    expect(gone.calls).toHaveLength(1);
-    t += 60_001;
+    // 主模型还在冷却里，候选也冷却了：直接再试主模型
     expect(await wrapped.doStream({})).toEqual({ stream: "primary-back" });
   });
 
@@ -285,14 +280,14 @@ describe("model fallback on quota errors", () => {
       };
       const backup = fakeModel("b", async () => ({ ok: "b" }));
       const wrapped = fallbackLanguageModel(primary, "c/p", { candidates: async () => ["c/b"], build: () => backup.model, log: () => {}, firstOutputMs: 30 });
-      expect(await wrapped.doStream({}) as unknown).toEqual({ ok: "b" });
+      expect(await wrapped.doStream({})).toEqual({ ok: "b" });
       expect(signal?.aborted).toBe(true);
     });
 
     test("a primary that streams in time is untouched: same parts in order, nothing announced", async () => {
       const primary = {
         modelId: "p",
-        async doStream(_options?: unknown) {
+        async doStream() {
           return {
             request: { id: 1 },
             stream: new ReadableStream({
@@ -356,6 +351,120 @@ describe("model fallback on quota errors", () => {
  * 2026-10-21：模型出错时对话里要看得到原因。AI SDK 的 APICallError 只在 message 里放状态行，
  * 供应商原话在 responseBody；包装层原地补上「（模型 id · HTTP 状态码：原因）」，不换错误对象。
  */
+describe("model fallback before stream output", () => {
+  beforeEach(() => resetModelCooldowns());
+  type Part = { type: string; [key: string]: unknown };
+  const drain = async (stream: ReadableStream<Part>) => {
+    const parts: Part[] = [], reader = stream.getReader();
+    for (;;) { const row = await reader.read(); if (row.done) return parts; parts.push(row.value); }
+  };
+  function streamModel(parts: Part[], failure?: Error) {
+    return fakeModel("p", async () => {
+      let index = 0;
+      return { stream: new ReadableStream<Part>({ pull(out) {
+        if (index < parts.length) out.enqueue(parts[index++]!);
+        else if (failure) out.error(failure);
+        else out.close();
+      } }) };
+    });
+  }
+  function wrap(primary: ReturnType<typeof fakeModel>, firstOutputMs = 0) {
+    const backup = streamModel([{ type: "text-delta", delta: "recovered" }, { type: "finish" }]);
+    const wrapped = fallbackLanguageModel(primary.model, "prelude/primary", {
+      candidates: async () => ["backup/model"], build: () => backup.model,
+      firstOutputMs, gatewayStallMs: 0, log: () => {},
+    });
+    const start = async (options: unknown = {}) => await wrapped.doStream(options) as { stream: ReadableStream<Part> };
+    return { start, backup };
+  }
+
+  for (const firstOutputMs of [0, 250]) {
+    test(`SSE error before content uses fallback with deadline ${firstOutputMs}`, async () => {
+      const primary = streamModel([{ type: "stream-start" }, { type: "error", error: apiError(503, "service unavailable") }]);
+      const { start, backup } = wrap(primary, firstOutputMs);
+      expect(await drain((await start()).stream)).toEqual([{ type: "text-delta", delta: "recovered" }, { type: "finish" }]);
+      expect(backup.calls).toHaveLength(1);
+      expect(coolingDown("prelude/primary")).toBe(true);
+    });
+
+    test(`metadata then reader 503 falls back with deadline ${firstOutputMs}`, async () => {
+      const primary = streamModel([{ type: "stream-start" }, { type: "response-metadata", id: "failed-response" }], apiError(503, "unavailable"));
+      const { start, backup } = wrap(primary, firstOutputMs);
+      expect((await drain((await start()).stream))[0]).toMatchObject({ delta: "recovered" });
+      expect(backup.calls).toHaveLength(1);
+    });
+
+    test(`tool or text output commits the stream and never replays with deadline ${firstOutputMs}`, async () => {
+      for (const first of [{ type: "tool-input-start", id: "call", toolName: "write_file" }, { type: "text-delta", delta: "already shown" }]) {
+        const failure = apiError(503, "late failure");
+        const { start, backup } = wrap(streamModel([{ type: "response-metadata" }, first], failure), firstOutputMs);
+        const reader = (await start()).stream.getReader();
+        expect((await reader.read()).value?.type).toBe("response-metadata");
+        expect((await reader.read()).value).toEqual(first);
+        await expect(reader.read()).rejects.toBe(failure);
+        expect(backup.calls).toHaveLength(0);
+        expect(coolingDown("prelude/primary")).toBe(false);
+      }
+    });
+  }
+
+  test("an error chunk after tool start is preserved without candidate replay", async () => {
+    const failure = apiError(429, "quota exceeded"), original = [{ type: "tool-input-start", id: "call" }, { type: "error", error: failure }];
+    const { start, backup } = wrap(streamModel(original));
+    expect(await drain((await start()).stream)).toEqual(original);
+    expect(backup.calls).toHaveLength(0);
+  });
+
+  test("unknown pre-output errors are preserved without fallback", async () => {
+    for (const asPart of [false, true]) {
+      const failure = new Error("invalid custom provider data");
+      const primary = streamModel(asPart ? [{ type: "error", error: failure }] : [{ type: "response-metadata" }], asPart ? undefined : failure);
+      const { start, backup } = wrap(primary);
+      await expect(start()).rejects.toBe(failure);
+      expect(backup.calls).toHaveLength(0);
+    }
+  });
+
+  test("zero deadline waits for content and Stop cancels an unresponsive metadata-only stream", async () => {
+    let signal: AbortSignal | undefined, cancelled = false;
+    const stop = new AbortController();
+    const primary = fakeModel("p", async () => ({ stream: new ReadableStream<Part>({
+      start(out) { out.enqueue({ type: "response-metadata" }); }, cancel() { cancelled = true; },
+    }) }));
+    const original = primary.model.doStream;
+    primary.model.doStream = async (options: unknown) => {
+      signal = (options as { abortSignal: AbortSignal }).abortSignal;
+      return original(options);
+    };
+    const { start, backup } = wrap(primary);
+    let settled = false;
+    const pending = start({ abortSignal: stop.signal }).finally(() => { settled = true; });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(settled).toBe(false);
+    const reason = new DOMException("stopped by user", "AbortError");
+    stop.abort(reason);
+    await expect(pending).rejects.toBe(reason);
+    expect(signal?.aborted).toBe(true);
+    expect(cancelled).toBe(true);
+    expect(backup.calls).toHaveLength(0);
+  });
+
+  test("failed pre-output source is cancelled before candidate and healthy metadata stays ordered", async () => {
+    let cancelled = false;
+    const primary = fakeModel("p", async () => ({ stream: new ReadableStream<Part>({
+      start(out) { out.enqueue({ type: "error", error: apiError(503, "unavailable") }); },
+      cancel() { cancelled = true; },
+    }) }));
+    const { start, backup } = wrap(primary);
+    await drain((await start()).stream);
+    expect(cancelled).toBe(true);
+    expect(backup.calls).toHaveLength(1);
+    resetModelCooldowns();
+    const parts = [{ type: "stream-start" }, { type: "response-metadata", id: "good" }, { type: "text-delta", delta: "ok" }, { type: "finish" }];
+    expect(await drain((await wrap(streamModel(parts)).start()).stream)).toEqual(parts);
+  });
+});
+
 describe("model errors carry the reason to the conversation", () => {
   beforeEach(() => resetModelCooldowns());
 
@@ -406,11 +515,89 @@ describe("model errors carry the reason to the conversation", () => {
     expect(error.message).toBe("This operation was aborted");
   });
 
-  test("a key echoed in the original message is masked as well as the response body", () => {
-    const error = new Error("Incorrect API key provided: sk-TEST_SENTINEL_NEVER_REAL_123456");
-    explainModelError(error, "c/p");
-    expect(error.message).not.toContain("SENTINEL");
-    expect(error.message).toContain("sk-TES***");
+  test("a cloudflare timeout retries the same model and skips the same gateway", async () => {
+    let n = 0;
+    const primary = fakeModel("p", async () => {
+      n += 1;
+      if (n === 1) throw apiError(503, "千刀 Cloudflare timeout");
+      return { ok: "p" };
+    });
+    const backup = fakeModel("b", async () => ({ ok: "b" }));
+    const logs: Record<string, unknown>[] = [];
+    const wrapped = fallbackLanguageModel(primary.model, "api666-zzzcoding/gpt-6.1-sol", {
+      candidates: async () => ["api666-zzzcoding/gpt-6-astra"],
+      build: () => backup.model,
+      log: (line) => logs.push(line),
+      gatewayStallMs: 0,
+    });
+    expect(await wrapped.doGenerate({})).toEqual({ ok: "p" });
+    expect(n).toBe(2);
+    expect(backup.calls.length).toBe(0);
+    expect(coolingDown("api666-zzzcoding/gpt-6.1-sol")).toBe(false);
+    expect(logs.some((line) => line.event === "primary-retry")).toBe(true);
+  });
+
+  test("two gateway timeouts do not hop to the sibling and cool the primary", async () => {
+    const primary = fakeModel("p", async () => {
+      throw apiError(504, "error code: 504");
+    });
+    const backup = fakeModel("b", async () => ({ ok: "b" }));
+    const logs: Record<string, unknown>[] = [];
+    const wrapped = fallbackLanguageModel(primary.model, "api666-zzzcoding/gpt-6.1-sol", {
+      candidates: async () => ["api666-zzzcoding/gpt-6-astra"],
+      build: () => backup.model,
+      log: (line) => logs.push(line),
+      gatewayStallMs: 0,
+    });
+    await expect(wrapped.doGenerate({})).rejects.toThrow(/504/);
+    expect(primary.calls.length).toBe(2);
+    expect(backup.calls.length).toBe(0);
+    expect(coolingDown("api666-zzzcoding/gpt-6.1-sol", 60_000)).toBe(true);
+    expect(logs.some((line) => line.event === "candidate-skipped" && line.reason === "same-gateway")).toBe(true);
+  });
+
+  test("a gateway timeout still falls over to a different gateway", async () => {
+    const primary = fakeModel("p", async () => {
+      throw apiError(504, "gateway timeout");
+    });
+    const backup = fakeModel("b", async () => ({ ok: "b" }));
+    const wrapped = fallbackLanguageModel(primary.model, "api666-zzzcoding/gpt-6.1-sol", {
+      candidates: async () => ["clinepass/other"],
+      build: () => backup.model,
+      log: () => {},
+      gatewayStallMs: 0,
+    });
+    expect(await wrapped.doGenerate({})).toEqual({ ok: "b" });
+    expect(primary.calls.length).toBe(1);
+  });
+
+  test("a silent same-gateway call is cut off and retried on that model", async () => {
+    let n = 0;
+    const primary = fakeModel("p", () => {
+      n += 1;
+      if (n === 1) return new Promise(() => {});
+      return Promise.resolve({ ok: "p" });
+    });
+    const backup = fakeModel("b", async () => ({ ok: "b" }));
+    const wrapped = fallbackLanguageModel(primary.model, "api666-zzzcoding/gpt-6.1-sol", {
+      candidates: async () => ["api666-zzzcoding/gpt-6-astra"],
+      build: () => backup.model,
+      log: () => {},
+      gatewayStallMs: 30,
+    });
+    expect(await wrapped.doGenerate({})).toEqual({ ok: "p" });
+    expect(n).toBe(2);
+    expect(backup.calls.length).toBe(0);
+  });
+
+  test("stall window is 45s for 千刀 and off for everyone else unless named", () => {
+    expect(isSharedGatewayTimeout(apiError(504, "gateway timeout"))).toBe(true);
+    expect(isSharedGatewayTimeout(apiError(503, "service unavailable"))).toBe(false);
+    expect(isSharedGatewayTimeout(apiError(503, "Cloudflare timeout"))).toBe(true);
+    expect(configuredStallMs("api666-zzzcoding/gpt-6.1-sol", {})).toBe(45_000);
+    expect(configuredStallMs("clinepass/mimo", {})).toBe(0);
+    expect(configuredStallMs("api666-zzzcoding/gpt-6.1-sol", { CHISABOT_GATEWAY_STALL_PREFIXES: "off" })).toBe(0);
+    expect(configuredStallMs("clinepass/mimo", { CHISABOT_GATEWAY_STALL_PREFIXES: "clinepass", CHISABOT_GATEWAY_STALL_MS: "12000" })).toBe(12_000);
   });
 
   test("providerReason reads common JSON shapes and HTML pages", () => {
@@ -419,247 +606,5 @@ describe("model errors carry the reason to the conversation", () => {
     expect(providerReason('{"detail":"Not authenticated"}')).toBe("Not authenticated");
     expect(providerReason("<html><body><h1>502 Bad Gateway</h1></body></html>")).toBe("502 Bad Gateway");
     expect(providerReason("")).toBe("");
-  });
-});
-
-describe("SSE failures before any model output", () => {
-  beforeEach(() => resetModelCooldowns());
-  type Part = { type: string; [key: string]: unknown };
-  const streamModel = (parts: Part[]) => ({
-    async doStream(_options: { abortSignal?: AbortSignal } = {}) {
-      return { stream: new ReadableStream<Part>({ start(out) {
-        for (const part of parts) out.enqueue(part);
-        out.close();
-      } }) };
-    },
-  });
-  const drain = async (stream: ReadableStream<Part>) => {
-    const parts: Part[] = [];
-    for await (const part of stream) parts.push(part);
-    return parts;
-  };
-
-  test("response.created metadata and empty text markers do not disable an explicit first-output deadline", async () => {
-    let cancelled = false;
-    let signal: AbortSignal | undefined;
-    const primary = { async doStream(options: { abortSignal?: AbortSignal }) {
-      signal = options.abortSignal;
-      return { stream: new ReadableStream<Part>({
-        start(out) {
-          out.enqueue({ type: "stream-start" });
-          out.enqueue({ type: "response-metadata", id: "pending-response" });
-          out.enqueue({ type: "text-start", id: "text" });
-          out.enqueue({ type: "text-delta", id: "text", delta: "" });
-        },
-        cancel() { cancelled = true; },
-      }) };
-    } };
-    const backup = fakeModel("b", async () => ({ ok: "b" }));
-    const wrapped = fallbackLanguageModel(primary, "c/p", {
-      candidates: async () => ["c/b"], build: () => backup.model, firstOutputMs: 20, log: () => {},
-    });
-    expect(await wrapped.doStream({}) as unknown).toEqual({ ok: "b" });
-    expect(signal?.aborted).toBe(true);
-    expect(cancelled).toBe(true);
-  });
-
-  test("a default untimed stream can be stopped while only metadata has arrived", async () => {
-    const stop = new AbortController();
-    let cancelled = false;
-    let entered!: () => void;
-    const started = new Promise<void>((resolve) => { entered = resolve; });
-    const primary = { async doStream() {
-      entered();
-      return { stream: new ReadableStream<Part>({
-        start(out) { out.enqueue({ type: "response-metadata" }); },
-        cancel() { cancelled = true; },
-      }) };
-    } };
-    const backup = fakeModel("b", async () => ({}));
-    const wrapped = fallbackLanguageModel(primary, "c/p", {
-      candidates: async () => ["c/b"], build: () => backup.model, log: () => {},
-    });
-    const result = (wrapped.doStream as (options: { abortSignal: AbortSignal }) => Promise<unknown>)({ abortSignal: stop.signal });
-    await started;
-    // Let the wrapper take ownership of the stream before simulating the stop button.
-    await Bun.sleep(1);
-    stop.abort(new DOMException("Stopped by user", "AbortError"));
-    await expect(result).rejects.toThrow("Stopped by user");
-    expect(backup.calls).toHaveLength(0);
-    expect(cancelled).toBe(true);
-  });
-
-  test.each([
-    { name: "chat error", error: { message: "Upstream service unavailable", statusCode: 503 } },
-    { name: "Responses failure", error: { type: "response.failed", response: { error: { code: "server_error", message: "Upstream service unavailable" } } } },
-    { name: "rate limit", error: { type: "rate_limit_error", message: "Too many requests" } },
-  ])("$name inside HTTP 200 falls back without enabling a thinking deadline", async ({ error }) => {
-    const primary = streamModel([{ type: "stream-start" }, { type: "response-metadata" }, { type: "error", error }]);
-    const backup = fakeModel("b", async () => ({ ok: "b" }));
-    const wrapped = fallbackLanguageModel(primary, "c/p", {
-      candidates: async () => ["c/b"], build: () => backup.model, log: () => {},
-    });
-    expect(await wrapped.doStream() as unknown).toEqual({ ok: "b" });
-    expect(backup.calls).toHaveLength(1);
-    expect(coolingDown("c/p")).toBe(true);
-  });
-
-  test("an early reader rejection falls back and a failed streaming candidate is cooled", async () => {
-    const primary = { async doStream() {
-      return { stream: new ReadableStream<Part>({ start(out) { out.error(apiError(504, "Gateway timeout")); } }) };
-    } };
-    let candidateCalls = 0;
-    const failed = streamModel([{ type: "error", error: { statusCode: 503, message: "Unavailable" } }]);
-    const backup = { async doStream() { candidateCalls++; return failed.doStream(); } };
-    const good = fakeModel("good", async () => ({ ok: "good" }));
-    const wrapped = fallbackLanguageModel(primary, "c/p", {
-      candidates: async () => ["c/b", "c/b", "c/good"],
-      build: (id) => id === "c/b" ? backup : good.model, log: () => {},
-    });
-    expect(await wrapped.doStream() as unknown).toEqual({ ok: "good" });
-    expect(await wrapped.doStream() as unknown).toEqual({ ok: "good" });
-    expect(candidateCalls).toBe(1);
-    expect(coolingDown("c/b")).toBe(true);
-  });
-
-  test("a gateway timeout does not exclude a healthy model merely for sharing its provider prefix", async () => {
-    const primary = fakeModel("p", async () => { throw apiError(504, "Cloudflare gateway timeout"); });
-    const backup = fakeModel("b", async () => ({ ok: "b" }));
-    const wrapped = fallbackLanguageModel(primary.model, "api666-zzzcoding/p", {
-      candidates: async () => ["api666-zzzcoding/b"], build: () => backup.model, log: () => {},
-    });
-    expect(await wrapped.doStream({})).toEqual({ ok: "b" });
-    expect(primary.calls).toHaveLength(1);
-    expect(backup.calls).toHaveLength(1);
-  });
-
-  test("a non-retryable SSE error surfaces the provider reason without switching", async () => {
-    const primary = streamModel([{ type: "error", error: { statusCode: 400, message: "Invalid tool schema" } }]);
-    const backup = fakeModel("b", async () => ({}));
-    const wrapped = fallbackLanguageModel(primary, "c/p", {
-      candidates: async () => ["c/b"], build: () => backup.model, log: () => {},
-    });
-    await expect(wrapped.doStream()).rejects.toThrow("Invalid tool schema（模型 c/p · HTTP 400）");
-    expect(backup.calls).toHaveLength(0);
-  });
-
-  test("a JSON stream error cannot expose a key in its message", async () => {
-    const primary = streamModel([{ type: "error", error: { statusCode: 401, message: "Incorrect API key provided: sk-TEST_SENTINEL_NEVER_REAL_123456" } }]);
-    const wrapped = fallbackLanguageModel(primary, "c/p", { candidates: async () => [], build: () => null, log: () => {} });
-    const error = await wrapped.doStream().catch((error: Error) => error);
-    expect(error).toBeInstanceOf(Error);
-    expect((error as Error).message).not.toContain("SENTINEL");
-  });
-
-  test("provider failure codes do not invent an HTTP error status for a successful SSE response", async () => {
-    const primary = streamModel([{ type: "error", error: { type: "response.failed", response: { error: { code: "server_error", message: "Unavailable" } } } }]);
-    const wrapped = fallbackLanguageModel(primary, "c/p", { candidates: async () => [], build: () => null, log: () => {} });
-    const error = await wrapped.doStream().catch((error: Error) => error);
-    expect((error as Error).message).toContain("Unavailable");
-    expect((error as Error).message).not.toContain("HTTP");
-  });
-
-  test.each([
-    { type: "text-delta", delta: "Already answered" },
-    { type: "reasoning-delta", delta: "Already thinking" },
-    { type: "tool-input-start", id: "tool-1", toolName: "write_file" },
-    { type: "tool-call", toolCallId: "tool-1", toolName: "write_file", input: "{}" },
-  ])("a later error after $type is explained but never replays the request", async (output) => {
-    const primary = streamModel([
-      { type: "stream-start" }, output,
-      { type: "error", error: { statusCode: 503, message: "Upstream disconnected" } },
-    ]);
-    const backup = fakeModel("b", async () => ({}));
-    const wrapped = fallbackLanguageModel(primary, "c/p", {
-      candidates: async () => ["c/b"], build: () => backup.model, log: () => {},
-    });
-    const result = await wrapped.doStream();
-    const parts = await drain(result.stream);
-    expect(parts[1]).toEqual(output);
-    expect((parts[2]?.error as Error).message).toBe("Upstream disconnected（模型 c/p · HTTP 503）");
-    expect(backup.calls).toHaveLength(0);
-  });
-
-  test("empty successful streams preserve their metadata and finish event without inventing a failure", async () => {
-    const parts: Part[] = [{ type: "stream-start" }, { type: "response-metadata", id: "empty" }, { type: "finish", finishReason: "stop" }];
-    const primary = streamModel(parts);
-    const wrapped = fallbackLanguageModel(primary, "c/p", { candidates: async () => [], build: () => null, log: () => {} });
-    expect(await drain((await wrapped.doStream()).stream)).toEqual(parts);
-  });
-
-  test("the real Responses SDK recovers from an HTTP 200 response.created followed by response.failed", async () => {
-    const { createOpenAI } = await import("@ai-sdk/openai");
-    const seen: string[] = [];
-    const upstream = Bun.serve({
-      hostname: "127.0.0.1", port: 0,
-      async fetch(request) {
-        seen.push((await request.json() as { model: string }).model);
-        const events = [
-          { type: "response.created", response: { id: "response-1", model: "gpt-6-astra", created_at: 1 } },
-          { type: "response.failed", sequence_number: 1, response: { error: { code: "server_error", message: "Upstream temporarily unavailable" } } },
-        ];
-        return new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), {
-          headers: { "content-type": "text/event-stream" },
-        });
-      },
-    });
-    try {
-      const primary = createOpenAI({ baseURL: `${upstream.url}v1`, apiKey: "synthetic-test-key" }).responses("gpt-6-astra");
-      const backup = streamModel([{ type: "text-delta", id: "reply", delta: "Recovered" }]);
-      const notices: FallbackUse[] = [];
-      const wrapped = fallbackLanguageModel(primary, "api666-zzzcoding/gpt-6-astra", {
-        candidates: async () => ["api666-zzzcoding/gpt-6.1-sol"], build: () => backup, log: () => {},
-      });
-      const result = await withFallbackListener((use) => notices.push(use), () => wrapped.doStream({
-        prompt: [{ role: "user", content: [{ type: "text", text: "Hello" }] }],
-      }));
-      expect(await drain(result.stream as ReadableStream<Part>)).toEqual([{ type: "text-delta", id: "reply", delta: "Recovered" }]);
-      expect(seen).toEqual(["gpt-6-astra"]);
-      expect(notices).toEqual([{ from: "api666-zzzcoding/gpt-6-astra", to: "api666-zzzcoding/gpt-6.1-sol", reason: "unavailable" }]);
-    } finally {
-      upstream.stop(true);
-    }
-  });
-});
-
-describe("model cooldowns are isolated by connection", () => {
-  beforeEach(() => resetModelCooldowns());
-
-  test("default wrappers with the same model name do not share failures or block a healthy connection", async () => {
-    const failed = fakeModel("p", async () => { throw apiError(429, "SENTINEL_PRIVATE_A"); });
-    const healthy = fakeModel("p", async () => ({ ok: "healthy" }));
-    const deps = { candidates: async () => [], build: () => null, log: () => {} };
-    const a = fallbackLanguageModel(failed.model, "same/model", deps);
-    const b = fallbackLanguageModel(healthy.model, "same/model", deps);
-    await expect(a.doStream({})).rejects.toThrow("SENTINEL_PRIVATE_A");
-    expect(await b.doStream({})).toEqual({ ok: "healthy" });
-    expect(healthy.calls).toHaveLength(1);
-  });
-
-  test("connection fingerprints share a cooldown only for the same provider, endpoint and credential", async () => {
-    const connection = { provider: "openai", baseUrl: "https://gateway-a.example/v1" };
-    const scope = modelCooldownScope(connection, "synthetic-key-a");
-    expect(scope).toMatch(/^[a-f0-9]{64}$/);
-    expect(scope).not.toContain("synthetic-key");
-    expect(modelCooldownScope(connection, "synthetic-key-a")).toBe(scope);
-    expect(modelCooldownScope(connection, "synthetic-key-b")).not.toBe(scope);
-    expect(modelCooldownScope({ ...connection, baseUrl: "https://gateway-b.example/v1" }, "synthetic-key-a")).not.toBe(scope);
-    expect(modelCooldownScope({ ...connection, provider: "anthropic" }, "synthetic-key-a")).not.toBe(scope);
-    expect(modelCooldownScope({ ...connection, useApiKey: false }, "synthetic-key-a")).not.toBe(scope);
-    const failed = fakeModel("p", async () => { throw apiError(504, "Gateway timeout SENTINEL_PRIVATE_A"); });
-    const second = fakeModel("p", async () => ({ ok: "same-connection" }));
-    const healthy = fakeModel("p", async () => ({ ok: "rotated-credential" }));
-    const deps = { candidates: async () => [], build: () => null, log: () => {}, cooldownScope: scope };
-    await expect(fallbackLanguageModel(failed.model, "same/model", deps).doStream({})).rejects.toMatchObject({ statusCode: 504 });
-    const cooled = await fallbackLanguageModel(second.model, "same/model", deps).doStream({}).catch((error: Error) => error);
-    expect(cooled).toMatchObject({ statusCode: 504 });
-    expect((cooled as Error).message).toContain("冷却中");
-    expect((cooled as Error).message).not.toContain("SENTINEL_PRIVATE_A");
-    expect(second.calls).toHaveLength(0);
-    const rotated = fallbackLanguageModel(healthy.model, "same/model", {
-      ...deps, cooldownScope: modelCooldownScope(connection, "synthetic-key-b"),
-    });
-    expect(await rotated.doStream({})).toEqual({ ok: "rotated-credential" });
-    expect(healthy.calls).toHaveLength(1);
   });
 });

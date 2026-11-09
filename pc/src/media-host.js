@@ -65,6 +65,8 @@ function createMediaHost({ authorize, getParentWindow, electron = require("elect
   };
   const release = (item) => {
     items.delete(item.id);
+    for (const child of item.children) if (!child.isDestroyed()) child.destroy();
+    item.children.clear();
     const popup = item.popup;
     item.popup = null;
     if (popup && !popup.isDestroyed()) popup.destroy();
@@ -72,6 +74,49 @@ function createMediaHost({ authorize, getParentWindow, electron = require("elect
       try { item.parent.contentView.removeChildView(item.view); } catch {}
     }
     if (!item.contents.isDestroyed()) item.contents.close();
+  };
+  const allowWebTarget = (item, target, blank = false) => {
+    if (blank && target === "about:blank") return true;
+    try { return new URL(mediaUrl(target)).origin !== new URL(item.parent.webContents.getURL()).origin; }
+    catch { return false; }
+  };
+  // OAuth needs a real Window/opener pair. Replacing window.open with loadURL
+  // loses the callback; these children share only the isolated media session.
+  const enableWebWindows = (item, isolated) => {
+    item.contents.setWindowOpenHandler(({ url }) => {
+      if (item.children.size >= 2 || !allowWebTarget(item, url, true)) return { action: "deny" };
+      const owner = item.popup || item.parent;
+      const area = screen.getDisplayMatching(owner.getBounds()).workArea;
+      return { action: "allow", outlivesOpener: false, overrideBrowserWindowOptions: {
+        parent: owner, width: Math.min(560, area.width), height: Math.min(760, area.height),
+        minWidth: Math.min(400, area.width), minHeight: Math.min(500, area.height),
+        frame: true, show: true, transparent: false, fullscreen: false, fullscreenable: false, kiosk: false, modal: false, alwaysOnTop: false,
+        title: "网页窗口", autoHideMenuBar: true,
+        webPreferences: { session: isolated, sandbox: true, contextIsolation: true, nodeIntegration: false, webSecurity: true, allowRunningInsecureContent: false, webviewTag: false }
+      } };
+    });
+    item.contents.on("did-create-window", (child) => {
+      if (!items.has(item.id) || item.children.size >= 2) { child.destroy(); return; }
+      item.children.add(child);
+      child.setMenu(null);
+      // Do not let a pinned player cover its own website login window.
+      if (item.popup?.isAlwaysOnTop()) child.setAlwaysOnTop(true, "screen-saver");
+      child.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+      const navigation = (event, target) => { if (!allowWebTarget(item, target, true)) event.preventDefault(); };
+      child.webContents.on("will-navigate", navigation);
+      child.webContents.on("will-redirect", navigation);
+      const title = () => {
+        if (child.isDestroyed()) return;
+        let host = "";
+        try { host = new URL(child.webContents.getURL()).host; } catch {}
+        child.setTitle(host ? `网页窗口 · ${host}` : "网页窗口");
+      };
+      child.webContents.on("page-title-updated", (event) => { event.preventDefault(); title(); });
+      child.webContents.on("did-navigate", title);
+      child.on("closed", () => item.children.delete(child));
+      child.show();
+      child.focus();
+    });
   };
   const control = (item, action) => {
     if (action === "reload") { item.status = "loading"; item.error = ""; item.contents.reload(); }
@@ -130,13 +175,13 @@ function createMediaHost({ authorize, getParentWindow, electron = require("elect
     isolated.setPermissionCheckHandler(() => false);
     if (!sessions.has(isolated)) { sessions.add(isolated); isolated.on("will-download", (event) => event.preventDefault()); }
     const view = new WebContentsView({ webPreferences: { session: isolated, sandbox: true, contextIsolation: true, nodeIntegration: false, backgroundThrottling: false } });
-    const item = { id: input.id, url, parent, view, contents: view.webContents, bounds: { x: 0, y: 0, width: 1, height: 1 }, visible: false, muted: false, popup: null, status: "loading", error: "" };
+    const item = { id: input.id, url, parent, view, contents: view.webContents, children: new Set(), bounds: { x: 0, y: 0, width: 1, height: 1 }, visible: false, muted: false, popup: null, status: "loading", error: "" };
     items.set(item.id, item);
     parent.contentView.addChildView(view);
     view.setBounds(item.bounds);
     view.setVisible(false);
     view.webContents.setAudioMuted(true);
-    view.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+    enableWebWindows(item, isolated);
     const navigation = (event, target) => { try { mediaUrl(target); } catch { event.preventDefault(); item.error = "已阻止非 HTTPS 网页跳转。"; notify(item); } };
     view.webContents.on("will-navigate", navigation);
     view.webContents.on("will-redirect", navigation);

@@ -1,6 +1,6 @@
 import type { AbstractAgent } from "@copilotkit/react-core/v2";
 import { useQueryClient } from "@tanstack/react-query";
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import type { ThreadActivity } from "./bot-thread";
 import { restoreQueue } from "./thread-inbox";
 import { workerKeys } from "./workers";
@@ -224,6 +224,8 @@ export function useConversationSync(
   onActivity: (listener: (activity: ThreadActivity) => void) => () => void,
   options: {
     liveTail?: boolean;
+    /** Hidden kept pages keep their baseline without replaying; resume checks it immediately. */
+    visible?: boolean;
     /**
      * 本机正在发消息 / 等回答：不要再开一次 connect。
      * `agent.isRunning` 只在 run/connect 真正开始后才为 true；`say` 里还有 joinGate /
@@ -235,6 +237,12 @@ export function useConversationSync(
 ) {
   const liveTail = options.liveTail === true;
   const suppressConnect = options.suppressConnect;
+  const visible = options.visible !== false;
+  const visibility = useRef({ visible, resumed: false });
+  if (visibility.current.visible !== visible) {
+    visibility.current.visible = visible;
+    if (visible) visibility.current.resumed = true;
+  }
   const queryClient = useQueryClient();
   useEffect(() => {
     if (!threadId) return;
@@ -257,7 +265,7 @@ export function useConversationSync(
      * mode "rebuild"（顺序和服务器不一致时）：照 SDK 原样，先清空再按服务器回放重建。
      */
     const join = (mode: "merge" | "rebuild" = "merge", running = false) => {
-      if (connecting || agent.isRunning || suppressConnect?.()) return;
+      if (connecting || agent.isRunning || !visibility.current.visible || suppressConnect?.()) return;
       connecting = true;
       merge = mode === "merge" ? knownForMerge(agent.messages as never, liveTail && running) : null;
       tail = mode === "merge" && liveTail && running ? liveTailOf(agent.messages as never) : null;
@@ -283,7 +291,7 @@ export function useConversationSync(
     const reconcile = () => {
       if (reconcileTimer) clearTimeout(reconcileTimer);
       reconcileTimer = setTimeout(async () => {
-        if (!alive || agent.isRunning || connecting) return;
+        if (!alive || agent.isRunning || connecting || !visibility.current.visible) return;
         const response = await fetch(`/api/copilotkit/threads/${encodeURIComponent(threadId)}/messages`, { credentials: "include" }).catch(() => null);
         if (!alive || !response?.ok || agent.isRunning || connecting) return;
         const body = (await response.json().catch(() => null)) as { messages?: { id: string; role: string }[] } | null;
@@ -333,14 +341,7 @@ export function useConversationSync(
       if (!alive || activity.threadId !== threadId) return;
       if (revisionNeedsRebuild(knownRevision, activity.revision, ownRevisions.get(threadId))) rebuildPending = true;
       if (activity.revision !== undefined) knownRevision = activity.revision;
-      if (rebuildPending && !agent.isRunning && !connecting) {
-        // 别的设备重新生成 / 编辑重发截断了这段对话：清空，按服务器回放重建（截掉的气泡、卡片一起消失）。
-        rebuildPending = false;
-        last = activity;
-        phase = "steady";
-        join("rebuild");
-        return;
-      }
+      if (!visibility.current.visible) return;
       if (connecting) return; // 接完会记成 afterJoin
       if (agent.isRunning || suppressConnect?.()) {
         // 本机在跑 / 本机刚点了发送：它收到的就是最新的，等它结束再记基线。
@@ -348,9 +349,33 @@ export function useConversationSync(
         return;
       }
       const previous = last;
+      // These stamps belong to the whole thread, including a resume/rebuild.
+      // Refresh them before any path advances the baseline and returns early.
+      if (previous) {
+        if (activity.workers !== previous.workers)
+          void queryClient.invalidateQueries({ queryKey: workerKeys.thread(threadId) });
+        if (activity.inbox !== previous.inbox) void restoreQueue(threadId);
+      }
+      if (rebuildPending) {
+        // 别的设备重新生成 / 编辑重发截断了这段对话：清空，按服务器回放重建（截掉的气泡、卡片一起消失）。
+        rebuildPending = false;
+        last = activity;
+        phase = "steady";
+        join("rebuild");
+        return;
+      }
       last = activity;
       const current = phase;
       phase = "steady";
+      const resumed = visibility.current.resumed;
+      visibility.current.resumed = false;
+      // A switch can finish before even one hidden poll. Keep the resume marker
+      // independently of activity so initial/afterJoin cannot consume new work
+      // as a baseline and leave the cached transcript stale forever.
+      if (resumed && (!previous || activity.seq !== previous.seq)) {
+        join("merge", activity.running);
+        return;
+      }
       const rejoin = shouldRejoin(activity, Date.now() - joinEndedAt);
       if (current !== "steady" || !previous) {
         // 服务器在回答、这台却没在跟（刚回到前台、刚打开时那一轮还没开始）：接上。刚接完的不再接（§109），
@@ -358,9 +383,6 @@ export function useConversationSync(
         if (shouldJoin(current, previous, activity) || rejoin) join("merge", true);
         return;
       }
-      if (activity.workers !== previous.workers)
-        void queryClient.invalidateQueries({ queryKey: workerKeys.thread(threadId) });
-      if (activity.inbox !== previous.inbox) void restoreQueue(threadId);
       if (shouldJoin(current, previous, activity) || rejoin) join("merge", activity.running);
     });
     return () => {

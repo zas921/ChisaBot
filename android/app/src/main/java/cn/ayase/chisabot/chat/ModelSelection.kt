@@ -3,7 +3,7 @@ package cn.ayase.chisabot.chat
 import kotlinx.serialization.json.JsonObject
 
 /** Public server projections only; credentials never leave the server. */
-data class ModelOption(val id: String, val label: String, val provider: String) {
+data class ModelOption(val id: String, val label: String, val provider: String, val contextWindow: Long? = null) {
     fun matches(query: String) = query.isBlank() || listOf(id, label, provider).any { it.contains(query.trim(), ignoreCase = true) }
 }
 
@@ -24,7 +24,7 @@ fun parseModelState(o: JsonObject): BotModelState = BotModelState(
 fun parseModelOptions(o: JsonObject): List<ModelOption> = (o.a("models") ?: error("模型列表格式不正确")).mapNotNull { el ->
     val row = el as? JsonObject ?: return@mapNotNull null
     val id = row.s("id")?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
-    ModelOption(id, row.s("label")?.takeIf { it.isNotBlank() } ?: id.substringAfterLast('/'), row.s("providerName") ?: row.s("provider").orEmpty())
+    ModelOption(id, row.s("label")?.takeIf { it.isNotBlank() } ?: id.substringAfterLast('/'), row.s("providerName") ?: row.s("provider").orEmpty(), row.s("contextWindow")?.toLongOrNull()?.takeIf { it > 0 })
 }.distinctBy { it.id }
 
 /** Match the desktop rule: a failed catalog request must never lock the composer. */

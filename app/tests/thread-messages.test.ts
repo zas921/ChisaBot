@@ -303,6 +303,52 @@ describe("thread history retrieval outcomes", () => {
     );
   });
 
+  test("overlapping reads share one request but own independent message objects", async () => {
+    let calls = 0;
+    let complete!: (response: Response) => void;
+    await withFetch(
+      () => {
+        calls++;
+        return new Promise<Response>((resolve) => { complete = resolve; });
+      },
+      async () => {
+        const a = readThreadMessages("shared-thread", "bot-a", { sharePending: true });
+        const b = readThreadMessages("shared-thread", "bot-a", { sharePending: true });
+        expect(calls).toBe(1);
+        complete(Response.json({ messages: [userTurn] }));
+        const [first, second] = await Promise.all([a, b]);
+        first.messages[0]!.content = "changed by SDK";
+        expect(second.messages[0]!.content).toBe(userTurn.content);
+        const refresh = readThreadMessages("shared-thread", "bot-a", { sharePending: true });
+        expect(calls).toBe(2);
+        complete(Response.json({ messages: [] }));
+        expect((await refresh).messages).toEqual([]);
+      },
+    );
+  });
+
+  test("bots, threads and request deadlines never share a pending read", async () => {
+    let calls = 0;
+    const complete: Array<(response: Response) => void> = [];
+    await withFetch(
+      () => {
+        calls++;
+        return new Promise<Response>((resolve) => { complete.push(resolve); });
+      },
+      async () => {
+        const pending = [
+          readThreadMessages("t1", "bot-a", { sharePending: true }),
+          readThreadMessages("t1", "bot-b", { sharePending: true }),
+          readThreadMessages("t2", "bot-a", { sharePending: true }),
+          readThreadMessages("t1", "bot-a", { deadlineMs: 15_000, sharePending: true }),
+        ];
+        expect(calls).toBe(4);
+        for (const resolve of complete) resolve(Response.json({ messages: [] }));
+        await Promise.all(pending);
+      },
+    );
+  });
+
   test.each([
     { name: "missing messages field", body: {} },
     { name: "non-array messages field", body: { messages: { id: "m1" } } },

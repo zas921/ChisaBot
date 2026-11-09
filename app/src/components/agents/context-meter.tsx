@@ -21,7 +21,7 @@ function windowOf(modelId: string | undefined, models: readonly ModelCatalogEntr
 const SOURCE_TEXT: Record<ThreadContextReading["source"], string> = {
   measured: "上次回复时模型返回的实测用量",
   "run-total": "按整轮累计用量折算（含工具步骤，可能偏大）",
-  estimate: "按消息文字估算（不含系统提示与工具定义，可能偏小）",
+  estimate: "按进模型前已自动压缩后的消息估算（不含系统提示与工具定义）",
 };
 
 /**
@@ -176,7 +176,11 @@ export function ContextMeter({
             </p>
             {level !== "ok" ? (
               <div className={cn("context-popover-warn", `is-${level}`)}>
-                <span>{level === "full" ? "上下文快满了，继续聊可能丢失前面的内容。" : "上下文已用了大半，长对话建议开个新话题。"}</span>
+                <span>
+                  {level === "full"
+                    ? "发给模型的上下文快满了；服务器会自动压缩旧轮，仍失败时请开新话题或换更长窗口的模型。"
+                    : "发给模型的上下文已用了大半，长对话建议开个新话题。"}
+                </span>
                 {onNewTopic ? (
                   <button className="context-popover-action" onClick={onNewTopic} type="button">
                     <IconMessagePlus className="size-3.5" />

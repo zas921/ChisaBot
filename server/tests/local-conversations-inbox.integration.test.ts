@@ -5,6 +5,8 @@ import { CopilotKitCore } from "@copilotkit/core";
 import { Observable } from "rxjs";
 import { z } from "zod/v4";
 import { sanitizeSeededHistory } from "../src/agents/history-sanitize";
+import { PERSON_INITIATOR } from "../src/audit";
+import { managedBrowserCommand } from "../src/computer/headless-tools";
 import { createDatabase } from "../src/db/client";
 import { createLocalConversations, type LocalConversationBackend } from "../src/local-conversations";
 import { TEST_POOL, testDatabaseUrl } from "./support/database";
@@ -102,6 +104,172 @@ suite("queued supplements across frontend wire runs", () => {
       counts: () => ({ modelRuns, executions }) };
   }
 
+  test("a managed command continues exactly once after the browser unsubscribes before END", async () => {
+    const threadId = `${owner}-${randomUUID()}`;
+    const runId = randomUUID();
+    const command = { name: "computer_run_command", description: "Probe", parameters: { type: "object" } };
+    const callId = "saved-command";
+    const observedPartial = deferred();
+    const finishArguments = deferred();
+    const serverAnswered = deferred();
+    let modelRuns = 0;
+    let executions = 0;
+    const input: RunAgentInput = {
+      threadId, runId, tools: [command], state: {}, context: [], forwardedProps: {},
+      messages: [{ id: "primary", role: "user", content: "Do the command once" }],
+    };
+    await backend.client.getOrCreateThread({ threadId, userId: owner, agentId: bot });
+    const agent = new class extends AbstractAgent {
+      run(request: RunAgentInput): Observable<BaseEvent> {
+        return new Observable((subscriber) => {
+          void (async () => {
+            modelRuns++;
+            subscriber.next({ type: EventType.RUN_STARTED, threadId, runId });
+            if (modelRuns === 1) {
+              subscriber.next({ type: EventType.TOOL_CALL_START, toolCallId: callId, toolCallName: command.name, parentMessageId: "command" });
+              subscriber.next({ type: EventType.TOOL_CALL_ARGS, toolCallId: callId, delta: '{"command":' });
+              await finishArguments.promise;
+              subscriber.next({ type: EventType.TOOL_CALL_ARGS, toolCallId: callId, delta: '"read report"}' });
+              subscriber.next({ type: EventType.TOOL_CALL_END, toolCallId: callId });
+            } else {
+              expect(request.messages.find((message) => message.role === "tool")).toMatchObject({ toolCallId: callId, content: '{"ok":true}' });
+              subscriber.next({ type: EventType.TEXT_MESSAGE_START, role: "assistant", messageId: "final" });
+              subscriber.next({ type: EventType.TEXT_MESSAGE_CONTENT, messageId: "final", delta: "Managed command complete." });
+              subscriber.next({ type: EventType.TEXT_MESSAGE_END, messageId: "final" });
+              serverAnswered.resolve();
+            }
+            subscriber.next({ type: EventType.RUN_FINISHED, threadId, runId });
+            subscriber.complete();
+          })().catch((error) => subscriber.error(error));
+        });
+      }
+    }({ agentId: bot, threadId });
+    agent.use(managedBrowserCommand(async () => ({
+      definition: command,
+      execute: async (args) => { expect(args).toEqual({ command: "read report" }); executions++; return { ok: true }; },
+    }), PERSON_INITIATOR));
+    const run = backend.runner.run({ threadId, agent, input });
+    const subscription = run.subscribe({
+      next(event) { if (event.type === EventType.TOOL_CALL_ARGS) observedPartial.resolve(); },
+      error(error) { throw error; },
+    });
+    await observedPartial.promise;
+    expect(backend.claimFrontendCommand(threadId, runId, callId)).toBe(false);
+    subscription.unsubscribe();
+    expect(executions).toBe(0);
+    finishArguments.resolve();
+    await serverAnswered.promise;
+    // Reattaching an observer only replays the saved result; it cannot execute the command.
+    const replay = await collect(run);
+    expect(replay.filter((event) => event.type === EventType.TOOL_CALL_RESULT)).toMatchObject([{ toolCallId: callId, content: '{"ok":true}' }]);
+    expect(replay.find((event) => event.type === EventType.TEXT_MESSAGE_CONTENT)).toMatchObject({ delta: "Managed command complete." });
+    expect(backend.control.isActive(threadId)).toBe(false);
+    expect(backend.claimFrontendCommand(threadId, runId, callId)).toBe(false);
+    expect(await unsafe("SELECT status FROM openbot_local_runs WHERE thread_id = $1 AND run_id = $2", [threadId, runId])).toEqual([{ status: "finished" }]);
+    await expect(collect(backend.runner.run({ threadId, agent, input }))).rejects.toThrow("Run ID was already used");
+    expect({ modelRuns, executions }).toEqual({ modelRuns: 2, executions: 1 });
+  });
+
+  test("checkpoints a burst once and replays only the unsnapshotted text before live events", async () => {
+    const threadId = `${owner}-${randomUUID()}`;
+    const runId = randomUUID();
+    const first = Array.from({ length: 24 }, (_, i) => `fragment-${i};`);
+    const live = "final-fragment;";
+    const release = deferred();
+    const burstDurable = deferred();
+    const replayReady = deferred();
+    const input: RunAgentInput = {
+      threadId, runId, tools: [], state: {}, context: [], forwardedProps: {},
+      messages: [{ id: "primary", role: "user", content: "Stream a response" }],
+    };
+    await backend.client.getOrCreateThread({ threadId, userId: owner, agentId: bot });
+    const agent = new class extends AbstractAgent {
+      run(): Observable<BaseEvent> {
+        return new Observable((subscriber) => {
+          subscriber.next({ type: EventType.RUN_STARTED, threadId, runId });
+          subscriber.next({ type: EventType.TEXT_MESSAGE_START, messageId: "streamed", role: "assistant" });
+          for (const delta of first) subscriber.next({ type: EventType.TEXT_MESSAGE_CONTENT, messageId: "streamed", delta });
+          void release.promise.then(() => {
+            subscriber.next({ type: EventType.TEXT_MESSAGE_CONTENT, messageId: "streamed", delta: live });
+            subscriber.next({ type: EventType.TEXT_MESSAGE_END, messageId: "streamed" });
+            subscriber.next({ type: EventType.RUN_FINISHED, threadId, runId });
+            subscriber.complete();
+          });
+        });
+      }
+    }({ agentId: bot, threadId });
+    let snapshotWrites = 0;
+    interceptUnsafe = (...args) => {
+      if (args[0].includes("snapshot_sequence =") && args[1]?.[0] === threadId) snapshotWrites++;
+      return unsafe(...args);
+    };
+    let run: Promise<BaseEvent[]> | undefined;
+    try {
+      const source = backend.runner.run({ threadId, agent, input });
+      run = collect(new Observable((subscriber) => source.subscribe({
+        next(event) {
+          subscriber.next(event);
+          if (event.type === EventType.TEXT_MESSAGE_CONTENT && event.delta === first.at(-1)) burstDurable.resolve();
+        }, error: (error) => subscriber.error(error), complete: () => subscriber.complete(),
+      })));
+      await Promise.race([burstDurable.promise, run.then(() => { throw new Error("Run ended before the burst"); })]);
+      expect(snapshotWrites).toBeLessThan(8);
+      const resumedEvents = backend.runner.connect({ threadId, agentId: bot, agent } as Parameters<typeof backend.runner.connect>[0]);
+      const resumed = collect(new Observable((subscriber) => resumedEvents.subscribe({
+        next(event) {
+          subscriber.next(event);
+          if (event.type === EventType.TEXT_MESSAGE_CONTENT && event.delta === first.at(-1)) replayReady.resolve();
+        }, error: (error) => subscriber.error(error), complete: () => subscriber.complete(),
+      })));
+      await Promise.race([replayReady.promise, resumed.then(() => { throw new Error("Reconnect omitted the durable suffix"); })]);
+      release.resolve();
+      const events = await resumed;
+      await run;
+      const snapshot = events.find((event) => event.type === EventType.MESSAGES_SNAPSHOT);
+      expect(snapshot?.type).toBe(EventType.MESSAGES_SNAPSHOT);
+      const before = snapshot?.type === EventType.MESSAGES_SNAPSHOT
+        ? snapshot.messages.find((message) => message.id === "streamed")?.content ?? ""
+        : "";
+      const deltas = events.flatMap((event) => event.type === EventType.TEXT_MESSAGE_CONTENT ? [event.delta] : []);
+      expect(deltas.filter((delta) => delta === live)).toHaveLength(1);
+      expect(before + deltas.join("")).toBe(first.join("") + live);
+      expect((await backend.client.getThreadMessages({ threadId, userId: owner })).messages.some((message) => message.content === first.join("") + live)).toBe(true);
+    } finally {
+      release.resolve();
+      await run?.catch(() => {});
+      interceptUnsafe = undefined;
+    }
+  });
+
+  test("persists a failure instead of offering a relay when an ended command contains truncated JSON", async () => {
+    const threadId = `${owner}-${randomUUID()}`;
+    const runId = randomUUID();
+    const toolCallId = `truncated-${runId}`;
+    await backend.client.getOrCreateThread({ threadId, userId: owner, agentId: bot });
+    const agent = new class extends AbstractAgent {
+      run(): Observable<BaseEvent> {
+        return new Observable((subscriber) => {
+          subscriber.next({ type: EventType.RUN_STARTED, threadId, runId });
+          subscriber.next({ type: EventType.TOOL_CALL_START, toolCallId, toolCallName: "computer_run_command", parentMessageId: "truncated-command" });
+          subscriber.next({ type: EventType.TOOL_CALL_ARGS, toolCallId, delta: '{"command":"unterminated' });
+          subscriber.next({ type: EventType.TOOL_CALL_END, toolCallId });
+          subscriber.next({ type: EventType.RUN_FINISHED, threadId, runId });
+          subscriber.complete();
+        });
+      }
+    }({ agentId: bot, threadId });
+    const events = await collect(backend.runner.run({ threadId, agent, input: {
+      threadId, runId, state: {}, context: [], forwardedProps: {},
+      messages: [{ id: "primary", role: "user", content: "Run the probe" }],
+      tools: [{ name: "computer_run_command", description: "Probe", parameters: { type: "object" } }],
+    } }));
+    expect(events.filter((event) => event.type === EventType.RUN_FINISHED)).toHaveLength(0);
+    expect(events.find((event) => event.type === EventType.RUN_ERROR)).toMatchObject({ code: "INCOMPLETE_TOOL_CALL" });
+    expect(backend.control.isActive(threadId)).toBe(false);
+    expect(await post(threadId, "frontend-finished", { results: [{ id: "unexpected", role: "tool", toolCallId, content: "never executed" }] })).toEqual({ finished: false });
+    expect(await unsafe("SELECT status FROM openbot_local_runs WHERE thread_id = $1 AND run_id = $2", [threadId, runId])).toEqual([{ status: "error" }]);
+  });
+
   test("early and tool-time supplements wait for the original result; the SDK executes one call", async () => {
     const f = await fixture();
     const turn = f.core.runAgent({ agent: f.agent });
@@ -111,6 +279,14 @@ suite("queued supplements across frontend wire runs", () => {
       f.finishGeneration.resolve();
       await f.toolStarted.promise;
       expect(f.counts()).toEqual({ modelRuns: 1, executions: 1 });
+      const [completedSegment] = await unsafe<{ run_id: string }[]>("SELECT run_id FROM openbot_local_runs WHERE thread_id = $1 AND status = 'finished'", [f.threadId]);
+      expect(completedSegment?.run_id).toBeTruthy();
+      const finishedRunId = completedSegment!.run_id;
+      expect(backend.claimFrontendCommand(f.threadId, "", "probe-call")).toBe(false);
+      expect(backend.claimFrontendCommand(f.threadId, "other-run", "probe-call")).toBe(false);
+      expect(backend.claimFrontendCommand(f.threadId, finishedRunId, "other-call")).toBe(false);
+      expect(backend.claimFrontendCommand(f.threadId, finishedRunId, "probe-call")).toBe(true);
+      expect(backend.claimFrontendCommand(f.threadId, finishedRunId, "probe-call")).toBe(false);
       expect(f.agent.isRunning).toBe(false);
       expect(backend.control.isActive(f.threadId)).toBe(true);
       expect(await backend.runner.isRunning({ threadId: f.threadId })).toBe(true);

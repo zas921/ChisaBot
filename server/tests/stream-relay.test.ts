@@ -1,17 +1,34 @@
 import { describe, expect, test } from "bun:test";
-import { relayToViewer, VIEWER_BUFFER_BUDGET, viewerBuffered, viewerDrained } from "../src/computer/stream-relay";
+import { encodeScreencastFrame } from "../../shared/screencast-frame";
+import {
+  relayToViewer,
+  VIEWER_BUFFER_BUDGET,
+  viewerBuffered,
+  viewerDrained,
+  type WirePayload,
+} from "../src/computer/stream-relay";
 
 /*
  * 2026-10-21 内置浏览器卡顿：Bun 的服务端 socket 没有 bufferedAmount，send 拥塞时排队而不是抛错，
  * 以前的「超过 2 MB 就丢帧」从来没生效。现在超过预算只压住画面帧（只留最新一帧），drain 时补发；
  * 标签、导航、错误、心跳从不丢。
+ * 2026-11-02：画面改为二进制 WebSocket 帧。
  */
 function viewer(buffered: number) {
-  const sent: string[] = [];
-  const ws = { buffered, send: (data: string) => sent.push(data), getBufferedAmount: () => ws.buffered };
+  const sent: WirePayload[] = [];
+  const ws = {
+    buffered,
+    send: (data: WirePayload) => sent.push(data),
+    getBufferedAmount: () => ws.buffered,
+  };
   return { ws, sent };
 }
-const frame = (n: number) => JSON.stringify({ type: "frame", data: `F${n}`, width: 1280, height: 800 });
+const frame = (n: number) =>
+  encodeScreencastFrame({
+    width: 1280,
+    height: 800,
+    jpeg: new Uint8Array([n, 0xff, 0xd8]),
+  });
 
 describe("live screen relay", () => {
   test("reads Bun's getBufferedAmount, not the missing property", () => {
@@ -22,22 +39,26 @@ describe("live screen relay", () => {
   test("an uncongested viewer gets every frame at once", () => {
     const { ws, sent } = viewer(0);
     const state = {};
-    relayToViewer(ws, frame(1), state);
-    relayToViewer(ws, frame(2), state);
-    expect(sent).toEqual([frame(1), frame(2)]);
+    const a = frame(1);
+    const b = frame(2);
+    relayToViewer(ws, a, state);
+    relayToViewer(ws, b, state);
+    expect(sent).toEqual([a, b]);
   });
 
   test("congested: frames are held back, newest wins, sent on drain", () => {
     const { ws, sent } = viewer(VIEWER_BUFFER_BUDGET + 1);
-    const state: { parkedFrame?: string } = {};
-    relayToViewer(ws, frame(1), state);
-    relayToViewer(ws, frame(2), state);
+    const state: { parkedFrame?: WirePayload } = {};
+    const a = frame(1);
+    const b = frame(2);
+    relayToViewer(ws, a, state);
+    relayToViewer(ws, b, state);
     expect(sent).toEqual([]);
     viewerDrained(ws, state); // still congested
     expect(sent).toEqual([]);
     ws.buffered = 0;
     viewerDrained(ws, state);
-    expect(sent).toEqual([frame(2)]);
+    expect(sent).toEqual([b]);
     expect(state.parkedFrame).toBeUndefined();
   });
 
@@ -53,12 +74,22 @@ describe("live screen relay", () => {
 
   test("a newer frame that can go out supersedes the parked one", () => {
     const { ws, sent } = viewer(VIEWER_BUFFER_BUDGET + 1);
-    const state: { parkedFrame?: string } = {};
+    const state: { parkedFrame?: WirePayload } = {};
     relayToViewer(ws, frame(1), state);
     ws.buffered = 0;
-    relayToViewer(ws, frame(2), state);
-    expect(sent).toEqual([frame(2)]);
+    const b = frame(2);
+    relayToViewer(ws, b, state);
+    expect(sent).toEqual([b]);
     viewerDrained(ws, state);
-    expect(sent).toEqual([frame(2)]);
+    expect(sent).toEqual([b]);
+  });
+
+  test("legacy JSON frames are still recognised as frames", () => {
+    const { ws, sent } = viewer(VIEWER_BUFFER_BUDGET + 1);
+    const state: { parkedFrame?: WirePayload } = {};
+    const legacy = JSON.stringify({ type: "frame", data: "x", width: 1, height: 1 });
+    relayToViewer(ws, legacy, state);
+    expect(sent).toEqual([]);
+    expect(state.parkedFrame).toBe(legacy);
   });
 });

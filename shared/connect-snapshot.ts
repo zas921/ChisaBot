@@ -53,18 +53,23 @@ export function capConnectMessages<
       : [...messages];
   let dropped = messages.length - kept.length;
 
-  const sizeOf = (list: readonly T[]) => {
-    try {
-      return JSON.stringify(list).length;
-    } catch {
-      // 不可序列化时退回条数限制（已经做过）。
-      return 0;
+  // Measure each retained message once, from the tail. Re-stringifying the whole shrinking
+  // array is quadratic: reconnecting a 10 MB transcript can monopolize the server event loop
+  // and starve unrelated bot leases and database response handling.
+  try {
+    let size = 2; // JSON array brackets; preserve the existing UTF-16 budget semantics.
+    let start = kept.length;
+    for (let i = kept.length - 1; i >= 0; i--) {
+      const encoded = JSON.stringify(kept[i]);
+      const next = (encoded ?? "null").length + (start < kept.length ? 1 : 0);
+      if (start < kept.length && size + next > maxJsonBytes) break;
+      size += next;
+      start = i;
     }
-  };
-
-  while (kept.length > 1 && sizeOf(kept) > maxJsonBytes) {
-    kept = kept.slice(1);
-    dropped += 1;
+    dropped += start;
+    kept = kept.slice(start);
+  } catch {
+    // 不可序列化时退回条数限制（已经做过）。
   }
 
   // 单条就超限：仍带这一条（否则连接空白），由调用方日志告警。

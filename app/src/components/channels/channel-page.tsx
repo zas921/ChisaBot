@@ -22,6 +22,7 @@ import { markChannelReadMutationOptions } from "@/lib/channels/mutations";
 import { useOpenThread } from "@/lib/channels/open-thread";
 import {
   type AgentChannel,
+  ChannelReadError,
   channelFromRoster,
   channelListQueryOptions,
   channelQueryOptions,
@@ -85,7 +86,7 @@ export function ChannelPage({
    * Channel routing currently supports one coworker. 刷新时对话详情还没读到：先用这台设备记下的「这段对话是哪个
    * 机器人的」（DESIGN.md §88），右栏第一帧就画对。
    */
-  const agentId = channel.data?.agentIds[0] ?? threadUi(channelId)?.agent;
+  const agentId = channel.data?.agentIds[0] ?? channelFromRoster(queryClient, channelId)?.agentIds[0] ?? threadUi(channelId)?.agent;
   useEffect(() => {
     const id = channel.data?.agentIds[0];
     if (id && threadUi(channelId)?.agent !== id)
@@ -103,6 +104,20 @@ export function ChannelPage({
    */
   const roster = useInfiniteQuery(channelListQueryOptions());
   const summary = roster.data?.find((row) => row.id === channelId);
+  // A failed background read can coexist with valid cached data. React Query drops placeholder
+  // data on errors, so the live roster also supplies its own matching fallback.
+  const readableChannel = channel.data?.id === channelId
+    ? channel.data
+    : channelFromRoster(queryClient, channelId);
+  const recoveryAttempt = useRef<string | null>(null);
+  useEffect(() => {
+    if (!visible || !channel.isError || channel.isFetching) return;
+    const attempt = `${channelId}:${epoch}`;
+    if (recoveryAttempt.current === attempt) return;
+    recoveryAttempt.current = attempt;
+    void channel.refetch({ cancelRefetch: false });
+  }, [visible, epoch, channelId, channel.isError, channel.isFetching, channel.refetch]);
+  const retry = () => void channel.refetch({ cancelRefetch: false });
 
   /*
    * Opening the channel marks it read; the Bot replying while it is open marks it read again.
@@ -177,9 +192,9 @@ export function ChannelPage({
             computerOpen={isWatching}
             onComputerChange={setWatching}
             onDeleteThread={
-              agentId && channel.data?.threadId
+              agentId && readableChannel?.threadId
                 ? () => {
-                    const threadId = channel.data!.threadId!;
+                    const threadId = readableChannel!.threadId;
                     void (async () => {
                       const result = await deleteBotThread(threadId);
                       if (result === "busy") {
@@ -221,7 +236,7 @@ export function ChannelPage({
         {agentId ? (
           <LazyBotThreadHistoryDialog
             agentId={agentId}
-            currentThreadId={channel.data?.threadId}
+            currentThreadId={readableChannel?.threadId}
             onDeletedCurrent={() =>
               void navigate({
                 to: "/channel/new",
@@ -233,13 +248,21 @@ export function ChannelPage({
             open={historyOpen}
           />
         ) : null}
-        {agentId && channel.data?.agentIds.length === 1 ? (
+        {agentId && readableChannel?.agentIds.length === 1 ? (
           <BotPausedBanner agentId={agentId} />
         ) : null}
+        {channel.isError && readableChannel ? (
+          <div className="flex items-center gap-2 px-4 py-2 text-xs text-muted-foreground" role="status">
+            <span>{"会话更新暂时失败，已保留当前内容。"}</span>
+            <Button size="sm" variant="ghost" disabled={channel.isFetching} onClick={retry}>{"重试"}</Button>
+          </div>
+        ) : null}
         <ChannelBody
-          channel={channel.data}
+          channel={readableChannel}
           isPending={channel.isPending}
-          hasError={Boolean(channel.error)}
+          missing={channel.error instanceof ChannelReadError && channel.error.status === 404}
+          retrying={channel.isFetching}
+          onRetry={retry}
         />
       </DetailPanel>
     </div>
@@ -253,32 +276,41 @@ export function ChannelPage({
 function ChannelBody({
   channel,
   isPending,
-  hasError,
+  missing,
+  retrying,
+  onRetry,
 }: {
   channel: AgentChannel | undefined;
   isPending: boolean;
-  hasError: boolean;
+  missing: boolean;
+  retrying: boolean;
+  onRetry: () => void;
 }) {
   // Nothing while the channel loads: a placeholder inside a local round-trip is a flicker.
-  if (isPending) return null;
-  if (hasError || !channel) {
+  if (isPending && !channel) return null;
+  if (!channel) {
     return (
       // 旧链接 / 删掉的对话：一张错误卡和出路（DESIGN.md §71.3），不是左上角一行红字。
       <div className="mx-auto w-full max-w-[520px] p-6 pt-16">
         <ErrorCard
           action={
-            <Button
-              className="mt-2"
-              nativeButton={false}
-              render={<Link to="/" />}
-              size="sm"
-              variant="outline"
-            >
-              {"回到聊天"}
-            </Button>
+            <div className="flex gap-2">
+              <Button className="mt-2" size="sm" disabled={retrying} onClick={onRetry}>
+                {retrying ? "正在重试…" : "重试"}
+              </Button>
+              <Button
+                className="mt-2"
+                nativeButton={false}
+                render={<Link to="/" />}
+                size="sm"
+                variant="outline"
+              >
+                {"回到聊天"}
+              </Button>
+            </div>
           }
-          description={"可能已经删掉了，或者这个链接不是你账号里的对话。"}
-          title={"找不到这段对话"}
+          description={missing ? "可能已经删掉了，或者这个链接不是你账号里的对话。" : "请检查连接后重试，已有对话不会因此丢失。"}
+          title={missing ? "找不到这段对话" : "会话暂时没有加载出来"}
         />
       </div>
     );

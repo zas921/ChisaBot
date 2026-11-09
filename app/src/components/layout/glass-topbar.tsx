@@ -1,7 +1,6 @@
 import {
   IconLayoutSidebarLeftCollapse,
   IconLayoutSidebarLeftExpand,
-  IconMenu2,
 } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
 import type { ReactElement } from "react";
@@ -12,6 +11,7 @@ import { currentUserQueryOptions } from "@/lib/auth/queries";
 import { canCompact, type DesktopWindowBridge, useDesktopWindow } from "@/lib/desktop-window";
 import { PROTO_PREVIEW } from "@/lib/proto-preview";
 import { cn } from "@/lib/utils";
+import "./sidebar-toggle.css";
 
 
 export function initialsOf(name: string | null | undefined, email: string | undefined) {
@@ -59,10 +59,9 @@ export function GlassTopBar({ scope = "app" }: { scope?: ShellScope }) {
   const sidebar = useOptionalSidebar();
   const mobile = Boolean(sidebar?.isMobile);
   const desktop = useDesktopWindow();
-  const drawerLabel = scope === "app" ? "机器人列表" : scope === "settings" ? "设置分区" : "管理导航";
   return (
     <header
-      className="glass-topbar"
+      className={cn("glass-topbar", sidebar && "glass-topbar-with-menu-toggle")}
       data-scope={scope}
       // PC 无边框窗口：空白处双击 = 最大化 / 还原（拖动由 -webkit-app-region 交给系统）。
       onDoubleClick={
@@ -75,16 +74,7 @@ export function GlassTopBar({ scope = "app" }: { scope?: ShellScope }) {
       }
     >
       <div className="glass-topbar-start">
-        {mobile ? (
-          <button
-            aria-label={`打开${drawerLabel}`}
-            className="glass-icon-btn glass-menu-btn"
-            onClick={() => sidebar?.setOpenMobile(true)}
-            type="button"
-          >
-            <IconMenu2 className="glass-icon-btn-ico" />
-          </button>
-        ) : (
+        {mobile ? null : (
           <span className="glass-brand">
             <BrandMark />
             {PROTO_PREVIEW ? (
@@ -94,7 +84,7 @@ export function GlassTopBar({ scope = "app" }: { scope?: ShellScope }) {
             ) : null}
           </span>
         )}
-        {sidebar && !mobile ? <RosterToggle scope={scope} /> : null}
+        {sidebar ? <RosterToggle scope={scope} /> : null}
       </div>
       {/* 中间留空（网格占位，保持左右两区位置不变）。 */}
       <span aria-hidden className="glass-topbar-mid" />
@@ -206,25 +196,28 @@ export function ToggleTip({
   );
 }
 
-/** Left roster: collapses to the slim avatar rail (Ctrl+B is the primitive's own shortcut). */
-function RosterToggle({ scope }: { scope: ShellScope }) {
+/** Always outside the sidebar, so a saved collapsed preference still has a visible way back. */
+export function RosterToggle({ scope }: { scope: ShellScope }) {
   const sidebar = useOptionalSidebar();
   if (!sidebar) return null;
-  const open = sidebar.open;
+  const open = sidebar.isMobile ? sidebar.openMobile : sidebar.open;
   const what = scope === "app" ? "机器人列表" : scope === "settings" ? "设置分区" : "管理导航";
-  const label = open ? `收起${what}` : `展开${what}`;
+  const label = open ? "折叠菜单" : "展开菜单";
+  const description = open ? `收起${what}` : `展开${what}`;
   const Icon = open ? IconLayoutSidebarLeftCollapse : IconLayoutSidebarLeftExpand;
   return (
-    <ToggleTip keys={MOD_LABEL} label={label}>
+    <ToggleTip keys={sidebar.isMobile ? undefined : MOD_LABEL} label={description}>
       <button
         aria-controls={ROSTER_ID}
         aria-expanded={open}
         aria-label={label}
-        className="glass-ghost-btn glass-roster-toggle"
+        className="glass-menu-toggle glass-roster-toggle"
+        data-sidebar-menu-toggle=""
         onClick={sidebar.toggleSidebar}
         type="button"
       >
-        <Icon className="glass-ghost-btn-ico" key={open ? "open" : "closed"} />
+        <Icon aria-hidden className="glass-menu-toggle-icon" />
+        <span>{label}</span>
       </button>
     </ToggleTip>
   );

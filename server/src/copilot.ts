@@ -13,6 +13,7 @@ import type { Observable } from "rxjs";
 import { defer, finalize, from, fromEvent, switchMap, takeUntil } from "rxjs";
 import { z } from "zod";
 import { currentGoalContinuation, goalContinuationModel } from "./agents/goal-context";
+import { videoInspectionModel } from "./video-production/inspection-content";
 import {
   ACTION_GUIDANCE,
   botIdentityGuidance,
@@ -38,6 +39,7 @@ import type { AgentActor } from "./agents/profile-types";
 import { modelOverrideFromValue, runOptionsFromValue } from "./agents/model-selection";
 import type { AgentRunOptions } from "../../shared/model-selection";
 import { thinkTagLanguageModel } from "./agents/think-tags";
+import { statelessGatewayResponsesLanguageModel } from "./agents/gateway-responses";
 import { currentConfirmTurn, currentToolAbort, TOOL_STOPPED_ZH, withConfirmToolCall } from "./confirmations/context";
 import { fallbackCandidates, fallbackLanguageModel, modelCooldownScope } from "./agents/model-fallback";
 import {
@@ -270,7 +272,7 @@ function openAiLanguageModel(
 ) {
   const provider = createOpenAI(options);
   return requiresResponsesApi(modelId)
-    ? provider.responses(modelId)
+    ? statelessGatewayResponsesLanguageModel(provider.responses(modelId), modelId)
     : provider.chat(modelId);
 }
 
@@ -285,9 +287,10 @@ export function setModelFallbackList(list: () => Promise<string[]>): void {
   fallbackConfigured = list;
 }
 /** 聊天回合用的模型：额度用完（429 等）时自动换同平台的其它模型重发（DESIGN.md §60）。 */
-export function fallbackConnectionModel(model: RuntimeModel, apiKey: string | null) {
+// 仅系统自检/辅助调用可省略 botId；BOT 调用必须传入 agent.id。
+export function fallbackConnectionModel(model: RuntimeModel, apiKey: string | null, botId?: string) {
   return fallbackLanguageModel(connectionLanguageModel(model, apiKey), model.defaultModel, {
-    cooldownScope: modelCooldownScope(model, apiKey),
+    cooldownScope: JSON.stringify([modelCooldownScope(model, apiKey), botId ?? null]),
     candidates: fallbackCandidates(() => fallbackCatalog(), process.env, () => fallbackConfigured()),
     build: (id) => connectionLanguageModel({ ...model, defaultModel: id }, apiKey),
   });
@@ -622,10 +625,10 @@ export function builtInAgentConfiguration(
     // 每一步开始前看收件箱：机器人回答期间用户又发来的话、后台任务的结果在步与步之间读进去（thread-inbox.ts）。
     // 计划模型（PlanModel）自己转发整段对话，不插话；它照样能吃到段与段之间读进来的消息。
     model: planModel
-      ? goalContinuationModel(planModel)
-      : model.baseUrl || model.useApiKey === false || model.reasoningEffort != null || model.fastMode !== undefined || currentGoalContinuation()
+      ? videoInspectionModel(goalContinuationModel(planModel))
+      : model.baseUrl || model.useApiKey === false || model.reasoningEffort != null || model.fastMode !== undefined || currentGoalContinuation() || allTools.some((tool) => tool.name === "video_project_inspect")
         ? // 每一步的用量记到当前运行的计量器（输入框的「上下文」读数，context-usage.ts）。
-          steerLanguageModel(goalContinuationModel(meterLanguageModel(fallbackConnectionModel(model, apiKey), { botId: agent.id })))
+          steerLanguageModel(goalContinuationModel(videoInspectionModel(meterLanguageModel(fallbackConnectionModel(model, apiKey, agent.id), { botId: agent.id }))))
         : `${model.provider}/${model.defaultModel}`,
     /*
      * The package's role, then the person's own standing instructions, then what this Bot actually

@@ -105,6 +105,7 @@ function ChatStage({ pathname }: { pathname: string }) {
       address={address}
       idleVisible={(kept) => pathname === "/" && landingChannel === kept.channelId}
       keyOf={chatKey}
+      maxIdlePages={5}
       working={working}
       renderKept={(kept, { visible, epoch }) => (
         <ChannelPage

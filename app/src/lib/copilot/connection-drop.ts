@@ -1,3 +1,5 @@
+import { tryClient } from "@/lib/client";
+
 /**
  * 这一轮的流在浏览器这头断了，而不是模型出错（DESIGN.md §89，2026-10-16「模型老断」）。
  *
@@ -73,6 +75,98 @@ export const SEND_REPLY_WATCHDOG_MS = 180_000;
 
 export const SEND_REPLY_WAITING_NOTICE =
   "模型还没有返回内容，服务器仍在处理。可以继续等待，或点「停止」。";
+
+export const SEND_RECEIPT_WAITING_NOTICE =
+  "正在确认服务器是否已接收这句消息，无需重复发送。可以继续等待，或点「停止」。";
+export const SEND_RECEIPT_UNKNOWN_NOTICE =
+  "暂时无法确认服务器状态，正在重新确认。请勿重复发送；可以点「停止」。";
+
+export type SendReceipt = {
+  received: true | null;
+  running: boolean;
+  persisted: boolean;
+  runId: string | null;
+};
+
+/** Small identity-only acknowledgement. Missing history is never evidence of a rejected send. */
+export async function readSendReceipt(threadId: string, agentId: string, messageId: string): Promise<SendReceipt | null> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const read = async (): Promise<SendReceipt | null> => {
+      const response = await tryClient(
+        `/api/copilotkit/threads/${encodeURIComponent(threadId)}/send-status?agentId=${encodeURIComponent(agentId)}&messageId=${encodeURIComponent(messageId)}`,
+        { signal: controller.signal, timeoutMs: 5_000 },
+      );
+      if (!response.ok || !(response.headers.get("content-type") ?? "").includes("json")) return null;
+      const value: unknown = await response.json();
+      if (!value || typeof value !== "object") return null;
+      const body = value as Record<string, unknown>;
+      if (body.threadId !== threadId || body.messageId !== messageId || typeof body.running !== "boolean") return null;
+      return {
+        received: body.received === true ? true : null,
+        running: body.running,
+        persisted: body.persisted === true,
+        runId: typeof body.runId === "string" ? body.runId : null,
+      };
+    };
+    return await Promise.race([
+      read(),
+      new Promise<null>((resolve) => {
+        timer = setTimeout(() => { controller.abort(); resolve(null); }, 5_000);
+      }),
+    ]);
+  } catch {
+    return null;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/** A pending HTTP request may arrive later. Only a positive receipt or a settled run ends this wait. */
+export function waitForSendReceipt<T>(
+  run: Promise<T>,
+  deps: {
+    probe: () => Promise<SendReceipt | null>;
+    afterMs: (ms: number) => Promise<void>;
+    stopped: () => boolean;
+    onPending?: (notice: string | null) => void;
+    now?: () => number;
+    probeMs?: number;
+  },
+): Promise<{ kind: "received"; receipt: SendReceipt } | { kind: "done" | "stopped" }> {
+  const now = deps.now ?? Date.now;
+  return new Promise((resolve) => {
+    let settled = false;
+    let probing = false;
+    let nextProbeAt = 0;
+    const finish = (value: { kind: "received"; receipt: SendReceipt } | { kind: "done" | "stopped" }) => {
+      if (settled) return;
+      settled = true;
+      deps.onPending?.(null);
+      resolve(value);
+    };
+    void run.then(() => finish({ kind: "done" }), () => finish({ kind: "done" }));
+    deps.onPending?.(SEND_RECEIPT_WAITING_NOTICE);
+    const watch = async () => {
+      while (!settled) {
+        if (deps.stopped()) return finish({ kind: "stopped" });
+        if (!probing && now() >= nextProbeAt) {
+          probing = true;
+          void Promise.resolve().then(deps.probe).catch(() => null).then((receipt) => {
+            probing = false;
+            if (settled || deps.stopped()) return;
+            if (receipt?.received === true) return finish({ kind: "received", receipt });
+            deps.onPending?.(receipt ? SEND_RECEIPT_WAITING_NOTICE : SEND_RECEIPT_UNKNOWN_NOTICE);
+            nextProbeAt = now() + (deps.probeMs ?? 5_000);
+          });
+        }
+        await deps.afterMs(SEND_WATCHDOG_POLL_MS);
+      }
+    };
+    void watch();
+  });
+}
 
 export type ReplyWaitOutcome =
   | "done"
@@ -214,7 +308,8 @@ export function raceSendWatchdog<T>(
  *
  * Guarantees the UI never treats a timed-out / unpersisted send as success:
  * - first race done → proceed (run settled; error path owns failures)
- * - first timeout + not persisted → hang (message likely never left; restore draft)
+ * - first timeout + missing/unknown persist → confirm with the acknowledgement endpoint
+ * - only an explicit rejection proves the send did not happen
  * - first timeout + persisted + reply timeout → reply_hang (sent, but answer stuck)
  * - first timeout + persisted + reply done → proceed
  *
@@ -222,6 +317,7 @@ export function raceSendWatchdog<T>(
  */
 export type SendWatchdogDecision =
   | { kind: "proceed" }
+  | { kind: "confirm" }
   | {
       kind: "hang";
       reason: typeof SEND_HANG_REASON;
@@ -237,11 +333,14 @@ export function decideSendWatchdogAction(input: {
   firstRace: "done" | "timeout";
   /** Whether the optimistic user message id is in the server thread. null = check failed. */
   persisted: boolean | null;
+  /** An explicit request rejection, never inferred from missing/stale/unavailable history. */
+  rejected?: boolean;
   replyRace?: "done" | "timeout";
 }): SendWatchdogDecision {
   if (input.firstRace === "done") return { kind: "proceed" };
-  // Timeout without a confirmed persist = fake-success risk. Treat null like not persisted.
+  // A snapshot can predate acceptance; a failed full-history read proves even less.
   if (input.persisted !== true) {
+    if (!input.rejected) return { kind: "confirm" };
     return {
       kind: "hang",
       reason: SEND_HANG_REASON,

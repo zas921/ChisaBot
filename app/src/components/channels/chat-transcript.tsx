@@ -81,7 +81,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { attachmentUrl } from "@/lib/channels/attachments";
 import { readResponsibilityTurn } from "@/lib/channels/responsibility-turn";
 import { readFiring } from "@/lib/channels/routine-firing";
-import { contentGap, nextBlankHeight } from "@/lib/chat/blank-release";
+import { nextBlankHeight } from "@/lib/chat/blank-release";
 import { friendlyError, UNANSWERED_TURN_REASON } from "@/lib/chat/friendly-error";
 import { supersededPageCalls } from "@/lib/chat/page-cards";
 import {
@@ -1159,31 +1159,15 @@ function SettleAtEnd({
         lastHeight = content.offsetHeight;
       }
       look();
-      /*
-       * 留白整个在视口下面（人往上翻了）：收掉，看得见的东西一点都不动。滚动容器的 spacer 也是：
-       * 它只在「对齐某一轮 / 回到底部」时才重算，人翻走成 free-scrolling 后没人再管它。
-       */
-      {
-        const spacer = content.querySelector<HTMLElement>(
-          "[data-message-scroller-spacer]",
-        );
-        const spacerPx = spacer && !spacer.hidden ? spacer.offsetHeight : 0;
-        const blank = s.slack + spacerPx;
-        if (
-          blank > 0 &&
-          element.scrollTop + element.clientHeight <
-            element.scrollHeight - blank - 1
-        ) {
-          if (spacer && spacerPx > 0) {
-            spacer.hidden = true;
-            spacer.style.height = "0px";
-            spacer.style.marginTop = "";
-          }
-          setSlack(0);
-          lastHeight = content.offsetHeight;
-        }
+      // 留白整个在视口下面（人往上翻了）：收掉，看得见的东西一点都不动。
+      if (
+        s.slack > 0 &&
+        element.scrollTop + element.clientHeight <
+          element.scrollHeight - s.slack - 1
+      ) {
+        setSlack(0);
+        lastHeight = content.offsetHeight;
       }
-      releaseRef.current?.();
       save();
     };
     /*
@@ -1248,7 +1232,6 @@ function SettleAtEnd({
       write();
     };
     let releaseFrame = 0;
-    let touchedRetry = 0;
     releaseRef.current = () => {
       const why = (reason: string) => {
         element.dataset.cbRelease = reason;
@@ -1258,27 +1241,15 @@ function SettleAtEnd({
         return why(
           `skip:${s.busy ? "busy" : s.releasing ? "releasing" : s.restore ? "restore" : "settling"}`,
         );
+      if (performance.now() - touchedAt < 400) return why("touched");
+      const gap =
+        element.scrollHeight - element.scrollTop - element.clientHeight;
+      if (gap > 4) return why(`gap:${Math.round(gap)}`); // 人不在底部：留白在视口外，§88.1 自己会收
       const spacer = content.querySelector<HTMLElement>(
         "[data-message-scroller-spacer]",
       );
       const spacerHeight = spacer && !spacer.hidden ? spacer.offsetHeight : 0;
       const total = spacerHeight + s.slack;
-      if (performance.now() - touchedAt < 400) {
-        window.clearTimeout(touchedRetry);
-        touchedRetry = window.setTimeout(() => releaseRef.current?.(), 420);
-        return why("touched");
-      }
-      /*
-       * 离真正的内容末尾多远：两块留白（spacer / slack）自己不算距离。对齐到视口 1/3 的那一轮底下
-       * 一定留着 spacer，把它算进 gap 就永远 >4，收空白就永远不发生。
-       */
-      const gap = contentGap(
-        element.scrollHeight,
-        element.scrollTop,
-        element.clientHeight,
-        total,
-      );
-      if (gap > 4) return why(`gap:${Math.round(gap)}`);
       if (total <= 1) return why("none");
       s.releasing = true;
       element.dataset.cbRelease = `release:${Math.round(total)}`;
@@ -1380,7 +1351,6 @@ function SettleAtEnd({
     return () => {
       if (s.floor !== null) setSlack(s.slack);
       if (saveTimer !== null) clearTimeout(saveTimer);
-      window.clearTimeout(touchedRetry);
       window.cancelAnimationFrame(releaseFrame);
       releaseRef.current = null;
       s.releasing = false;

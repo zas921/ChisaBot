@@ -21,6 +21,7 @@ import {
   transcriptMessages,
 } from "@/components/channels/transcript-messages";
 import { PermissionChip } from "@/components/chat/permission-chip";
+import { ThreadWorkerProgress } from "@/components/chat/thread-worker-progress";
 import { HandoffResumeNotice } from "@/components/computer/handoff-resume-notice";
 import { useAsyncAction } from "@/components/ui/async-action";
 import { Button } from "@/components/ui/button";
@@ -44,21 +45,28 @@ import { readSync } from "@/lib/copilot/bot-thread";
 import { reportChatRunning } from "@/lib/copilot/computer-activity";
 import {
   CONNECTION_LOST_REASON,
-  decideSendWatchdogAction,
   forceUnlockThread,
   isConnectionDrop,
   raceSendWatchdog,
+  readSendReceipt,
   reportBudgetEvent,
   SEND_REPLY_WAITING_NOTICE,
+  SEND_RECEIPT_UNKNOWN_NOTICE,
   SEND_UNREACHABLE_REASON,
   SEND_WATCHDOG_MS,
   settleDroppedTurn,
   storedTurnAnswered,
   waitForPersistedReply,
+  waitForSendReceipt,
   pingRelayAlive,
   RELAY_ALIVE_INTERVAL_MS,
 } from "@/lib/copilot/connection-drop";
 import { runContinuingAgent } from "@/lib/copilot/continue-agent";
+import {
+  guardFrontendToolDispatch,
+  INCOMPLETE_FRONTEND_TOOL_REASON,
+  INVALID_FRONTEND_TOOL_REASON,
+} from "@/lib/copilot/frontend-tool-dispatch-guard";
 import { ConversationProvider } from "@/lib/copilot/conversation";
 import { frontendToolProgressAt } from "@/lib/copilot/frontend-tool-activity";
 import { afterMs, joinWithin } from "@/lib/copilot/join-thread";
@@ -90,6 +98,7 @@ import {
 } from "@/lib/copilot/thread-messages";
 import {
   cachedTranscript,
+  forgetTranscript,
   rememberTranscript,
 } from "@/lib/copilot/transcript-cache";
 import {
@@ -107,7 +116,7 @@ import {
 import { useConversationSync } from "@/lib/copilot/use-conversation-sync";
 import { useThreadInbox } from "@/lib/copilot/use-thread-inbox";
 import { readImageDims } from "@/lib/image-dims";
-import { useKeptHeld, useMarkChatWorking } from "@/lib/kept-visible";
+import { useKeptHeld, useKeptVisible, useMarkChatWorking } from "@/lib/kept-visible";
 import { useModelSelectionSaving } from "@/lib/model-selection/hooks";
 import { assertModelSelectionNotSaving } from "@/lib/model-selection/mutations";
 import { agentModelQueryOptions, modelCatalogQueryOptions } from "@/lib/model-selection/queries";
@@ -127,6 +136,7 @@ const JOIN_DEADLINE_MS = 1500;
 
 /** 服务器说在回答、事件序号却这么久没动、最后一步还没有结果：当成没人在执行那一步（DESIGN.md §109）。 */
 const STALLED_RELAY_MS = 30_000;
+const ACCEPTED_RUN_PROGRESS_UNKNOWN = "消息已送达。暂时无法读取进度，连接恢复后会同步。";
 
 /**
  * Backstop for a message typed before the runtime agent exists; it must not be discarded.
@@ -450,7 +460,7 @@ export function ChannelChat({
   if (earlyRead.current === undefined) {
     earlyRead.current =
       seed === null
-        ? readThreadMessages(channel.threadId, runtimeAgentId)
+        ? readThreadMessages(channel.threadId, runtimeAgentId, { sharePending: true })
         : null;
   }
   /** 打开时那次读存储读到了：接入之后不用为「最后一句是机器人说的」再读一遍。 */
@@ -491,6 +501,7 @@ export function ChannelChat({
    * sync 不得再开 connect（否则会和即将发出的 `/run` 抢 agent，超大回放时主线程卡住）。
    */
   const sendInFlightRef = useRef(false);
+  const onScreen = useKeptVisible();
 
   /** Promise gate so messages typed before runtime readiness wait instead of being discarded. */
   const openReadyGate = useRef<() => void>(() => {});
@@ -533,6 +544,10 @@ export function ChannelChat({
   const [historyReadFailed, setHistoryReadFailed] = useState(false);
   // Mount reads and Bot refreshes share one ordering: only the newest read owns the notice.
   const historyReadVersion = useRef(0);
+  // If both network restore paths fail, retain the last readable transcript.
+  // A successful retry may replace this exact fallback, including with an empty
+  // transcript after a remote truncate, until a local/live update has changed it.
+  const historyFallback = useRef<string | null>(null);
   /** 首次读取失败后正在后台重试：这期间不提示，空会话继续显示骨架。 */
   const [retryingHistory, setRetryingHistory] = useState(false);
   /**
@@ -547,8 +562,12 @@ export function ChannelChat({
     if (version !== historyReadVersion.current) return false;
     if (stored.availability === "unavailable") return false;
     const current = agentRef.current;
-    const messages = mergeStoredMessages(current.messages, stored.messages);
+    const messages = historyFallback.current !== null && JSON.stringify(current.messages) === historyFallback.current
+      ? stored.messages
+      : mergeStoredMessages(current.messages, stored.messages);
+    historyFallback.current = null;
     if (messages !== current.messages) current.setMessages(messages);
+    if (messages.length === 0) forgetTranscript(channel.threadId);
     setUnreadable(stored.unreadable);
     setHistoryAvailability("ready");
     setHistoryReadFailed(false);
@@ -591,8 +610,13 @@ export function ChannelChat({
         if (isCurrent) {
           // The gateway snapshot can lag the store. Keep its valid local rows even when the
           // corresponding stored row is unreadable, while restoring other readable additions.
-          const messages = mergeStoredMessages(agent.messages, stored.messages);
+          const messages = stored.availability === "unavailable" && !agent.messages.length && cached?.length
+            ? structuredClone([...cached])
+            : mergeStoredMessages(agent.messages, stored.messages);
+          const usedFallback = stored.availability === "unavailable" && !agent.messages.length;
           if (messages !== agent.messages) agent.setMessages(messages);
+          historyFallback.current = usedFallback ? JSON.stringify(agent.messages) : null;
+          if (stored.availability === "ready" && messages.length === 0) forgetTranscript(channel.threadId);
         }
         /*
          * Said on screen rather than only counted. A turn the history store holds and this app cannot
@@ -629,7 +653,7 @@ export function ChannelChat({
         // never coming.
         if (current) setRestoring(false);
         // Release even on join/restore failure; the gate orders messages, not withholds them.
-        openJoinGate.current();
+        if (current) openJoinGate.current();
       }
     })();
 
@@ -643,6 +667,7 @@ export function ChannelChat({
     channel.threadId,
     runtimeAgentId,
     retryHistoryRead,
+    cached,
   ]);
 
   /*
@@ -690,6 +715,7 @@ export function ChannelChat({
     onJoinedActivity,
     {
       liveTail: true,
+      visible: onScreen,
       suppressConnect: suppressConnectDuringSend,
     },
   );
@@ -867,8 +893,11 @@ export function ChannelChat({
     const threadId = channel.threadId;
     // 恢复没完成就离开：手里只有回放的一部分，不记（下次会先画出半截）。
     return () => {
-      if (restoredRef.current)
-        rememberTranscript(threadId, agentRef.current.messages);
+      if (restoredRef.current) {
+        const messages = agentRef.current.messages;
+        if (messages.length > 0) rememberTranscript(threadId, messages);
+        else forgetTranscript(threadId);
+      }
     };
   }, [channel.threadId]);
 
@@ -884,6 +913,7 @@ export function ChannelChat({
   // Run failures arrive as events and are reported only for turns started in this mount.
   const [runError, setRunError] = useState<string | null>(null);
   const [waitingForModel, setWaitingForModel] = useState(false);
+  const [sendReceiptNotice, setSendReceiptNotice] = useState<string | null>(null);
   const replyWaitAbort = useRef<AbortController | null>(null);
   /** 服务器说这一轮还在、却停在一步没人执行的浏览器操作上（§109）：给「停止」，并说清原因。 */
   const [relayStalled, setRelayStalled] = useState(false);
@@ -905,11 +935,12 @@ export function ChannelChat({
    * `Error: signal is aborted without reason`，这一轮以「运行命令 这一步出错」收尾（2026-10-20 真机）。
    *
    * 现在看门狗看的是**静默**：模型在写、工具在跑、工具结果在回来，都刷新这个时刻；真的什么都没动满
-   * 12 秒（首段）查消息是否落库，180 秒静默只探测后台，仍运行就等到最终上限。
+   * 12 秒（首段）用轻量接口确认接收，180 秒静默只探测后台；仍运行就继续等待。
    */
   const runProgressAt = useRef(0);
   const noteRunProgress = useRef(() => {
     runProgressAt.current = Date.now();
+    if (mountedRef.current) setSendReceiptNotice(null);
   });
   /**
    * WHY THIS TURN ENDED WITHOUT AN ANSWER, KEPT WHERE `deliver` CAN STILL SEE IT — because the one
@@ -942,7 +973,7 @@ export function ChannelChat({
    */
   const turnFailure = useRef<string | null>(null);
   /** 这一轮的流在浏览器这头断了（不是模型出错，DESIGN.md §89）：先不报，run 结束后问服务器这一轮怎样了。 */
-  const connectionDropped = useRef(false);
+  const connectionDropped = useRef<boolean | "incomplete-tool">(false);
   const assistantMessagesBeforeRun = useRef<Set<string>>(new Set());
   const lastReportedReply = useRef<string | null>(null);
 
@@ -1044,6 +1075,7 @@ export function ChannelChat({
 
     setRunError(null);
     setWaitingForModel(false);
+    setSendReceiptNotice(null);
     setRelayStalled(false);
     forgetTurnOutcome(channel.threadId);
     turnFailure.current = null;
@@ -1111,9 +1143,17 @@ export function ChannelChat({
      * 浏览器工具：命令一结束、模型再写十几秒就被当成挂住停掉（2026-10-22 生产两次「莫名停止」，都是
      * 命令结束后整 12 秒发出 stop）。组件已经不在时出的错也在这里记下原因，切回来能看到为什么停。
      */
+    let expectedRunId: string | undefined;
+    let wireRunAccepted = false;
+    let acceptedDrop = false;
+    const markReadFailure = () => { connectionDropped.current ||= true; };
     const runWatch = target.subscribe({
+      onRunInitialized: ({ input }) => { expectedRunId = input.runId; },
       onEvent: () => noteRunProgress.current(),
-      onRunStartedEvent: () => noteRunProgress.current(),
+      onRunStartedEvent: ({ event }) => {
+        if (event.threadId === channel.threadId && event.runId === expectedRunId) wireRunAccepted = true;
+        noteRunProgress.current();
+      },
       onRunErrorEvent: ({ event }) => {
         if (!mountedRef.current) failRef.current(stoppedReason(event?.message));
       },
@@ -1121,6 +1161,10 @@ export function ChannelChat({
         if (mountedRef.current) return;
         if (pausedForApproval() && isAbortFailure(error)) return;
         if (stopRequestedRef.current) return;
+        if (wireRunAccepted && awaitingReply.current && isConnectionDrop(error)) {
+          markReadFailure();
+          return;
+        }
         failRef.current(stoppedReason(error));
       },
     });
@@ -1130,7 +1174,7 @@ export function ChannelChat({
       /*
        * DOG-01 实机 FAIL（v0.1.18）：sync 仍通时 connection-drop 的 10s unreachable 不会触发；
        * `/run` 被同线程超大 connect 回放拖住（或 runAgent 挂起）→ 乐观气泡静默几十秒、刷新消失。
-       * 这里给 run 加硬超时：超时后停掉、查落库；没落库就可见失败并让外层把草稿放回输入框。
+       * 静默只触发轻量接收确认，不用完整历史的读取结果判断这句有没有发出去。
        */
       noteRunProgress.current();
       const runStartedAt = Date.now();
@@ -1153,89 +1197,99 @@ export function ChannelChat({
         lastProgressAt,
       });
       if (race === "timeout") {
-        /*
-         * 先查这条消息有没有进服务器，再决定停不停（DESIGN.md §109）。以前是先 stopAgent 再查：消息早已落库、
-         * 服务器正在回答时，这一步就把正在写的回答掐断了，后面「再多等一会儿」等的是一轮已经被停掉的回答。
-         * 只有没落库（真的挂住了）才停。
-         */
-        const stored = await readThreadMessages(
-          channel.threadId,
-          runtimeAgentId,
-        ).catch(() => null);
-        const persisted =
-          stored != null &&
-          stored.availability === "ready" &&
-          stored.messages.some((message) => message.id === userMessageId);
-        // First-bound decision without reply race yet.
-        const first = decideSendWatchdogAction({
-          firstRace: "timeout",
-          persisted,
-        });
-        if (first.kind === "hang") {
-          try {
-            copilotkit.stopAgent({ agent: target });
-          } catch {
-            /* stop best-effort */
-          }
-          reportBudgetEvent(first.budget);
-          forceUnlockThread(channel.threadId);
-          failRef.current(first.reason);
-          // Still let runPromise settle in the background so CopilotKit counters clear.
-          void runPromise.catch(() => undefined);
-          throw new Error(first.reason);
-        }
-        // 静默不等于失败：确认后台还在运行就继续等，后台运行期间持续等待，用户可主动停止。
-        const reply = await waitForPersistedReply(runPromise, {
+        // A slow or stale transcript cannot prove that a pending /run was rejected.
+        // Keep this exact send alive, probe only its identity, and never stop/unlock/re-send it.
+        const acknowledgement = await waitForSendReceipt(runPromise, {
           afterMs,
-          startedAt: runStartedAt,
-          lastProgressAt,
+          probe: () => readSendReceipt(channel.threadId, runtimeAgentId, userMessageId),
           stopped: () => waitAbort.signal.aborted,
-          onWaiting: (waiting) => {
-            if (mountedRef.current && replyWaitAbort.current === waitAbort) setWaitingForModel(waiting);
-          },
-          running: async () => {
-            const state = await readSync(runtimeAgentId, channel.threadId, 5_000);
-            if (state === "unsupported") return "unsupported";
-            return state?.thread?.threadId === channel.threadId ? state.thread.running : null;
+          onPending: (notice) => {
+            if (mountedRef.current && replyWaitAbort.current === waitAbort) setSendReceiptNotice(notice);
           },
         });
-        if (reply === "stopped") {
+        if (acknowledgement.kind === "stopped") {
           void runPromise.catch(() => undefined);
           return;
         }
-        if (reply === "unreachable") {
-          // 状态未知：不停止后台，也不解锁。重连后由同步恢复。
-          const reason = "暂时无法确认服务器上的运行状态。恢复连接或刷新后可继续查看。";
-          failRef.current(reason);
-          void target.detachActiveRun().catch(() => undefined);
-          void runPromise.catch(() => undefined);
-          throw new Error(reason);
-        }
-        if (reply === "server_idle") {
-          // 可能只是浏览器丢了结束事件：读回已完成的回答，绝不重发任务。
-          const saved = await readThreadMessages(channel.threadId, runtimeAgentId).catch(() => null);
-          if (saved?.availability === "ready" && storedTurnAnswered(saved.messages as never, userMessageId)) {
-            target.setMessages(withStoredTail(mergeStoredMessages(target.messages, saved.messages), saved.messages));
-            awaitingReply.current = false;
-            void target.detachActiveRun().catch(() => undefined);
-          } else {
-            failRef.current(CONNECTION_LOST_REASON);
-            void target.detachActiveRun().catch(() => undefined);
-            void runPromise.catch(() => undefined);
-            throw new Error(CONNECTION_LOST_REASON);
-          }
-          void runPromise.catch(() => undefined);
-        } else {
+        if (acknowledgement.kind === "done") {
           await runPromise;
+        } else {
+          for (;;) {
+            // Once received, quiet models can keep working without a total-duration limit.
+            const reply = await waitForPersistedReply(runPromise, {
+              afterMs,
+              startedAt: runStartedAt,
+              lastProgressAt,
+              stopped: () => waitAbort.signal.aborted,
+              onWaiting: (waiting) => {
+                if (mountedRef.current && replyWaitAbort.current === waitAbort) {
+                  setWaitingForModel(waiting);
+                  if (waiting) setSendReceiptNotice(null);
+                }
+              },
+              running: async () => {
+                const state = await readSync(runtimeAgentId, channel.threadId, 5_000);
+                if (state === "unsupported") return "unsupported";
+                return state?.thread?.threadId === channel.threadId ? state.thread.running : null;
+              },
+            });
+            if (reply === "stopped") {
+              void runPromise.catch(() => undefined);
+              return;
+            }
+            if (reply === "unreachable") {
+              // It was accepted. A broken state probe must not restore the draft for duplicate submission.
+              if (mountedRef.current && replyWaitAbort.current === waitAbort) setSendReceiptNotice(SEND_RECEIPT_UNKNOWN_NOTICE);
+              continue;
+            }
+            if (reply === "server_idle") {
+              // Recover a lost finish event without submitting the task again.
+              const saved = await readThreadMessages(channel.threadId, runtimeAgentId, {
+                deadlineMs: THREAD_MESSAGES_RETRY_DEADLINE_MS,
+              }).catch(() => null);
+              if (waitAbort.signal.aborted) {
+                void runPromise.catch(() => undefined);
+                return;
+              }
+              if (saved?.availability !== "ready") {
+                if (mountedRef.current && replyWaitAbort.current === waitAbort) setSendReceiptNotice(SEND_RECEIPT_UNKNOWN_NOTICE);
+                await afterMs(1_000);
+                continue;
+              }
+              if (storedTurnAnswered(saved.messages as never, userMessageId)) {
+                target.setMessages(withStoredTail(mergeStoredMessages(target.messages, saved.messages), saved.messages));
+                awaitingReply.current = false;
+                void target.detachActiveRun().catch(() => undefined);
+              } else {
+                failRef.current(CONNECTION_LOST_REASON);
+                void target.detachActiveRun().catch(() => undefined);
+                void runPromise.catch(() => undefined);
+                throw new Error(CONNECTION_LOST_REASON);
+              }
+              void runPromise.catch(() => undefined);
+            } else {
+              await runPromise;
+            }
+            break;
+          }
         }
       } else {
         await runPromise;
       }
+    } catch (error) {
+      // A rejected reader must reach the same read-only recovery as a clean EOF.
+      // Leave the existing send/receipt path alone until this run is acknowledged.
+      if (!wireRunAccepted || !awaitingReply.current || stopRequestedRef.current ||
+          pausedForApproval() || !isConnectionDrop(error)) throw error;
+      markReadFailure();
     } finally {
       runWatch.unsubscribe();
       if (replyWaitAbort.current === waitAbort) {
         replyWaitAbort.current = null;
-        if (mountedRef.current) setWaitingForModel(false);
+        if (mountedRef.current) {
+          setWaitingForModel(false);
+          setSendReceiptNotice(null);
+        }
       }
       setRunsInFlight((count) => Math.max(0, count - 1));
     }
@@ -1247,6 +1301,8 @@ export function ChannelChat({
      * 都不是（服务重启 / 一直连不上）→ 说「和 ChisaBot 的连接断了」，并把没有结果的步骤收起来，卡片不再一直转。
      */
     if (connectionDropped.current && awaitingReply.current) {
+      acceptedDrop = wireRunAccepted;
+      const incompleteTool = connectionDropped.current === "incomplete-tool";
       connectionDropped.current = false;
       const outcome = await settleDroppedTurn({
         running: async () => {
@@ -1273,7 +1329,13 @@ export function ChannelChat({
           return true;
         },
       });
-      if (outcome === "lost" || outcome === "unreachable") {
+      if (stopRequestedRef.current || !awaitingReply.current || pausedForApproval()) {
+        // Stop or a real run error may have arrived while status was being read.
+      } else if (outcome === "unreachable" && wireRunAccepted) {
+        awaitingReply.current = false;
+        if (mountedRef.current) setSendReceiptNotice(ACCEPTED_RUN_PROGRESS_UNKNOWN);
+        activity.kick();
+      } else if (outcome === "lost" || outcome === "unreachable") {
         const current = agentRef.current;
         const closed = repairUnansweredToolCalls(current.messages);
         if (closed !== current.messages)
@@ -1282,7 +1344,7 @@ export function ChannelChat({
         failRef.current(
           outcome === "unreachable"
             ? SEND_UNREACHABLE_REASON
-            : CONNECTION_LOST_REASON,
+            : incompleteTool ? INCOMPLETE_FRONTEND_TOOL_REASON : CONNECTION_LOST_REASON,
         );
       } else {
         awaitingReply.current = false;
@@ -1338,7 +1400,7 @@ export function ChannelChat({
        * 输入框清空、记下的草稿也清掉（DESIGN.md §88.4）；「重试」从这条消息起重新生成（`retryTurn`）。
        * 什么都没回来就失败的，照旧把字放回去（重试 = 再发一次，先拿掉失败的那份）。
        */
-      if (!turnAnswered(target.messages)) throw new Error(turnFailure.current);
+      if (!acceptedDrop && !turnAnswered(target.messages)) throw new Error(turnFailure.current);
     }
     return target.messages
       .filter(
@@ -1416,6 +1478,12 @@ export function ChannelChat({
   };
 
   const failRef = useRef<(message: string) => void>(() => {});
+  guardFrontendToolDispatch(agent, (issue) => {
+    if (!awaitingReply.current || stopRequestedRef.current || pausedForApproval()) return;
+    if (issue === "stream-ended") connectionDropped.current = "incomplete-tool";
+    else if (issue === "stream-closed") connectionDropped.current ||= true;
+    else failRef.current(INVALID_FRONTEND_TOOL_REASON);
+  });
   useEffect(() => {
     const fail = (message: string) => {
       if (!awaitingReply.current) return;
@@ -1448,7 +1516,7 @@ export function ChannelChat({
         if (pausedForApproval() && isAbortFailure(error)) return;
         // 浏览器这头的连接断了：先别报（更别说成「连不上模型服务」），deliver 里问过服务器再定（§89）。
         if (awaitingReply.current && isConnectionDrop(error)) {
-          connectionDropped.current = true;
+          connectionDropped.current ||= true;
           return;
         }
         fail(stoppedReason(error));
@@ -1532,6 +1600,7 @@ export function ChannelChat({
     stopRequestedRef.current = true;
     replyWaitAbort.current?.abort();
     setWaitingForModel(false);
+    setSendReceiptNotice(null);
     awaitingReply.current = false;
     // Track B：停止必须立刻放下 busy，不能干等 runPromise/finally——否则频道永久灰。
     turnsRef.current = 0;
@@ -1576,7 +1645,9 @@ export function ChannelChat({
     };
     return onJoinedActivity((value) => {
       const local = turnsRef.current > 0 || agentRef.current.isRunning;
-      if (!value.running || local) {
+      // Only the server can distinguish a browser relay from a quiet native
+      // tool. Both can have an unanswered call and a stationary event cursor.
+      if (!value.running || value.waiting !== true || local) {
         if (since) clear();
         since = null;
         return;
@@ -1601,6 +1672,7 @@ export function ChannelChat({
     let seen = 0;
     setRemoteBusy(null);
     return onJoinedActivity((value) => {
+      setSendReceiptNotice((previous) => previous === ACCEPTED_RUN_PROGRESS_UNKNOWN ? null : previous);
       const local = turnsRef.current > 0 || agentRef.current.isRunning;
       if (!value.running || local) {
         seen = 0;
@@ -1881,6 +1953,12 @@ export function ChannelChat({
                  * it — and they are independent, so neither is an `else` for the other.
                  */
                 <>
+                  <ThreadWorkerProgress threadId={channel.threadId} agentId={runtimeAgentId} />
+                  {sendReceiptNotice ? (
+                    <p className="pb-2 text-sm text-muted-foreground" role="status">
+                      {sendReceiptNotice}
+                    </p>
+                  ) : null}
                   {waitingForModel ? (
                     <p className="pb-2 text-sm text-muted-foreground" role="status">
                       {SEND_REPLY_WAITING_NOTICE}

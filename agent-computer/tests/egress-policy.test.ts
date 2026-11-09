@@ -300,9 +300,11 @@ describe("the filter proxy", () => {
         secret,
       ),
     ).toContain("403");
+    // Anonymous is challenged (407) so a browser can present Bot credentials; with nothing
+    // pushed those credentials are still refused above.
     expect(
       await connectThrough(filter.port, `127.0.0.1:${target.port}`),
-    ).toContain("403");
+    ).toContain("407");
     await target.close();
   });
 
@@ -312,8 +314,18 @@ describe("the filter proxy", () => {
       env: { EGRESS_POLICY_REQUIRED: "0" },
     });
     // Implicit allow_all when nothing is pushed — private/loopback still denied.
+    // Anonymous sees a challenge first; an authenticated Bot is refused by the floor.
     expect(
       await connectThrough(filter.port, `127.0.0.1:${target.port}`),
+    ).toContain("407");
+    const secret = egressFor("sales", {})?.password;
+    expect(
+      await connectThrough(
+        filter.port,
+        `127.0.0.1:${target.port}`,
+        "sales",
+        secret,
+      ),
     ).toContain("403");
     await target.close();
   });
@@ -563,13 +575,24 @@ describe("the filter proxy", () => {
     expect(egressShellEnvironment()).toEqual({});
   });
 
-  test("an anonymous connection is refused while any Bot on the computer is deny_all", async () => {
+  test("an anonymous connection is challenged while any Bot on the computer is deny_all", async () => {
     const target = await origin();
     const filter = await startEgressFilter({ env: {} });
     setEgressPolicy("a", { mode: "allow_all", rules: [] });
     setEgressPolicy("b", { mode: "deny_all", rules: [] });
+    // Challenge (not 403) so a browser can retry with Bot credentials; the deny_all Bot itself
+    // is still refused after authenticating.
     expect(
       await connectThrough(filter.port, `127.0.0.1:${target.port}`),
+    ).toContain("407");
+    const secret = egressFor("b", {})?.password;
+    expect(
+      await connectThrough(
+        filter.port,
+        `127.0.0.1:${target.port}`,
+        "b",
+        secret,
+      ),
     ).toContain("403");
     await target.close();
   });

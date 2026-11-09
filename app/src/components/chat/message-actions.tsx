@@ -147,14 +147,15 @@ export function MessageEditor({
   }, []);
   const send = useAsyncAction(
     async () => {
-      if (!actions) throw new Error("现在不能重发。");
+      if (!actions?.canAct) throw new Error("现在不能重发。");
       await actions.edit(messageId, text);
       onClose();
     },
     { errorToast: FAILED },
   );
-  const blocked =
-    !text.trim() || text.trim() === initial.trim() || !actions?.canAct;
+  // Opening Edit is also an explicit request to resend the original text.
+  // Only empty input, a busy conversation, or this pending submission blocks it.
+  const blocked = !text.trim() || !actions?.canAct || send.state === "pending";
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === "Escape") {
       event.preventDefault();

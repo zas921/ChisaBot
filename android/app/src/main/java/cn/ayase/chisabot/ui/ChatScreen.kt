@@ -47,6 +47,7 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
@@ -85,15 +86,32 @@ import kotlinx.coroutines.launch
 /** 原生聊天：历史、发送、流式回复、干活卡（§75）、停顿小点（§78.2）、短气泡（§69）、富卡片（render_ui）。 */
 @Composable
 fun ChatScreen(vm: AppViewModel, bot: Bot) {
+    if (vm.chatBot?.id != bot.id) return
+    // Compose 1.6 provides this owner directly. Lifecycle 2.8.2's compatibility
+    // lookup uses reflection with a broken consumer keep rule and crashes after R8.
+    val lifecycle = androidx.compose.ui.platform.LocalLifecycleOwner.current.lifecycle
+    androidx.compose.runtime.DisposableEffect(vm.threadId, bot.id, lifecycle) {
+        val thread = vm.threadId
+        fun current() = vm.chatBot?.id == bot.id && vm.threadId == thread
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (current() && event == androidx.lifecycle.Lifecycle.Event.ON_START) vm.observeTasks()
+            if (current() && event == androidx.lifecycle.Lifecycle.Event.ON_STOP) vm.pauseTaskObservation()
+        }
+        lifecycle.addObserver(observer)
+        if (lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED)) vm.observeTasks()
+        onDispose { lifecycle.removeObserver(observer); if (current()) vm.pauseTaskObservation() }
+    }
     LaunchedEffect(bot.id) { vm.loadModels() }
     val sky = LocalSky.current
     val scope = rememberCoroutineScope()
     var menu by remember { mutableStateOf(false) }
+    var chooseBot by remember { mutableStateOf(false) }
+    var history by remember(bot.id) { mutableStateOf(false) }
     val rows = remember(vm.messages, vm.running, vm.runError, vm.confirms) { Turns.build(vm.messages, vm.running, vm.runError, vm.confirms) }
     val list = rememberLazyListState()
     val atBottom by remember { derivedStateOf { list.firstVisibleItemIndex == 0 && list.firstVisibleItemScrollOffset < 40 } }
     val webFallback = { vm.push(Screen.Web(vm.channelId?.let { "/channel/$it" } ?: "/channel/new?agent=${bot.id}", bot.name)) }
-    val actions = remember(bot.id) { RenderActions(ask = { text -> scope.launch { vm.send(text) } }, fallback = webFallback) }
+    val actions = remember(bot.id) { RenderActions(ask = { text -> scope.launch { if (vm.running) vm.queueFollowUp(text) else vm.send(text) } }, fallback = webFallback) }
 
     // 刚发出 / 自己在底部：新内容来了贴着底部（reverseLayout，index 0 = 最底下）。
     // 「跟着底部」在手指滑完时才更新：新的一行插在 index 0 时列表按 key 保住原来那一行，atBottom 会先变 false，
@@ -104,13 +122,16 @@ fun ChatScreen(vm: AppViewModel, bot: Bot) {
 
     Column(Modifier.fillMaxSize().imePadding()) {
         TopBar(bot.name, subtitle = if (vm.running) "正在回复…" else if (bot.main) "主机器人" else bot.title, onBack = { vm.back() }) {
+            IconText("☰", "展开机器人列表", { chooseBot = true })
             IconText("▦", "面板", { vm.openPanels(bot) })
             Box {
                 IconText("⋯", "更多", { menu = true }, size = 22.sp)
                 DropdownMenu(menu, { menu = false }) {
                     DropdownMenuItem({ Text("新话题") }, { menu = false; vm.newTopic() }, enabled = !vm.running)
+                    DropdownMenuItem({ Text("历史对话") }, { menu = false; history = true })
                     DropdownMenuItem({ Text("在网页中打开这段对话") }, { menu = false; webFallback() })
                     DropdownMenuItem({ Text("机器人资料") }, { menu = false; vm.push(Screen.Web("/bots/${bot.id}", bot.name)) })
+                    DropdownMenuItem({ Text("全部功能") }, { menu = false; vm.push(Screen.Features) })
                 }
             }
         }
@@ -145,6 +166,14 @@ fun ChatScreen(vm: AppViewModel, bot: Bot) {
         }
         Composer(vm, onSent = { scope.launch { delay(50); list.scrollToItem(0) } })
     }
+    if (history) ConversationHistory(vm, bot) { history = false }
+    if (chooseBot) androidx.compose.material3.AlertDialog(onDismissRequest = { chooseBot = false }, title = { Text("切换机器人") }, text = {
+        LazyColumn(Modifier.heightIn(max = 420.dp)) {
+            items(vm.bots, key = { it.id }) { target ->
+                TextButton(onClick = { chooseBot = false; if (target.id != bot.id) vm.openChat(target) }, modifier = Modifier.fillMaxWidth()) { Text(target.name, modifier = Modifier.fillMaxWidth()) }
+            }
+        }
+    }, confirmButton = { TextButton(onClick = { chooseBot = false }) { Text("收起") } })
 }
 
 @Composable
@@ -253,7 +282,7 @@ private fun WorkCard(vm: AppViewModel, row: ChatRow.Work) {
 private fun Composer(vm: AppViewModel, onSent: () -> Unit) {
     val sky = LocalSky.current
     val scope = rememberCoroutineScope()
-    var text by remember { mutableStateOf("") }
+    var text by remember(vm.chatBot?.id) { mutableStateOf("") }
     var sending by remember { mutableStateOf(false) }
     // 照片：系统照片选择器（Android 13+ 不要权限；老系统回落到 GET_CONTENT）；文件：只给能读的类型；拍照：存到 cache/camera 再上传
     val pickPhotos = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(8)) { uris -> if (uris.isNotEmpty()) vm.addFiles(uris) }
@@ -263,6 +292,7 @@ private fun Composer(vm: AppViewModel, onSent: () -> Unit) {
     val uploading = vm.files.any { it.state == "uploading" }
     val readyFiles = vm.files.count { it.state == "ready" }
     Column(Modifier.fillMaxWidth().background(sky.glass1).navigationBarsPadding()) {
+        TaskProgress(vm)
         ModelPicker(vm)
         AttachmentStrip(vm)
         Row(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp), verticalAlignment = Alignment.Bottom) {
@@ -284,6 +314,15 @@ private fun Composer(vm: AppViewModel, onSent: () -> Unit) {
             val canSend = (text.isNotBlank() || readyFiles > 0) && !uploading && !sending && !vm.turnPreparing && !vm.modelSaving && !vm.selectedModelMissing
             AnimatedContent(vm.running, transitionSpec = { fadeIn(tween(150)) togetherWith fadeOut(tween(150)) }, label = "send") { running ->
                 if (running) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                    if (text.isNotBlank()) TextButton(enabled = canSend && vm.files.isEmpty(), onClick = {
+                        val msg = text.trim()
+                        sending = true
+                        scope.launch {
+                            try { if (vm.queueFollowUp(msg) && text.trim() == msg) { text = ""; onSent() } }
+                            finally { sending = false }
+                        }
+                    }) { Text("补充") }
                     // 停止（§38）：点了原地转圈「停止中」，服务器停下、流断开后变回发送
                     Box(
                         Modifier.size(44.dp).clip(CircleShape).background(sky.ink1).clickable(enabled = !vm.stopping) { vm.stop() }
@@ -292,6 +331,7 @@ private fun Composer(vm: AppViewModel, onSent: () -> Unit) {
                     ) {
                         if (vm.stopping) CircularProgressIndicator(Modifier.size(18.dp), color = sky.skyBottom, strokeWidth = 2.dp)
                         else Box(Modifier.size(12.dp).clip(RoundedCornerShape(2.dp)).background(sky.skyBottom))
+                    }
                     }
                 } else {
                     Box(

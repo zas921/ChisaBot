@@ -6,6 +6,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resumeWithException
+import okhttp3.Callback
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -98,9 +101,11 @@ class Api(val origin: String, private val renew: (suspend () -> Boolean)? = null
         }
     }
 
-    suspend fun call(path: String, method: String = "GET", body: JsonElement? = null): JsonElement = withContext(Dispatchers.IO) {
+    suspend fun call(path: String, method: String = "GET", body: JsonElement? = null, timeoutMs: Long? = null): JsonElement = withContext(Dispatchers.IO) {
         for (attempt in 0..1) {
-            val r = client.newCall(request(path, method, body)).execute()
+            val call = client.newCall(request(path, method, body))
+            if (timeoutMs != null) call.timeout().timeout(timeoutMs, TimeUnit.MILLISECONDS)
+            val r = awaitResponse(call)
             val auth = isAuthFail(r)
             if (auth) {
                 r.close()
@@ -112,6 +117,16 @@ class Api(val origin: String, private val renew: (suspend () -> Boolean)? = null
             return@withContext if (text.isBlank()) JsonObject(emptyMap()) else json.parseToJsonElement(text)
         }
         throw Unauthorized()
+    }
+
+    /** Switching conversations cancels the HTTP call as well as the coroutine. */
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    private suspend fun awaitResponse(call: Call): Response = suspendCancellableCoroutine { continuation ->
+        continuation.invokeOnCancellation { call.cancel() }
+        call.enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) { if (!continuation.isCancelled) continuation.resumeWithException(e) }
+            override fun onResponse(call: Call, response: Response) { continuation.resume(response) { response.close() } }
+        })
     }
 
     /** multipart 上传（聊天附件）：一个文件字段 + 几个普通字段。 */

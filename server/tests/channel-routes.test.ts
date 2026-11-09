@@ -891,6 +891,49 @@ async function channelTableSnapshot() {
 }
 
 describe("channel store integration", () => {
+  test("latest direct lookup reaches a Bot beyond the first 50 roster rows without creating channels", async () => {
+    const actor = await createPersistentUser();
+    const targetBot = await createPersistentAgent({ name: "Older Bot", owner: actor });
+    const activeBot = await createPersistentAgent({ name: "Recent Bot", owner: actor });
+    const target = await persistentStore.create(actor, [targetBot]);
+    createdChannelIds.push(target.id);
+    await database.update(channels).set({ lastMessageAt: new Date("2020-01-01T00:00:00Z") }).where(eq(channels.id, target.id));
+    for (let index = 0; index < 51; index++) {
+      const recent = await persistentStore.create(actor, [activeBot]);
+      createdChannelIds.push(recent.id);
+    }
+    const firstPage = await persistentStore.list(actor);
+    expect(firstPage.channels).toHaveLength(50);
+    expect(firstPage.channels.some((row) => row.id === target.id)).toBe(false);
+    const before = await channelTableSnapshot();
+    expect((await persistentStore.latestDirect!(actor, targetBot))?.id).toBe(target.id);
+    expect(await persistentStore.latestDirect!(actor, "bot-with-no-conversation")).toBeNull();
+    expect(await channelTableSnapshot()).toEqual(before);
+  });
+
+  test("latest direct lookup follows recency, excludes groups, deleted channels and other users", async () => {
+    const actor = await createPersistentUser();
+    const outsider = await createPersistentUser();
+    const bot = await createPersistentAgent({ name: "Target", owner: actor, visibility: "public" });
+    const otherBot = await createPersistentAgent({ name: "Group member", owner: actor });
+    const make = async (member: AgentActor, agentIds: string[], at: string) => {
+      const made = await persistentStore.create(member, agentIds);
+      createdChannelIds.push(made.id);
+      await database.update(channels).set({ lastMessageAt: new Date(at) }).where(eq(channels.id, made.id));
+      return made;
+    };
+    const pinned = await make(actor, [bot], "2026-01-01T00:00:00Z");
+    const latest = await make(actor, [bot], "2026-02-01T00:00:00Z");
+    await persistentStore.setPinned(actor, pinned.id, true);
+    await make(actor, [bot, otherBot], "2026-03-01T00:00:00Z");
+    const deleted = await make(actor, [bot], "2026-04-01T00:00:00Z");
+    await persistentStore.softDelete(actor, deleted.id);
+    const theirs = await make(outsider, [bot], "2026-05-01T00:00:00Z");
+    expect((await persistentStore.latestDirect!(actor, bot))?.id).toBe(latest.id);
+    expect((await persistentStore.latestDirect!(outsider, bot))?.id).toBe(theirs.id);
+    expect(await persistentStore.latestDirect!(outsider, otherBot)).toBeNull();
+  });
+
   test("reads the creator's persisted channel exactly", async () => {
     const actor = await createPersistentUser();
     const agentId = await createPersistentAgent({

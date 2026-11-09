@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import type { Message } from "@ag-ui/client";
 import { estimateTokens } from "../src/context-usage";
 import {
@@ -9,7 +10,10 @@ import {
   stripHeavyBlobs,
   budgetsForRun,
   MAX_CONTINUATION_SEGMENTS,
+  shrinkOlderTurnsForModel,
 } from "../src/agents/model-context";
+import { reviewImages, type ReviewPacket } from "../src/video-production/inspection";
+import type { VideoJob } from "../src/video-production/types";
 
 function history(rows: unknown[]): Message[] {
   return rows as Message[];
@@ -51,6 +55,27 @@ function longThread(turns: number): Message[] {
     });
   }
   return history(rows);
+}
+
+function evidenceReads(count: number): Message[] {
+  return Array.from({ length: count }, (_, i) => [
+    { id: `evidence-call-${i}`, role: "assistant", content: "", toolCalls: [call(`evidence-${i}`, "video_project_review_evidence")] },
+    { id: `evidence-result-${i}`, role: "tool", toolCallId: `evidence-${i}`, content: `page ${i}: ` + "measured narration and shot evidence; ".repeat(500) },
+  ]).flat() as Message[];
+}
+
+async function reviewImageMessage(): Promise<Message> {
+  // Large opaque media bytes exercise the former long-base64 stripping path. The actual
+  // production frame loader verifies the source digest and constructs the AG-UI image part.
+  const bytes = Buffer.concat([Buffer.from([0xff, 0xd8]), Buffer.alloc(16_000, 0x55), Buffer.from([0xff, 0xd9])]);
+  const digest = createHash("sha256").update(bytes).digest("hex");
+  const packet: ReviewPacket = { version: 1, revision: 1, scriptHash: "a".repeat(64), complete: true, errors: [], limitations: ["sampled frame"],
+    audio: { method: "local-asr", transcript: [{ start: 0, end: 2, text: "实测音轨" }] },
+    videos: [{ name: "landscape.mp4", sha256: "b".repeat(64), qc: { analysisComplete: true }, frames: [{ name: "frame.jpg", at: 1, sha256: digest }] }] };
+  const job: VideoJob = { id: "video1", ownerId: "owner", botId: "producer", threadId: "thread", title: "review", state: "awaiting_video_approval", revision: 1,
+    createdAt: 0, updatedAt: 0, artifacts: [{ name: "frame.jpg", kind: "review_frame", sha256: digest }] };
+  const content = await reviewImages(job, packet, async () => new Response(bytes, { headers: { "Content-Type": "image/jpeg" } }));
+  return { id: "current-video-review", role: "user", content: [{ type: "text", text: "请按实际画面和音轨审核当前成片。" }, ...content] };
 }
 
 describe("stripHeavyBlobs", () => {
@@ -155,6 +180,63 @@ describe("compactHistoryForModel", () => {
     expect(result.dropped).toBe(true);
     expect(result.messages.length).toBeLessThan(rows.length);
     expect(result.estimatedTokens).toBeLessThan(estimateTokens(rows));
+  });
+
+  test("actual review frame parts survive 17 evidence tool results and repeated compaction", async () => {
+    const request = await reviewImageMessage();
+    for (const older of [[], longThread(10)]) {
+      let messages = [...older, request, ...evidenceReads(17)];
+      const original = structuredClone(request);
+      for (let pass = 0; pass < 4; pass++) {
+        const result = compactHistoryForModel(messages, { forceShrink: true });
+        const kept = result.messages.find((message) => message.id === request.id);
+        expect(Array.isArray(kept?.content)).toBe(true);
+        expect(kept?.content).toEqual(original.content);
+        expect(contentLen(result.messages.find((message) => message.id === "evidence-result-0"))).toBeLessThan(1_000);
+        messages = result.messages;
+      }
+      expect(request).toEqual(original);
+    }
+  });
+
+  test("shrinking text keeps typed media parts and frame labels rather than JSON-stringifying them", async () => {
+    const request = await reviewImageMessage();
+    if (!Array.isArray(request.content)) throw new Error("Expected multipart review request.");
+    const image = request.content.find((part) => part.type === "image");
+    const withLargeText = { ...request, content: [...request.content, { type: "text" as const, text: "检查说明。".repeat(2_000) }] } as Message;
+    const [shrunk] = shrinkOlderTurnsForModel([withLargeText], budgetsForRun());
+    expect(Array.isArray(shrunk?.content)).toBe(true);
+    if (!Array.isArray(shrunk?.content)) throw new Error("Media content was converted to text.");
+    expect(shrunk.content.find((part) => part.type === "image")).toBe(image);
+    expect(shrunk.content.some((part) => part.type === "text" && part.text.includes("landscape.mp4 成片 1 秒"))).toBe(true);
+    const last = shrunk.content.at(-1);
+    expect(last?.type === "text" && last.text.length < 2_100).toBe(true);
+  });
+
+  test("message-cap dropping retains current media while discarding an older media turn", async () => {
+    const request = await reviewImageMessage();
+    const previous = { ...request, id: "old-video-review" };
+    const messages = [previous, ...longThread(6), request, ...evidenceReads(100)];
+    const result = compactHistoryForModel(messages, { goal: true });
+    expect(result.dropped).toBe(true);
+    expect(result.messages.find((message) => message.id === request.id)?.content).toEqual(request.content);
+    expect(typeof result.messages.find((message) => message.id === previous.id)?.content).toBe("string");
+    expect(result.messages.length).toBeLessThanOrEqual(result.budgets.maxKeptMessages + 3);
+    const repeated = compactHistoryForModel(result.messages, { goal: true });
+    expect(repeated.messages.find((message) => message.id === request.id)?.content).toEqual(request.content);
+    expect(messages[0]?.content).toEqual(previous.content);
+  });
+
+  test("inline image bytes are not estimated as megabytes of text or removed to reduce that estimate", () => {
+    const image = (size: number): Message => ({ id: "image", role: "user", content: [
+      { type: "text", text: "Describe this image." },
+      { type: "image", source: { type: "data", mimeType: "image/jpeg", value: "A".repeat(size) } },
+    ] });
+    const small = compactHistoryForModel([image(100)], { forceShrink: true });
+    const largeRequest = image(2_000_000);
+    const large = compactHistoryForModel([largeRequest], { forceShrink: true });
+    expect(large.estimatedTokens).toBe(small.estimatedTokens);
+    expect(large.messages[0]?.content).toEqual(largeRequest.content);
   });
 });
 

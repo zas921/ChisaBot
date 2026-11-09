@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { serve } from "bun";
 import type { BrowserContext, Page } from "playwright";
 import { downloadHeaders } from "../../shared/file-download";
+import { encodeScreencastFrame } from "../../shared/screencast-frame";
 import { visiblePageText } from "./readable-text";
 import {
   cutAtCodeUnits,
@@ -47,7 +48,17 @@ import {
   parseNavigateUrl,
   parseScrollDelta,
 } from "./request-validation";
-import { type InputMessage, startScreencast } from "./screencast";
+import { type FrameMessage, type InputMessage, startScreencast } from "./screencast";
+
+/** A live picture ready for the binary WebSocket frame encoder. */
+function isBinaryFrameMessage(frame: unknown): frame is FrameMessage {
+  return (
+    !!frame &&
+    typeof frame === "object" &&
+    (frame as FrameMessage).type === "frame" &&
+    (frame as FrameMessage).jpeg instanceof Uint8Array
+  );
+}
 import {
   keepAlivePingPayload,
   keepAlivePongPayload,
@@ -673,7 +684,12 @@ serve<StreamData>({
         const send = (frame: unknown) => {
           // A closed socket starts a fresh cast on the next connection.
           try {
-            ws.send(JSON.stringify(frame));
+            // Pictures go as binary WebSocket frames (no Base64/JSON tax). Everything else stays JSON.
+            if (isBinaryFrameMessage(frame)) {
+              ws.send(encodeScreencastFrame(frame));
+            } else {
+              ws.send(JSON.stringify(frame));
+            }
           } catch {
             void session.viewer.release(ws);
           }
@@ -700,7 +716,21 @@ serve<StreamData>({
           void ensureStartPage(target, linksFor(ws.data.botId));
           void pushTabs();
           if (target === casting) return;
-          const cast = await startScreencast(target, send);
+          const cast = await startScreencast(target, send, {
+            // Tunable via SCREENCAST_* env; smaller JPEG = less SwiftShader/CPU and less ocean RTT queue.
+            maxWidth: numberFromEnv("SCREENCAST_MAX_WIDTH", 1024, {
+              min: 640,
+              max: 1920,
+            }),
+            maxHeight: numberFromEnv("SCREENCAST_MAX_HEIGHT", 640, {
+              min: 400,
+              max: 1200,
+            }),
+            quality: numberFromEnv("SCREENCAST_QUALITY", 45, {
+              min: 20,
+              max: 100,
+            }),
+          });
           // The claim stops a cast it refuses, so a launch that lost the screen leaks nothing.
           if (!(await claim.install(cast))) return;
           casting = target;

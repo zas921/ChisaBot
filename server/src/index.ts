@@ -1,4 +1,11 @@
 import { createGoalTasks, decodeGoalResult } from "./agents/goal-tasks";
+import { createVideoProduction } from "./video-production/service";
+import { videoProducerMessageId } from "./video-production/producer-delivery";
+import { createVideoReviewDispatcher } from "./video-production/reviewer";
+import type { VideoEvent } from "./video-production/types";
+import { withWorkerResultDelivery } from "./thread-inbox";
+import { isVideoAssetRequest } from "../../shared/video-assets";
+import { readFileSync } from "node:fs";
 import { currentConfirmTurn } from "./confirmations/context";
 import type { TurnRunner } from "./turns/types";
 import { createHash, randomUUID } from "node:crypto";
@@ -136,6 +143,7 @@ import { onControlReleased } from "./computer/control-blocks";
 import {
   createHeadlessComputerTools,
   HeadlessToolSuspension,
+  managedBrowserWorkspace,
 } from "./computer/headless-tools";
 import { createPageFrameStore } from "./computer/page-frames";
 import { startPolicyListener } from "./computer/policy-listener";
@@ -304,7 +312,7 @@ import { markUntrusted } from "./untrusted-content";
 import { createUserInstructionsStore } from "./user-instructions";
 import { createUserPreferencesStore } from "./user-preferences";
 import { repeatAfterEach } from "./work/loop";
-import { createWorkerService, type WorkerService } from "./workers/service";
+import { createWorkerService, WORKER_TURN_TIMEOUT_MS, type WorkerService } from "./workers/service";
 import { createLocalAgentService, type LocalAgentService } from "./local-agents/service";
 import { createCloudCcService, type CloudCcService } from "./cloud-cc/service";
 import { createRepairService } from "./repair/service";
@@ -690,6 +698,13 @@ const approvalService = createApprovalService(
     );
     if (!tool)
       throw new ApprovalRefusedError("That computer tool is not available.");
+    signal.throwIfAborted();
+    if (
+      localBackend && snapshot.toolName === "computer_run_command" &&
+      !localBackend.claimFrontendCommand(snapshot.threadId, snapshot.runId, snapshot.toolCallId)
+    ) {
+      throw new ApprovalRefusedError("That command is not awaiting execution by this page.");
+    }
     return tool.execute(snapshot.args, {
       toolCallId: snapshot.toolCallId,
       signal,
@@ -1444,6 +1459,7 @@ const teamBots = createTeamBots({
 
 /** IM 接入（server/src/im，DESIGN.md §49）：下面才建；IM 回合的工具按连接的开关裁剪。 */
 let imService: ImService | undefined;
+let videoProduction: ReturnType<typeof createVideoProduction> | undefined;
 const loadToolsForActor =
   (actorId: string, initiator: AuditInitiator = PERSON_INITIATOR) =>
   async (botId: string) => {
@@ -1454,6 +1470,7 @@ const loadToolsForActor =
     // 有后果的工具（删除 / 付款 / 对外发消息）按审批偏好先出确认卡片（server/src/confirmations）。
     return confirmations.wrap([
     ...(goalTasks?.tools(actorId, botId) ?? []),
+    ...(videoProduction && !(initiator.kind === "routine" && initiator.id.startsWith("lp_")) ? videoProduction.tools(actorId, botId) : []),
     ...(initiator.kind === "routine" && initiator.id.startsWith("lp_") ? [] : confirmations.tools(actorId, botId, initiator)),
     ...wakeUpTools({
       store: wakeUpStore,
@@ -2051,7 +2068,7 @@ const routineAgentRunner =
     authToken: routineIntelligence.ɵgetRunnerAuthToken(),
   });
 
-const governedTurnRunner = createTurnRunner({
+const governedTurnOptions = {
   intelligence: routineIntelligence,
   runner: routineAgentRunner,
   components: { store: componentStore, auditStore: bootAuditStore },
@@ -2071,10 +2088,17 @@ const governedTurnRunner = createTurnRunner({
       ...(signInService ? { signIn: signInService } : {}),
     });
   },
+} satisfies Parameters<typeof createTurnRunner>[0];
+const governedTurnRunner = createTurnRunner(governedTurnOptions);
+// Continuing the parent can take as long as the delegated work. Keep the same tools,
+// permissions, approvals and stop handling without inheriting a routine's five-minute deadline.
+const workerDeliveryTurnRunner = createTurnRunner({
+  ...governedTurnOptions,
+  turnTimeoutMs: WORKER_TURN_TIMEOUT_MS,
 });
 /*
  * 后台任务（DESIGN.md §38，workers/service.ts）：只在本地对话后端下有。工人的回合用自己的一个回合运行器
- * （超时 15 分钟、多一个 worker_plan 工具），结果交回主对话用上面的 governedTurnRunner。
+ * （无总时长截止、多一个 worker_plan 工具），主对话的结果续跑也无总时长截止。
  */
 const workerComputerTools = async ({ ownerUserId, agentId, initiator }: { ownerUserId: string; agentId: string; initiator: AuditInitiator }) => {
   if (!computerGateway) return [];
@@ -2100,14 +2124,14 @@ if (localBackend) {
       ...(await workerComputerTools(input)),
       ...(workerService && input.threadId.startsWith("worker-") ? workerService.workerTools(input.threadId.slice("worker-".length)) : []),
     ],
-    turnTimeoutMs: 15 * 60_000 + 30_000,
+    turnTimeoutMs: WORKER_TURN_TIMEOUT_MS,
   });
   workerService = createWorkerService({
     database,
     inbox: localBackend.inbox,
     control: localBackend.control,
     runTurn: workerTurnRunner,
-    deliverTurn: governedTurnRunner,
+    deliverTurn: workerDeliveryTurnRunner,
     agentOfThread: async (threadId) => {
       const rows = await database.$client.unsafe<{ agent_id: string }[]>("SELECT agent_id FROM openbot_local_threads WHERE id = $1", [threadId]);
       return rows[0]?.agent_id ?? null;
@@ -2130,6 +2154,15 @@ if (localBackend) {
     }
   }
   localBackend.setWorkers(workerService);
+  let reconcilingWorkerDeliveries = false;
+  const workerDeliveryTimer = setInterval(async () => {
+    if (reconcilingWorkerDeliveries) return;
+    reconcilingWorkerDeliveries = true;
+    try { await workerService!.reconcileDeliveries(); }
+    catch (error) { console.warn("recovering pending worker results failed", error); }
+    finally { reconcilingWorkerDeliveries = false; }
+  }, 30_000);
+  workerDeliveryTimer.unref?.();
 }
 /*
  * 确认卡片：工具已经不等了（超时 / 服务重启）之后用户才点「确认」——往那段对话里发一条「用户确认了」，
@@ -2154,6 +2187,106 @@ confirmations.setResume(async ({ ownerUserId, agentId, threadId, requestId, text
     forwardedProps: { chisabotConfirmResume: { id: requestId } },
   });
 });
+
+// Media generation and review are background work with no fixed wall-clock cutoff.
+// Ownership, tool grants, actual Stop, and per-call timeouts remain governed by the shared runner.
+if (process.env.VIDEO_PRODUCTION_URL) {
+  const videoTurnRunner = createTurnRunner({ ...governedTurnOptions, turnTimeoutMs: 0 });
+  const videoPreferences = createUserPreferencesStore(database);
+  const resolveVideoMainBot = async (ownerId: string): Promise<string | null> => {
+    const id = (await videoPreferences.read(ownerId)).mainBotId;
+    if (!id) return null;
+    const profile = await agentProfileStore.get(await actorFor(ownerId), id);
+    return profile && !profile.deletedAt && profile.ownerUserId === ownerId ? profile.id : null;
+  };
+  const notifyVideoProducer = async (event: VideoEvent) => {
+    const [thread] = await database.$client.unsafe<{ agent_id: string; archived: boolean }[]>(
+      "SELECT agent_id, archived FROM openbot_local_threads WHERE id = $1 AND owner_user_id = $2",
+      [event.threadId, event.ownerId],
+    );
+    // Deleting/archiving the originating conversation never creates a new conversation or run.
+    if (!thread || thread.archived) return;
+    if (thread.agent_id !== event.botId) throw new Error("Video result does not belong to the originating Bot.");
+    const job = await videoProduction!.getJob(event.ownerId, event.jobId);
+    // Script approval already queued rendering; there is no producer action until video_ready.
+    if (event.kind === "review_approved" && ["render_queued", "rendering"].includes(job.state)) return;
+    const detail = markUntrusted(event.message.length > 12_000 ? `${event.message.slice(0, 12_000)}\n[诊断较长，请读取项目状态/审核记录核对完整信息]` : event.message, "video processing status or review feedback");
+    const text = `视频项目 ${event.jobId} 状态更新：${detail}\n审核链接：/api/video-production/jobs/${event.jobId}/review\n配置入口：/api/video-production/settings`;
+    const [previousDelivery] = localBackend ? await database.$client.unsafe<{ id: string; status: string }[]>(
+      "SELECT id, status FROM chisabot_thread_inbox WHERE thread_id = $1 AND owner_user_id = $2 AND (id = $3 OR id LIKE $4) ORDER BY created_at DESC LIMIT 1",
+      [event.threadId, event.ownerId, `video-event-${event.seq}`, `video-event-${event.seq}-attempt-%`],
+    ) : [];
+    const message = { id: videoProducerMessageId(event, job, previousDelivery), role: "user", content: text } as Message;
+    const runId = randomUUID();
+    const input = {
+      ownerUserId: event.ownerId, routineId: `video:${event.jobId}:${event.seq}`,
+      agentId: thread.agent_id, threadId: event.threadId, runId,
+      instruction: "处理本会话新到的视频制作结果和审核意见，依据当前项目状态继续执行实际操作。委托审核项目由主 bot 审核，你负责补证、返修、保存并重新送审；必须调用工具推进，不能仅承诺稍后处理就结束。通过后取得导出链接并交付；未经授权不得投稿。",
+      initiator: { kind: "routine" as const, id: `video:${event.jobId}:${event.seq}` },
+    };
+    if (!localBackend) {
+      await videoTurnRunner({ ...input, userMessage: message });
+      return;
+    }
+    // Keep the worker event unacknowledged until this durable inbox row is handled. A browser
+    // closing, a transient model failure, or a server restart therefore cannot lose the result.
+    await localBackend.inbox.enqueue({ threadId: event.threadId, ownerUserId: event.ownerId, message, kind: "worker_result" });
+    const deliveryState = async () => (await database.$client.unsafe<{ status: string }[]>(
+      "SELECT status FROM chisabot_thread_inbox WHERE thread_id = $1 AND id = $2 AND owner_user_id = $3",
+      [event.threadId, message.id, event.ownerId],
+    ))[0]?.status;
+    if (["answered", "merged", "withdrawn"].includes(await deliveryState() ?? "")) return;
+    await localBackend.inbox.retryWorkerResults(event.threadId, [message.id]);
+    const pendingStatus = await deliveryState();
+    // A later user message can unpause the conversation without releasing an older stopped row.
+    // Keep that row visible; do not repeatedly create empty runs for an intentionally held result.
+    if (["paused", "stopped", "answered", "merged", "withdrawn"].includes(pendingStatus ?? "")) return;
+    // Explicit Stop and the bounded exhausted-retry hold remain visible in the inbox.
+    if (await localBackend.inbox.isPaused(event.threadId)) return;
+    if (localBackend.control.isActive(event.threadId)) throw new Error("Video result is queued for the active conversation.");
+    if (pendingStatus !== "queued") throw new Error("Video result is not yet eligible for delivery.");
+    const [waiting] = await database.$client.unsafe<{ waiting: boolean }[]>(`
+      SELECT EXISTS (SELECT 1 FROM approval_requests a WHERE a.owner_user_id = $2
+        AND a.action->>'threadId' = $1 AND a.status IN ('pending', 'approved', 'consumed'))
+        OR COALESCE((SELECT e.event->'outcome'->>'type' = 'interrupt' OR e.event->'metadata' ? 'openbotWaiting'
+          FROM openbot_local_events e WHERE e.thread_id = $1 AND e.event->>'type' IN ('RUN_FINISHED', 'RUN_ERROR')
+          ORDER BY e.sequence DESC LIMIT 1), false) AS waiting`, [event.threadId, event.ownerId]);
+    if (waiting?.waiting) throw new Error("Video result is waiting for an existing approval continuation.");
+    await withWorkerResultDelivery(event.threadId, runId, new Set([message.id]), () => videoTurnRunner({
+      ...input, automationContext: input.instruction,
+    }));
+    if (!["answered", "merged", "withdrawn"].includes(await deliveryState() ?? ""))
+      throw new Error("Video result is still pending in the conversation inbox.");
+  };
+  const dispatchVideoReview = createVideoReviewDispatcher({
+    runTurn: async (input) => {
+      if (localBackend) {
+        const [state] = await database.$client.unsafe<{ paused: boolean; pause_reason: string }[]>(
+          "SELECT paused, pause_reason FROM chisabot_thread_inbox_control WHERE thread_id = $1", [input.threadId]);
+        if (state?.paused && state.pause_reason === "user")
+          throw new Error("The reviewer conversation is paused; an automatic event cannot override Stop.");
+      }
+      return videoTurnRunner(input);
+    },
+    resolveMainBot: resolveVideoMainBot,
+    getJob: (ownerId, jobId) => videoProduction!.getJob(ownerId, jobId),
+    prepareReview: (input) => videoProduction!.prepareReview(input),
+    notifyProducer: notifyVideoProducer,
+  });
+  const token = process.env.VIDEO_PRODUCTION_TOKEN_FILE
+    ? readFileSync(process.env.VIDEO_PRODUCTION_TOKEN_FILE, "utf8").trim()
+    : process.env.VIDEO_PRODUCTION_TOKEN?.trim() ?? "";
+  videoProduction = createVideoProduction({
+    baseUrl: process.env.VIDEO_PRODUCTION_URL,
+    token,
+    allowedOrigins: (process.env.VIDEO_PRODUCTION_PUBLIC_ORIGINS ?? config.publicUrl ?? "")
+      .split(",").map((value) => value.trim()).filter(Boolean),
+    resolveMainBot: resolveVideoMainBot,
+    onError: (message) => console.warn(message),
+    notify: async (event) => { await dispatchVideoReview(event); },
+  });
+  videoProduction.start();
+}
 
 /**
  * 本地 agent 与权限档位（server/src/local-agents，docs/local-agents.md）：设备的只读 / 工作区 / 完全访问档位挂在
@@ -2696,9 +2829,31 @@ const actorAgentResolver = createActorAgentResolver({
   loadPersonalMemoryForActor,
 });
 
+// The local runner outlives the browser's SSE subscription. Keep authorized
+// workspace commands and reads on that runner; other tools still use the browser.
+// Programmatic/headless runs still use actorAgentResolver directly.
+const browserAgentResolver = localBackend && computerGateway
+  ? {
+      ...actorAgentResolver,
+      async resolveAgentsForActor(actor: AgentActor) {
+        const agents = await actorAgentResolver.resolveAgentsForActor(actor);
+        for (const [botId, agent] of Object.entries(agents)) {
+          agent.use(managedBrowserWorkspace(async ({ threadId, runId }) => {
+            const source = await sourceForCoordinationRun({
+              actorId: actor.id, botId, threadId, runId, depth: 0, initiator: PERSON_INITIATOR,
+            });
+            if (!source) return [];
+            return approvalComputerTools(actor.id, botId, PERSON_INITIATOR, true);
+          }, PERSON_INITIATOR));
+        }
+        return agents;
+      },
+    }
+  : actorAgentResolver;
+
 const copilotRuntime = mountCopilotRuntime(
   config,
-  actorAgentResolver,
+  browserAgentResolver,
   identifyUser,
   identifyActor,
   {
@@ -2892,13 +3047,14 @@ const approvalComputerTools = async (
   ownerUserId: string,
   agentId: string,
   initiator: AuditInitiator,
+  builtInOnly = false,
 ) => {
   const actor = await actorFor(ownerUserId);
   const profile = await agentProfileStore.get(actor, agentId);
   if (!profile)
     throw new ApprovalRefusedError("That Bot is no longer available to you.");
   // A Team Bot's teammate uses the Bot, not its owner's signed-in computer.
-  return computerGateway && canUseComputer(profile, actor)
+  return computerGateway && canUseComputer(profile, actor) && (!builtInOnly || !profile.endpoint)
     ? createHeadlessComputerTools({
         gateway: computerGateway,
         botId: agentId,
@@ -3763,6 +3919,7 @@ const app = createApp(
     ...(gatewaySecret ? { singleUserGuard: createGatewayRequireUser(gatewaySecret, provisionGatewayUser) } : {}),
     extraRoutes: ({ requireUser }) => [
       ...(goalTasks ? [["/api/goal-tasks", goalTasks.routes(requireUser)] satisfies [string, unknown]] : []),
+      ...(videoProduction ? [["/api/video-production", videoProduction.routes(requireUser)] satisfies [string, unknown]] : []),
       [
         "/api/admin/smoke",
         createAdminSmokeRoutes({
@@ -3954,6 +4111,7 @@ serve<SocketData>({
       return Response.json({ ok: false, error: "请先登录。", openbotAuthRequired: true }, { status: 401 });
     }
     const url = new URL(request.url);
+    if (isVideoAssetRequest(request.method, url.pathname)) server.timeout(request, 0);
     if (request.method === "POST" && (url.pathname === "/api/chat-files" || /^\/api\/channels\/[^/]+\/attachments$/.test(url.pathname))) server.timeout(request, 0);
     if (url.pathname === "/api/audio/transcriptions") {
       server.timeout(request, DICTATION_HTTP_IDLE_SECONDS);
@@ -4141,6 +4299,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     livePanelService.stop();
     wakeUpSweep.stop();
     schedules.stop();
+    videoProduction?.stop();
     wakeUpReaper.stop();
     approvalSweep.stop();
     personResponseSweep.stop();

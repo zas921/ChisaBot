@@ -45,6 +45,7 @@ fun BotsScreen(vm: AppViewModel, onCheckUpdate: () -> Unit, onLogout: () -> Unit
     var menu by remember { mutableStateOf(false) }
     Column(Modifier.fillMaxSize()) {
         TopBar("ChisaBot", subtitle = vm.origin()?.removePrefix("https://")) {
+            IconText("☰", "全部功能", { vm.push(Screen.Features) })
             IconText("⚙", "设置", { vm.openSettings() })
             Box {
                 IconText("⋯", "更多", { menu = true }, size = 22.sp)
@@ -83,6 +84,7 @@ fun BotsScreen(vm: AppViewModel, onCheckUpdate: () -> Unit, onLogout: () -> Unit
 private fun BotRow(vm: AppViewModel, bot: Bot) {
     val sky = LocalSky.current
     var menu by remember { mutableStateOf(false) }
+    var history by remember { mutableStateOf(false) }
     Box {
         Row(
             Modifier.fillMaxWidth().glass(sky, level = 2)
@@ -107,9 +109,10 @@ private fun BotRow(vm: AppViewModel, bot: Bot) {
         DropdownMenu(menu, { menu = false }) {
             DropdownMenuItem({ Text("面板") }, { menu = false; vm.openPanels(bot) })
             DropdownMenuItem({ Text("机器人资料") }, { menu = false; vm.push(Screen.Web("/bots/${bot.id}", bot.name)) })
-            DropdownMenuItem({ Text("历史对话（网页）") }, { menu = false; vm.push(Screen.Web("/channel/new?agent=${bot.id}", bot.name)) })
+            DropdownMenuItem({ Text("历史对话") }, { menu = false; history = true })
         }
     }
+    if (history) ConversationHistory(vm, bot) { history = false }
 }
 
 @Composable

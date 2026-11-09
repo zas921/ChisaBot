@@ -10,6 +10,7 @@ import {
 import { Observable, type Subscription } from "rxjs";
 import { currentConfirmTurn, currentToolAbort } from "../confirmations/context";
 import { REFUSAL_MARKER } from "../plugins/tools";
+import { guardToolCallStream } from "./tool-stream-guard";
 import {
   compactHistoryForModel,
   shouldContinueToolSegments,
@@ -51,7 +52,9 @@ class SegmentTransport extends AbstractAgent {
     super({ initialMessages: input.messages, initialState: input.state });
   }
   run(input: RunAgentInput) {
-    return this.source(input);
+    const signal = currentToolAbort();
+    const turn = currentConfirmTurn();
+    return guardToolCallStream(this.source(input), () => Boolean(signal?.aborted || turn?.stopped()));
   }
 }
 
@@ -159,7 +162,10 @@ class ToolContinuationMiddleware extends Middleware {
               message.role === "tool" ? message.toolCallId : "",
             ),
           );
-          const last = messages.at(-1);
+          // Providers may append a reasoning message (including an empty/encrypted one)
+          // after the final tool result at a segment boundary. It is not a final answer.
+          // Keep it in history, but inspect the last non-reasoning message for progress.
+          const last = messages.findLast((message) => message.role !== "reasoning");
           // Only the last tool group controls failure here: an earlier recoverable
           // error may already have been fixed by the model inside this segment.
           const lastCall = messages.findLast(

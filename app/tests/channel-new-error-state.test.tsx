@@ -1,6 +1,6 @@
 import "./channel-new-error-state.fixture";
 
-import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, expect, test } from "bun:test";
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
@@ -16,12 +16,24 @@ import { type AgentProfile, agentKeys } from "@/lib/agents/queries";
 import { authKeys } from "@/lib/auth/queries";
 import { userPreferencesQueryOptions } from "@/lib/settings/message-list";
 import { Route as ChannelNewRoute } from "@/routes/_authed/_app/channel/new";
+import { type AgentChannel, channelKeys } from "@/lib/channels/queries";
 
-beforeAll(() => GlobalRegistrator.register());
+const originalFetch = globalThis.fetch;
+const NativeResponse = globalThis.Response;
+let readLatest: () => Promise<Response>;
+beforeEach(() => { readLatest = async () => NativeResponse.json({ channel: null }); });
+beforeAll(() => {
+  GlobalRegistrator.register();
+  globalThis.fetch = Object.assign(async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+    const path = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    if (path.startsWith("/api/channels/direct/")) return readLatest();
+    return originalFetch(input, init);
+  }, originalFetch);
+});
 
 afterEach(() => cleanup());
 
-afterAll(() => GlobalRegistrator.unregister());
+afterAll(() => { globalThis.fetch = originalFetch; GlobalRegistrator.unregister(); });
 
 function agent(
   overrides: Partial<AgentProfile> & { id: string },
@@ -107,7 +119,11 @@ const testChannelNewRoute = ChannelNewRoute.update({
   getParentRoute: () => appRoute,
 } as TestFileRouteWiring);
 const routeTree = rootRoute.addChildren([
-  authedRoute.addChildren([appRoute.addChildren([testChannelNewRoute])]),
+  authedRoute.addChildren([appRoute.addChildren([testChannelNewRoute, createRoute({
+    getParentRoute: () => appRoute,
+    path: "/channel/$channelId",
+    component: () => <p>{"Existing conversation"}</p>,
+  })])]),
 ]);
 
 function renderChannelNew(
@@ -293,4 +309,36 @@ test("/channel/new keeps a usable hidden detail when a background refetch fails"
 
   expect(view.queryByRole("alert")).toBeNull();
   await expectMessageComposerDisabled(view, false);
+});
+
+test("/channel/new finds existing history outside the loaded roster page before showing an empty chat", async () => {
+  const queryClient = queryClientWithAgents([GENERAL_ASSISTANT]);
+  queryClient.setQueryData(channelKeys.list(), { pages: [{ channels: [], nextCursor: "page-two" }], pageParams: [""] });
+  const channel: AgentChannel = { id: "older-channel", name: "Saved", agentIds: [GENERAL_ASSISTANT.id], threadId: "saved-thread", active: true, lastMessageAt: "2026-01-01T00:00:00Z" };
+  let complete!: (response: Response) => void;
+  readLatest = () => new Promise((resolve) => { complete = resolve; });
+  const view = renderChannelNew(queryClient, `/channel/new?agent=${GENERAL_ASSISTANT.id}`);
+  expect(await view.findByRole("status")).toBeTruthy();
+  expect(view.queryByRole("textbox", { hidden: true })).toBeNull();
+  complete(NativeResponse.json({ channel }));
+  expect(await view.findByText("Existing conversation")).toBeTruthy();
+  expect(queryClient.getQueryData<AgentChannel>(channelKeys.detail(channel.id))).toEqual(channel);
+});
+
+test("failed conversation lookup does not pretend a Bot has no history and can be retried", async () => {
+  readLatest = async () => NativeResponse.json({ error: "unavailable" }, { status: 503 });
+  const view = renderChannelNew(queryClientWithAgents([GENERAL_ASSISTANT]), `/channel/new?agent=${GENERAL_ASSISTANT.id}`);
+  expect((await view.findByRole("alert")).textContent).toContain("对话暂时没有加载出来");
+  await expectMessageComposerDisabled(view, true);
+  readLatest = async () => NativeResponse.json({ channel: null });
+  view.getByRole("button", { name: "重试" }).click();
+  await expectMessageComposerDisabled(view, false);
+});
+
+test("explicit new topic skips the existing conversation lookup", async () => {
+  let reads = 0;
+  readLatest = async () => { reads++; throw new Error("should not read"); };
+  const view = renderChannelNew(queryClientWithAgents([GENERAL_ASSISTANT]), `/channel/new?agent=${GENERAL_ASSISTANT.id}&topic=new`);
+  await expectMessageComposerDisabled(view, false);
+  expect(reads).toBe(0);
 });

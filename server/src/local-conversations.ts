@@ -25,9 +25,11 @@ import {
   type ThreadContextReading,
 } from "./context-usage";
 import type { Database } from "./db/client";
+import { frontendToolFinish, FrontendToolHandoff } from "./frontend-tool-handoff";
 import { imageDimsFor } from "./image-dims";
 import {
   anchorsPresent,
+  currentWorkerResultDelivery,
   INBOX_TEXT_LIMIT,
   isWorkerResult,
   newSteerSession,
@@ -243,6 +245,7 @@ type ThreadRow = {
   archived: boolean;
   messages: Message[];
   state: Record<string, unknown>;
+  snapshot_sequence: string | number | bigint | null;
   run_id: string | null;
   lock_expires_at: Date | null;
   created_at: Date;
@@ -250,6 +253,7 @@ type ThreadRow = {
 };
 type EventRow = { sequence: string | number | bigint; event: BaseEvent };
 type ThreadIdentity = { threadId: string; userId: string };
+type ThreadMetadata = Omit<ThreadRow, "messages" | "state" | "snapshot_sequence">;
 type ThreadCreation = ThreadIdentity & {
   agentId: string;
   learningContainerId?: string;
@@ -257,7 +261,7 @@ type ThreadCreation = ThreadIdentity & {
 type ThreadLock = ThreadCreation & { runId: string; ttlSeconds?: number };
 type LeaseIdentity = { threadId: string; runId: string };
 
-function record(row: ThreadRow) {
+function record(row: ThreadMetadata) {
   return {
     id: row.id,
     name: row.name,
@@ -278,6 +282,16 @@ function ttl(seconds = 120) {
 
 class ConversationStore {
   constructor(readonly database: Database) {}
+
+  async metadata(threadId: string, userId?: string): Promise<ThreadMetadata> {
+    const [row] = await this.database.$client.unsafe<ThreadMetadata[]>(
+      `SELECT id, owner_user_id, agent_id, name, archived, run_id, lock_expires_at, created_at, updated_at
+       FROM openbot_local_threads WHERE id = $1 AND ($2::text IS NULL OR owner_user_id = $2)`,
+      [threadId, userId ?? null],
+    );
+    if (!row) throw new LocalConversationError("Thread not found", 404);
+    return row;
+  }
 
   async thread(threadId: string): Promise<ThreadRow> {
     const rows = await this.database.$client.unsafe<ThreadRow[]>(
@@ -314,16 +328,26 @@ class ConversationStore {
     return value == null ? 0n : BigInt(value);
   }
 
+  async eventsAfterSnapshot(threadId: string, runId: string, after: bigint): Promise<EventRow[]> {
+    return this.database.$client.unsafe<EventRow[]>(
+      `SELECT sequence, event FROM openbot_local_events
+       WHERE thread_id = $1 AND run_id = $2 AND sequence > $3::text::bigint ORDER BY sequence`,
+      [threadId, runId, after.toString()],
+    );
+  }
+
   async snapshot(
     threadId: string,
     runId: string,
     messages: readonly Message[],
     state: unknown,
+    sequence: bigint,
   ) {
     const rows = await this.database.$client.unsafe(
-      `UPDATE openbot_local_threads SET messages = $3::text::jsonb, state = $4::text::jsonb, updated_at = now()
+      `UPDATE openbot_local_threads SET messages = $3::text::jsonb, state = $4::text::jsonb,
+         snapshot_sequence = $5::text::bigint, updated_at = now()
        WHERE id = $1 AND run_id = $2 AND lock_expires_at > now() RETURNING id`,
-      [threadId, runId, JSON.stringify(messages), JSON.stringify(state ?? {})],
+      [threadId, runId, JSON.stringify(messages), JSON.stringify(state ?? {}), sequence.toString()],
     );
     if (rows.length === 0)
       throw new LocalConversationError(
@@ -454,7 +478,7 @@ export class LocalConversationClient {
   constructor(private readonly store: ConversationStore) {}
 
   async getThread(identity: ThreadIdentity) {
-    return record(await this.store.owned(identity));
+    return record(await this.store.metadata(identity.threadId, identity.userId));
   }
 
   async getOrCreateThread(identity: ThreadCreation) {
@@ -468,7 +492,7 @@ export class LocalConversationClient {
        ON CONFLICT (id) DO NOTHING`,
       [identity.threadId, identity.userId, identity.agentId],
     );
-    const row = await this.store.owned(identity);
+    const row = await this.store.metadata(identity.threadId, identity.userId);
     if (row.agent_id !== identity.agentId)
       throw new LocalConversationError(
         "Thread belongs to a different agent",
@@ -607,19 +631,20 @@ export class LocalConversationClient {
   }
 }
 
-/** A wire run can end while its frontend tools are still executing in the browser. */
-function pendingFrontendCalls(messages: readonly Message[], tools: readonly { name: string }[]): string[] {
-  const frontend = new Set(tools.map((tool) => tool.name));
-  const answered = new Set(messages.flatMap((message) => message.role === "tool" ? [message.toolCallId] : []));
-  return messages.flatMap((message) => message.role === "assistant"
-    ? (message.toolCalls ?? []).filter((call) => frontend.has(call.function.name) && !answered.has(call.id)).map((call) => call.id)
-    : []);
+function localRunFailureCode(error: unknown): string {
+  if (error && typeof error === "object" && "code" in error && error.code === "DATABASE_TIMEOUT")
+    return "DATABASE_TIMEOUT";
+  if (error instanceof LocalConversationError && error.message === "Thread run no longer owns its lock")
+    return "THREAD_LEASE_LOST";
+  return "LOCAL_RUN_FAILED";
 }
 
 type FrontendRelay = {
   runId: string;
   inboxRunIds: string[];
   callIds: string[];
+  claimedCommands?: Set<string>;
+  receivedUserMessageIds: Set<string>;
   closing?: Promise<void>;
   /** 执行这些前端工具的页面最近一次报平安的时刻（毫秒）。 */
   aliveAt: number;
@@ -638,6 +663,13 @@ export const RELAY_STALE_MS = (() => {
   return Number.isFinite(seconds) && seconds >= 30 ? Math.floor(seconds * 1000) : 150_000;
 })();
 type LiveEvent = { sequence: bigint; event: BaseEvent };
+/** Full transcript updates rewrite a large JSON value; durable deltas remain per event. */
+const SNAPSHOT_DELTA_INTERVAL_MS = 2_000;
+const SNAPSHOT_DELTA_TYPES = new Set<string>([
+  EventType.TEXT_MESSAGE_CONTENT,
+  EventType.TOOL_CALL_ARGS,
+  EventType.REASONING_MESSAGE_CONTENT,
+]);
 type ActiveRun = {
   runId: string;
   agent: AbstractAgent;
@@ -652,6 +684,9 @@ type ActiveRun = {
   /** Inbox claims belong to the logical turn, including earlier frontend handoffs. */
   inboxRunIds: string[];
   inputMessageIds: Set<string>;
+  frontendHandoff: FrontendToolHandoff;
+  /** Transport receipts exist before lease acquisition and the first durable snapshot. */
+  receivedUserMessageIds: Set<string>;
 };
 
 /** 一次运行最多接着跑几段（每段 = 一次完整的模型循环；段与段之间读进新排队的消息）。 */
@@ -702,9 +737,8 @@ export class PostgresAgentRunner extends AgentRunner {
     })();
     return relay.closing;
   }
-  private pendingFrontend(entry: ActiveRun, tools: readonly { name: string }[]): string[] {
-    const fresh = entry.agent.messages.filter((message) => !entry.inputMessageIds.has(message.id));
-    return pendingFrontendCalls(fresh, tools);
+  private freshMessages(entry: ActiveRun): Message[] {
+    return entry.agent.messages.filter((message) => !entry.inputMessageIds.has(message.id));
   }
   private readonly observers = new Map<
     string,
@@ -731,6 +765,25 @@ export class PostgresAgentRunner extends AgentRunner {
   /** 只剩接力：模型段已经结束，服务器在等某个页面里的浏览器工具交结果。 */
   isRelay(threadId: string): boolean {
     return !this.active.has(threadId) && this.frontend.has(threadId);
+  }
+
+  /** Atomically reserve only a command explicitly left for this browser handoff. */
+  claimFrontendCommand(threadId: string, runId: string, toolCallId: string): boolean {
+    const relay = this.frontend.get(threadId);
+    if (!runId || !toolCallId || !relay || relay.closing || relay.runId !== runId || !relay.callIds.includes(toolCallId))
+      return false;
+    const claims = relay.claimedCommands ??= new Set<string>();
+    if (claims.has(toolCallId)) return false;
+    claims.add(toolCallId);
+    return true;
+  }
+
+  /** Positive evidence only; absence cannot rule out a request still before runner.run. */
+  receivedUserMessage(threadId: string, messageId: string): string | null {
+    const entry = this.active.get(threadId);
+    if (entry?.receivedUserMessageIds.has(messageId)) return entry.runId;
+    const relay = this.frontend.get(threadId);
+    return relay?.receivedUserMessageIds.has(messageId) ? relay.runId : null;
   }
 
   /** 每个对话最近一次页面报平安的时刻（接力还没出现时先记着，出现时据此判断有没有人守着）。 */
@@ -787,12 +840,14 @@ export class PostgresAgentRunner extends AgentRunner {
         "Run thread and runId are required",
         400,
       );
+    const receivedUserMessageIds = new Set(request.input.messages.filter((message) => message.role === "user").map((message) => message.id));
     const running = this.active.get(request.threadId);
     // 正在回答时又发来消息：不拒绝、不打断。新的用户消息进收件箱（下一步读进去），这个请求接上正在跑的那一轮。
     if (running) {
+      for (const id of receivedUserMessageIds) running.receivedUserMessageIds.add(id);
       // RUN_FINISHED can reach the browser a few awaits before execute's cleanup finishes.
       // A frontend result in that window must resume after cleanup, rather than join and lose it.
-      const pending = this.pendingFrontend(running, request.input.tools);
+      const pending = running.stopped ? [] : running.frontendHandoff.pending(this.freshMessages(running));
       const answered = new Set(request.input.messages.flatMap((message) => message.role === "tool" ? [message.toolCallId] : []));
       if (pending.length && pending.every((id) => answered.has(id))) {
         return new Observable<BaseEvent>((subscriber) => {
@@ -808,6 +863,7 @@ export class PostgresAgentRunner extends AgentRunner {
     }
     const relay = this.frontend.get(request.threadId);
     if (relay) {
+      for (const id of receivedUserMessageIds) relay.receivedUserMessageIds.add(id);
       if (relay.closing) return new Observable<BaseEvent>((subscriber) => {
         let subscription: { unsubscribe(): void } | undefined;
         let closed = false;
@@ -848,6 +904,8 @@ export class PostgresAgentRunner extends AgentRunner {
       injections: [],
       inboxRunIds: [...(relay?.inboxRunIds ?? []), request.input.runId],
       inputMessageIds: new Set(),
+      frontendHandoff: new FrontendToolHandoff(request.input.tools),
+      receivedUserMessageIds: new Set([...(relay?.receivedUserMessageIds ?? []), ...receivedUserMessageIds]),
     };
     this.active.set(request.threadId, entry);
     entry.done = this.execute(request, entry);
@@ -899,8 +957,12 @@ export class PostgresAgentRunner extends AgentRunner {
     entry: ActiveRun,
   ): Promise<void> {
     const { threadId, agent, input } = request;
+    const workerResultIds = request.persistedInputMessages === undefined
+      ? undefined : currentWorkerResultDelivery(threadId, entry.runId);
+    const claimInbox = () => this.inbox.claim(threadId, entry.runId, workerResultIds);
     let started = false;
     let heartbeat: ReturnType<typeof setInterval> | undefined;
+    let renewal: Promise<void> | undefined;
     let persistenceError: unknown;
     let terminal = false;
     let runStarted = false;
@@ -912,6 +974,10 @@ export class PostgresAgentRunner extends AgentRunner {
     /** 段与段之间扣下的 RUN_FINISHED：还要接着跑就丢掉，最后一段的才发出去。 */
     let heldFinish: BaseEvent | undefined;
     let segmenting = false;
+    let lastEventSequence = 0n;
+    let lastSnapshotAt = 0;
+    let coalesceCapture = false;
+    let pendingCapture: { messages: Message[]; state: unknown; sequence: bigint } | undefined;
     /** 智能体最近一次报告的消息列表（不含插话）。 */
     let latest: Message[] = [];
     /** 已读进来、但它紧跟的工具结果还没到消息列表里的插话：等到了再推快照。 */
@@ -952,6 +1018,8 @@ export class PostgresAgentRunner extends AgentRunner {
         entry.runId,
         published,
       );
+      lastEventSequence = sequence;
+      entry.frontendHandoff.observe(published);
       finalizer.observe(published);
       runStarted ||= published.type === EventType.RUN_STARTED;
       terminal ||=
@@ -963,19 +1031,22 @@ export class PostgresAgentRunner extends AgentRunner {
       notify(published);
     };
     // AG-UI catches subscriber exceptions. Remember failed writes and stop the producer ourselves.
+    const failPersistence = (error: unknown) => {
+      persistenceError ??= error;
+      try {
+        agent.abortRun();
+      } catch {
+        /* Finalization reports the original write failure. */
+      }
+      void agent.detachActiveRun();
+    };
     const guarded = (action: () => Promise<unknown>): Promise<void> => {
       durableWrites = durableWrites.then(async () => {
         if (persistenceError) return;
         try {
           await action();
         } catch (error) {
-          persistenceError = error;
-          try {
-            agent.abortRun();
-          } catch {
-            /* Finalization reports the original write failure. */
-          }
-          void agent.detachActiveRun();
+          failPersistence(error);
         }
       });
       return durableWrites;
@@ -990,18 +1061,27 @@ export class PostgresAgentRunner extends AgentRunner {
         } as BaseEvent),
       );
     };
-    // AG-UI invokes these callbacks without awaiting them. Freeze each snapshot and queue it
-    // with event writes so an earlier partial snapshot cannot overwrite the completed transcript.
+    const flushCapture = async () => {
+      const capture = pendingCapture;
+      if (!capture) return;
+      pendingCapture = undefined;
+      await this.store.snapshot(
+        threadId, entry.runId, prepared.project(capture.messages),
+        prepared.sanitize(capture.state), capture.sequence,
+      );
+      lastSnapshotAt = Date.now();
+    };
+    // Deltas are individually durable and replayable. Only coalesce their full checkpoints;
+    // semantic boundaries and finalization still flush immediately through the ordered queue.
     const capture = (
       messages: readonly Readonly<Message>[],
       state: unknown,
     ) => {
       latest = structuredClone(messages) as Message[];
-      const savedMessages = prepared.project(woven(latest));
-      const savedState = prepared.sanitize(structuredClone(state));
-      const write = guarded(() =>
-        this.store.snapshot(threadId, entry.runId, savedMessages, savedState),
-      );
+      pendingCapture = { messages: woven(latest), state: structuredClone(state), sequence: lastEventSequence };
+      const write = !coalesceCapture || Date.now() - lastSnapshotAt >= SNAPSHOT_DELTA_INTERVAL_MS
+        ? guarded(flushCapture)
+        : durableWrites;
       if (
         pendingNotices.length &&
         pendingNotices.every((anchors) => anchorsPresent(latest, anchors))
@@ -1015,7 +1095,7 @@ export class PostgresAgentRunner extends AgentRunner {
       newSteerSession(
         async () => {
           if (entry.stopped) return [];
-          return (await this.inbox.claim(threadId, entry.runId)).map(
+          return (await claimInbox()).map(
             (claimed) => claimed.message,
           );
         },
@@ -1030,7 +1110,18 @@ export class PostgresAgentRunner extends AgentRunner {
       if (heldFinish && !terminal) {
         const finish = heldFinish;
         heldFinish = undefined;
-        await emit(finish);
+        if (!entry.stopped && interruptionMessage === undefined) {
+          const handoff = frontendToolFinish(finish);
+          if (handoff && entry.frontendHandoff.inspect(this.freshMessages(entry), handoff.ids).incomplete) {
+            await emit({
+              type: EventType.RUN_ERROR,
+              code: "INCOMPLETE_TOOL_CALL",
+              message: "工具参数不完整，本次调用未执行。已完成的步骤仍保留。",
+            });
+          } else {
+            await emit(finish);
+          }
+        }
       }
       if (!runStarted && !terminal)
         await emit({
@@ -1069,10 +1160,11 @@ export class PostgresAgentRunner extends AgentRunner {
         entry.runId,
         prepared.project(woven(agent.messages)),
         prepared.sanitize(agent.state),
+        lastEventSequence,
       );
     };
     try {
-      const identity = await this.store.thread(threadId);
+      const identity = await this.store.metadata(threadId);
       if (agent.agentId && agent.agentId !== identity.agent_id)
         throw new LocalConversationError(
           "Thread belongs to a different agent",
@@ -1097,6 +1189,14 @@ export class PostgresAgentRunner extends AgentRunner {
           throw new LocalConversationError("Run ID was already used", 409);
       });
       started = true;
+      // Lease renewal must not queue behind transcript writes. Start immediately after
+      // acquisition, including while loading a long history, and fence every renewal by run ID.
+      heartbeat = setInterval(() => {
+        if (renewal || persistenceError) return;
+        renewal = this.client.ɵrenewThreadLock({ threadId, runId: entry.runId, ttlSeconds: 120 })
+          .then(() => {}, failPersistence)
+          .finally(() => { renewal = undefined; });
+      }, 30_000);
       // Read after claiming so a prior run finishing during acquisition cannot leave stale history.
       const row = await this.store.thread(threadId);
       // 重新生成 / 编辑后重发截掉的消息（DESIGN.md §67）：还没收到截断的旧设备会把它们一起发上来，滤掉，不让它们复活。
@@ -1109,6 +1209,25 @@ export class PostgresAgentRunner extends AgentRunner {
         ? dropTombstoned(request.persistedInputMessages, dead).filter((message) => !held.has(message.id))
         : incoming;
       const storedIds = new Set(row.messages.map((message) => message.id));
+      if (workerResultIds) {
+        const [latestEnd] = await this.store.database.$client.unsafe<{ waiting: boolean }[]>(
+          `SELECT COALESCE(event->'outcome'->>'type' = 'interrupt' OR event->'metadata' ? 'openbotWaiting', false) AS waiting
+           FROM openbot_local_events WHERE thread_id = $1 AND event->>'type' IN ('RUN_FINISHED', 'RUN_ERROR')
+           ORDER BY sequence DESC LIMIT 1`, [threadId],
+        );
+        if (row.archived || latestEnd?.waiting) return;
+      }
+      // A server wake is authorized by the selected, still-queued worker notices, not by a
+      // synthetic new user message. Claim after taking the thread lease: another run may
+      // already have read the results, or an explicit Stop may have held them in the meantime.
+      const workerBatch = workerResultIds
+        ? await claimInbox()
+        : undefined;
+      if (workerBatch && !workerBatch.length) return;
+      if (workerBatch) {
+        incoming = incoming.filter((message) => storedIds.has(message.id));
+        visible = visible.filter((message) => storedIds.has(message.id));
+      }
       const backgroundDelivery = Boolean(input.forwardedProps?.chisabotWorkerDelivery) || request.persistedInputMessages !== undefined;
       const freshUser = !backgroundDelivery && incoming.some((message) => message.role === "user" && !isWorkerResult(message) && !storedIds.has(message.id));
       const resume = input.forwardedProps?.chisabotInboxResume as { sourceId?: unknown; messageId?: unknown } | undefined;
@@ -1150,8 +1269,11 @@ export class PostgresAgentRunner extends AgentRunner {
           .map((message) => message.id),
       );
       // Paused supplements stay held; only newly queued messages can enter this turn.
-      const early = await this.inbox.claim(threadId, entry.runId);
-      const execution = [...prepared.execution];
+      const early = workerBatch ?? await claimInbox();
+      // The model already receives this compact view. Give the event reducer the same view:
+      // otherwise AG-UI clones all archived tool output for every streamed token. project()
+      // still restores the complete, unchanged saved history before any checkpoint or UI snapshot.
+      const execution = [...compactHistoryForModel(prepared.execution).messages];
       for (const claimed of early) {
         if (execution.some((message) => message.id === claimed.message.id))
           continue;
@@ -1171,26 +1293,16 @@ export class PostgresAgentRunner extends AgentRunner {
           ? row.state
           : (input.state ?? {}),
       );
+      lastEventSequence = await this.store.lastEventSequence(threadId);
       await this.store.snapshot(
         threadId,
         entry.runId,
         prepared.project(woven(prepared.visible)),
         prepared.sanitize(agent.state),
+        lastEventSequence,
       );
-      let renewing = false;
-      heartbeat = setInterval(() => {
-        if (renewing) return;
-        renewing = true;
-        void guarded(() =>
-          this.client.ɵrenewThreadLock({
-            threadId,
-            runId: entry.runId,
-            ttlSeconds: 120,
-          }),
-        ).finally(() => {
-          renewing = false;
-        });
-      }, 30_000);
+      lastSnapshotAt = Date.now();
+      if (persistenceError) throw persistenceError;
       for (
         let segment = 0;
         segment < MAX_SEGMENTS && !entry.stopped;
@@ -1208,8 +1320,16 @@ export class PostgresAgentRunner extends AgentRunner {
             withToolAbort(entry.abort.signal, () =>
               withSteering(steering(), () =>
                 agent.runAgent(segmentInput, {
-                  onEvent: ({ event }) =>
-                    guarded(() => emit(structuredClone(event))),
+                  onEvent: ({ event }) => {
+                    const copied = structuredClone(event);
+                    const delta = SNAPSHOT_DELTA_TYPES.has(copied.type);
+                    coalesceCapture = delta;
+                    return guarded(async () => {
+                      // Persist a tool's complete arguments before allowing END / approval.
+                      if (!delta) await flushCapture();
+                      await emit(copied);
+                    });
+                  },
                   onMessagesChanged: ({ messages, state }) =>
                     capture(messages, state),
                   onStateChanged: ({ messages, state }) =>
@@ -1222,16 +1342,20 @@ export class PostgresAgentRunner extends AgentRunner {
             ),
         );
         await finalization;
+        await guarded(flushCapture);
         await durableWrites;
         if (persistenceError || failed || entry.stopped || !heldFinish) break;
         // RUN_FINISHED ends only the wire segment when frontend tools have no results yet.
         // Claiming here would put a user row ahead of those results; the seeded-history
         // sanitizer then correctly removes the dangling call and the model issues it again.
-        if (this.pendingFrontend(entry, input.tools).length) break;
+        const finish = frontendToolFinish(heldFinish);
+        if (!finish) break;
+        const handoff = entry.frontendHandoff.inspect(this.freshMessages(entry), finish.ids);
+        if (handoff.incomplete || handoff.ready.length) break;
         // 这一段正常结束了，收件箱里还有没读的：同一次运行接着开下一段，把它们读进去。
         const more =
           segment + 1 < MAX_SEGMENTS
-            ? await this.inbox.claim(threadId, entry.runId)
+            ? await claimInbox()
             : [];
         if (!more.length) break;
         const base = woven(agent.messages);
@@ -1253,6 +1377,7 @@ export class PostgresAgentRunner extends AgentRunner {
             entry.runId,
             prepared.project(base),
             prepared.sanitize(agent.state),
+            lastEventSequence,
           ),
         );
       }
@@ -1261,6 +1386,7 @@ export class PostgresAgentRunner extends AgentRunner {
         clearInterval(heartbeat);
         heartbeat = undefined;
       }
+      await renewal;
       await durableWrites;
       if (persistenceError) throw persistenceError;
       await finalize();
@@ -1271,6 +1397,7 @@ export class PostgresAgentRunner extends AgentRunner {
         clearInterval(heartbeat);
         heartbeat = undefined;
       }
+      await renewal;
       await durableWrites;
       if (started && !persistenceError) {
         try {
@@ -1282,11 +1409,16 @@ export class PostgresAgentRunner extends AgentRunner {
         }
       }
       if (!started || persistenceError) {
+        if (started && !entry.stopped) console.warn(JSON.stringify({
+          type: "local-run-failed", threadId, runId: entry.runId, stage: "persistence",
+          code: localRunFailureCode(persistenceError ?? error),
+        }));
         entry.stream.error(persistenceError ?? error);
         entry.live.error(persistenceError ?? error);
       }
     } finally {
       if (heartbeat) clearInterval(heartbeat);
+      await renewal;
       if (started) {
         try {
           await this.store.database.$client.unsafe(
@@ -1298,18 +1430,9 @@ export class PostgresAgentRunner extends AgentRunner {
             ],
           );
           const callIds = !entry.stopped && !failed && !persistenceError
-            ? this.pendingFrontend(entry, input.tools)
+            ? entry.frontendHandoff.pending(this.freshMessages(entry))
             : [];
-          if (callIds.length) {
-            const heardAt = this.heard(threadId);
-            const relay: FrontendRelay = {
-              runId: entry.runId,
-              inboxRunIds: entry.inboxRunIds,
-              callIds,
-              aliveAt: heardAt ?? Date.now(),
-            };
-            this.frontend.set(threadId, relay);
-          } else {
+          if (!callIds.length) {
             for (const runId of entry.inboxRunIds) await this.inbox.settle(
               threadId,
               runId,
@@ -1320,18 +1443,28 @@ export class PostgresAgentRunner extends AgentRunner {
             threadId,
             runId: entry.runId,
           });
-          // Stop can arrive while lease cleanup awaits the database, after the relay was
-          // installed. It still targets the active entry then, so reconcile that late stop
-          // before deleting active and exposing a stray relay as a 25-minute busy turn.
+          // The lease must be released before accepting results. Stop can still arrive
+          // while that database write is pending; it must not leave an executable relay.
           if (entry.stopped) {
-            if (this.frontend.get(threadId)?.runId === entry.runId) this.clearFrontend(threadId);
             for (const runId of entry.inboxRunIds) await this.inbox.settle(threadId, runId, "stopped");
             await this.store.database.$client.unsafe(
               "UPDATE openbot_local_runs SET status = 'stopped', finished_at = now() WHERE thread_id = $1 AND run_id = $2",
               [threadId, entry.runId],
             );
+          } else if (callIds.length) {
+            this.frontend.set(threadId, {
+              runId: entry.runId,
+              inboxRunIds: entry.inboxRunIds,
+              callIds,
+              receivedUserMessageIds: entry.receivedUserMessageIds,
+              aliveAt: this.heard(threadId) ?? Date.now(),
+            });
           }
         } catch (error) {
+          if (!entry.stopped) console.warn(JSON.stringify({
+            type: "local-run-failed", threadId, runId: entry.runId, stage: "cleanup",
+            code: localRunFailureCode(error),
+          }));
           entry.stream.error(error);
           entry.live.error(error);
         }
@@ -1375,13 +1508,17 @@ export class PostgresAgentRunner extends AgentRunner {
          * apply 这些事件时，发消息的 `/run` 被拖住（busy/activity 已发出、/run 迟迟不到 nginx），乐观气泡
          * 干等几十秒；sync 仍 200，v0.1.18 的「连不上」路径也不会触发。
          *
-         * 存档消息列才是权威快照（和 GET .../messages 同源）。接入时发一条 MESSAGES_SNAPSHOT + STATE，
-         * 再接上正在跑的那一轮的 live 事件即可；历史事件日志不再整段下发。仍保留 events() 给调试接口。
+         * The snapshot and its sequence are read together. Only replay the current run's
+         * durable suffix; a separate max(sequence) read here would skip unsnapshotted deltas.
          */
         const row = await this.store.thread(request.threadId);
         if (request.agentId && row.agent_id !== request.agentId)
           throw new LocalConversationError("Thread not found", 404);
-        lastSequence = await this.store.lastEventSequence(request.threadId);
+        const replayEntry = entry && (!row.run_id || row.run_id === entry.runId) ? entry : undefined;
+        const tail = replayEntry
+          ? await this.store.eventsAfterSnapshot(request.threadId, replayEntry.runId, BigInt(row.snapshot_sequence ?? 0))
+          : [];
+        lastSequence = replayEntry ? BigInt(row.snapshot_sequence ?? 0) : 0n;
         const dims = imageDimsFor(this.store.database);
         /*
          * Track B：长对话压力——全量 annotate 上千条再一次塞进浏览器仍会拖住 `/run`。
@@ -1407,6 +1544,14 @@ export class PostgresAgentRunner extends AgentRunner {
           type: EventType.STATE_SNAPSHOT,
           snapshot: row.state ?? {},
         } as BaseEvent);
+        if (entry && !replayEntry) {
+          subscriber.complete();
+          return;
+        }
+        for (const item of tail) {
+          lastSequence = BigInt(item.sequence);
+          subscriber.next(item.event);
+        }
         ready = true;
         for (const item of pending)
           if (item.sequence > lastSequence) {
@@ -1522,6 +1667,7 @@ export type LocalConversationBackend = {
   runner: AgentRunner;
   control: LocalRunControl;
   inbox: ThreadInbox;
+  claimFrontendCommand(threadId: string, runId: string, toolCallId: string): boolean;
   /** 后台任务服务建好以后挂上来（index.ts）。 */
   setWorkers(routes: ThreadWorkerRoutes): void;
   handle(request: Request, actorId: string): Promise<Response | undefined>;
@@ -1538,6 +1684,7 @@ export async function createLocalConversations(
     run_id text, lock_expires_at timestamptz,
     created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now()
   )`);
+  await database.$client.unsafe("ALTER TABLE openbot_local_threads ADD COLUMN IF NOT EXISTS snapshot_sequence bigint");
   await database.$client.unsafe(`CREATE TABLE IF NOT EXISTS openbot_local_runs (
     thread_id text NOT NULL REFERENCES openbot_local_threads(id) ON DELETE CASCADE,
     run_id text NOT NULL, status text NOT NULL,
@@ -1827,6 +1974,35 @@ export async function createLocalConversations(
       if (!encodedId)
         throw new LocalConversationError("Thread is required", 400);
       const threadId = decodeURIComponent(encodedId);
+      // A send receipt must not download or annotate a growing transcript. An idle/missing
+      // snapshot is still unknown: the original /run may be in a request or resolver queue.
+      if (operation === "send-status" && request.method === "GET") {
+        const messageId = url.searchParams.get("messageId") ?? "";
+        const agentId = url.searchParams.get("agentId") ?? "";
+        if (!messageId || messageId.length > 200 || !agentId || agentId.length > 200)
+          throw new LocalConversationError("Agent and message IDs are required", 400);
+        const [identity] = await database.$client.unsafe<{
+          agent_id: string; locked: boolean; persisted: boolean; queued: boolean;
+        }[]>(
+          `SELECT agent_id, run_id IS NOT NULL AND lock_expires_at > now() AS locked,
+             messages @> jsonb_build_array(jsonb_build_object('id', $2::text, 'role', 'user')) AS persisted,
+             EXISTS (SELECT 1 FROM chisabot_thread_inbox q WHERE q.thread_id = t.id AND q.id = $2
+               AND q.owner_user_id = $3 AND q.message->>'role' = 'user') AS queued
+           FROM openbot_local_threads t WHERE t.id = $1 AND t.owner_user_id = $3`,
+          [threadId, messageId, actorId],
+        );
+        if (!identity || identity.agent_id !== agentId)
+          throw new LocalConversationError("Thread not found", 404);
+        const runId = runner.receivedUserMessage(threadId, messageId);
+        const received = identity.persisted || identity.queued || runId !== null ? true : null;
+        return Response.json({
+          threadId, messageId, received,
+          persisted: identity.persisted,
+          running: runner.isActive(threadId) || Boolean(identity.locked),
+          phase: identity.persisted ? "persisted" : received ? "received" : "unknown",
+          runId,
+        }, { headers: { "Cache-Control": "no-store" } });
+      }
       // 新对话第一次打开时还没有这一行（第一条消息才建）：输入框读数、停止标记、收件箱、任务卡片这几个
       // 只读接口回空结果（200），不报 404 —— 浏览器控制台里每开一个新对话就是三条红字（实测 2026-10-13）。
       // 别人的对话也走这里，回的同样是空结果，看不出它存不存在。
@@ -1860,6 +2036,16 @@ export async function createLocalConversations(
         const requestedAgent = url.searchParams.get("agentId");
         if (requestedAgent && requestedAgent !== identity.agent_id) throw new LocalConversationError("Thread not found", 404);
         return Response.json({ running: runner.isActive(threadId), waiting: runner.isRelay(threadId), paused: await inbox.isPaused(threadId), items: await inbox.list(threadId) });
+      }
+      // Progress polling and identity checks must not fetch/decode a multi-megabyte transcript.
+      if (request.method === "GET" && (operation === "workers" || !operation)) {
+        const identity = await store.metadata(threadId, actorId);
+        const requestedAgent = url.searchParams.get("agentId");
+        if (requestedAgent && requestedAgent !== identity.agent_id)
+          throw new LocalConversationError("Thread not found", 404);
+        return Response.json(operation === "workers"
+          ? { workers: workers ? await workers.list(threadId, actorId) : [] }
+          : { thread: record(identity) });
       }
       const row = await store.owned({ threadId, userId: actorId });
       const requestedAgent = url.searchParams.get("agentId");
@@ -2158,6 +2344,7 @@ export async function createLocalConversations(
     runner,
     control,
     inbox,
+    claimFrontendCommand: (threadId, runId, toolCallId) => runner.claimFrontendCommand(threadId, runId, toolCallId),
     setWorkers: (routes) => {
       workers = routes;
     },

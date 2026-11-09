@@ -29,9 +29,11 @@ function setup() {
     setMenu() {}
     loadFile() { return Promise.resolve(); }
     show() {}
+    focus() {}
+    setTitle(value) { this.title = value; }
     setAlwaysOnTop(value) { this.pinned = value; }
     isAlwaysOnTop() { return this.pinned; }
-    destroy() { this.dead = true; }
+    destroy() { this.dead = true; this.emit("closed"); }
   }
   class View {
     constructor(options) { this.options = options; this.webContents = new Contents(); views.push(this); }
@@ -123,5 +125,60 @@ test("top-level navigation and renderer failure tear down remote content", () =>
     ctx.call("open", { id: "next", url: "https://outside.test" });
     ctx.parent.webContents.emit("render-process-gone");
     assert.equal(ctx.views[1].webContents.dead, true);
+  } finally { ctx.host.destroy(); }
+});
+
+test("website login windows retain isolated browser settings and restrict navigation", () => {
+  const ctx = setup();
+  try {
+    ctx.call("open", { id: "panel", url: "https://outside.test" });
+    const contents = ctx.views[0].webContents;
+    for (const url of ["file:///secret", "javascript:alert(1)", "http://outside.test/", "https://user:pass@outside.test/", "https://chisabot.test/chat"])
+      assert.equal(contents.popupHandler({ url }).action, "deny");
+    const options = contents.popupHandler({ url: "https://identity.test/authorize" });
+    assert.equal(options.action, "allow");
+    assert.equal(options.outlivesOpener, false);
+    assert.equal(options.overrideBrowserWindowOptions.parent, ctx.parent);
+    assert.deepEqual(options.overrideBrowserWindowOptions.webPreferences, {
+      session: ctx.isolated, sandbox: true, contextIsolation: true, nodeIntegration: false,
+      webSecurity: true, allowRunningInsecureContent: false, webviewTag: false,
+    });
+    assert.equal(contents.popupHandler({ url: "about:blank" }).action, "allow");
+    const child = new ctx.parent.constructor(options.overrideBrowserWindowOptions);
+    contents.emit("did-create-window", child);
+    assert.equal(child.webContents.popupHandler({ url: "https://another.test" }).action, "deny");
+    for (const eventName of ["will-navigate", "will-redirect"]) {
+      for (const [url, expected] of [["https://identity.test/callback", false], ["about:blank", false], ["https://chisabot.test/chat", true], ["http://identity.test/", true], ["file:///secret", true]]) {
+        let blocked = false;
+        child.webContents.emit(eventName, { preventDefault() { blocked = true; } }, url);
+        assert.equal(blocked, expected, `${eventName}: ${url}`);
+      }
+    }
+    assert.throws(() => ctx.call("control", { id: "panel", action: "reload" }, { sender: child.webContents, senderFrame: child.webContents.mainFrame }));
+    ctx.call("release", "panel");
+    assert.equal(child.dead, true);
+  } finally { ctx.host.destroy(); }
+});
+
+test("website popup count is bounded and pinned media does not cover login", () => {
+  const ctx = setup();
+  try {
+    ctx.call("open", { id: "panel", url: "https://outside.test" });
+    const contents = ctx.views[0].webContents;
+    ctx.call("control", { id: "panel", action: "detach" });
+    const player = ctx.windows[1];
+    player.emit("ready-to-show");
+    const request = () => contents.popupHandler({ url: "https://identity.test/" });
+    const first = new ctx.parent.constructor(request().overrideBrowserWindowOptions);
+    contents.emit("did-create-window", first);
+    assert.equal(first.options.parent, player);
+    assert.equal(first.pinned, true);
+    const second = new ctx.parent.constructor(request().overrideBrowserWindowOptions);
+    contents.emit("did-create-window", second);
+    assert.equal(request().action, "deny");
+    first.destroy();
+    assert.equal(request().action, "allow");
+    ctx.parent.webContents.emit("render-process-gone");
+    assert.equal(second.dead, true);
   } finally { ctx.host.destroy(); }
 });

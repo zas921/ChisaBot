@@ -184,6 +184,8 @@ export type ChannelStore = {
    * would look for the answer.
    */
   direct(actor: AgentActor, agentId: string): Promise<AgentChannel>;
+  /** Read the latest one-to-one conversation across all pages, without creating a channel. */
+  latestDirect?(actor: AgentActor, agentId: string): Promise<AgentChannel | null>;
   /**
    * 一条已有对话的频道（CB-046，DESIGN.md §68）：旧的 `/bot` 对话（`POST /api/threads/mint` 铸的、没有频道）
    * 和「历史对话」里的任何一条，都在同一套频道聊天里打开。这条对话已经有频道 → 那个频道（删过的恢复）；
@@ -439,6 +441,32 @@ export function createChannelStore(
         { isolationLevel: "read committed" },
       );
       return found ? store.get(actor, found) : null;
+    },
+
+    async latestDirect(actor, agentId) {
+      const [latest] = await database
+        .select({ id: channels.id })
+        .from(channels)
+        .innerJoin(channelMemberships, and(
+          eq(channelMemberships.channelId, channels.id),
+          eq(channelMemberships.userId, actor.id),
+        ))
+        .innerJoin(intelligenceChannelMappings, and(
+          eq(intelligenceChannelMappings.channelId, channels.id),
+          eq(intelligenceChannelMappings.userId, actor.id),
+        ))
+        .innerJoin(channelAgents, and(
+          eq(channelAgents.channelId, channels.id),
+          eq(channelAgents.agentId, agentId),
+        ))
+        .where(and(
+          isNull(channels.deletedAt),
+          sql`(select count(*) from ${channelAgents} where ${channelAgents.channelId} = ${channels.id}) = 1`,
+        ))
+        // Pins organize the roster; opening a Bot follows its most recent conversation.
+        .orderBy(sql`${RECENCY} desc`, desc(channels.id))
+        .limit(1);
+      return latest ? store.get(actor, latest.id) : null;
     },
 
     async get(actor, channelId) {
@@ -1300,6 +1328,21 @@ export function createChannelRoutes(
       const channel = await store.openThread(context.var.actor, agentId, threadId);
       if (!channel) return context.json({ error: "没有这条对话" }, 404);
       return context.json({ channel: channelDto(channel) });
+    } catch (error) {
+      return mapStoreError(context, error);
+    }
+  });
+
+  routes.get("/direct/:agentId", requireUser, async (context) => {
+    const agentId = context.req.param("agentId");
+    if (!agentId.trim() || agentId.length > 200)
+      return context.json({ error: "A valid agent id is required." }, 400);
+    if (!store.latestDirect)
+      return context.json({ error: "Conversation lookup is unavailable." }, 503);
+    try {
+      const channel = await store.latestDirect(context.var.actor, agentId);
+      context.header("Cache-Control", "no-store");
+      return context.json({ channel: channel ? channelDto(channel) : null });
     } catch (error) {
       return mapStoreError(context, error);
     }

@@ -1,7 +1,7 @@
 # ChisaBot 文档
 
 ChisaBot 是 CopilotKit/OpenBot 的中文私人助手分支：一台云端服务器上的机器人，替你在任何地方管理你所有的设备。
-这一页是**全部文档的总索引**。截至 2026-10-17：服务器 main `0e23321`（PR #192），客户端最新 v0.1.15。
+这一页是**全部文档的总索引**。历史全量整理基线为 2026-10-17 的 main `0e23321`（PR #192）；2026-10-23 新增优化方案、待办及测试说明，当前本地检查范围见[优化方案](optimization-plan-2026-10-23.md)。
 
 ## 从这里开始
 
@@ -26,6 +26,7 @@ ChisaBot 是 CopilotKit/OpenBot 的中文私人助手分支：一台云端服务
 |---|---|
 | [ROADMAP.md](ROADMAP.md) | 里程碑、现在 / 接下来 / 以后、最近完成 |
 | [BACKLOG.md](BACKLOG.md) | CB-001 起的全部条目、验收标准、状态（GitHub Issues 未开启前它就是 issue 列表） |
+| [optimization-plan-2026-10-23.md](optimization-plan-2026-10-23.md) | 多端一致性、恢复检查点、CI、发布和长对话优化的代码证据、实施顺序与本地验收；对应 CB-089～CB-097 / CB-031 |
 | [decisions.md](decisions.md) | 所有者的长期规则（发布流程、测试安全、版本号、界面原则），带日期 |
 | [CHANGELOG.md](CHANGELOG.md) | 0.1.0 → v0.1.15 及之后的 PR，按发版标签分组 |
 | [adr/](adr/README.md) | 架构决策记录 0001–0014（0012 号空缺） |

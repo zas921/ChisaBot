@@ -10,6 +10,7 @@ import {
   IconX,
 } from "@tabler/icons-react";
 import { useEffect, useRef, useState } from "react";
+import { useDismissedWorkers } from "@/lib/copilot/worker-dismissals";
 import { cn } from "@/lib/utils";
 import {
   ACTIVE_WORKER,
@@ -24,7 +25,7 @@ import {
 /**
  * 后台任务卡片（DESIGN.md §38.2，「思考提示框」）：机器人委派一件事时，在那条回复里出现一张紧凑的玻璃卡——
  * 标题、状态、当前步骤一行、可折叠的清单（✓ 已完成 · ● 正在做 · ○ 未开始 · ! 卡住）、用时，
- * 下面「补充说明」「停止」。做完收成一行结果，点它跳到交回来的那条结果消息。
+ * 下面「补充说明」「停止」。完成后隐藏进度卡；失败的卡片可以关闭，交回来的结果消息仍留在对话里。
  *
  * 不跳动：卡片外框高度只随清单展开 / 收起变化（grid 0fr→1fr 过渡），状态行原地换字；
  * 窄窗口（PC 小窗、手机）里按钮只留图标。
@@ -33,15 +34,20 @@ export function WorkerCard({ workerId, pendingTitle }: { workerId?: string; pend
   const chat = useCopilotChatConfiguration();
   const threadId = chat?.threadId;
   const workers = useThreadWorkers(threadId);
+  const { dismissed, dismiss } = useDismissedWorkers(threadId);
   const worker = workerId ? workers.data?.find((item) => item.id === workerId) : undefined;
+  const workerList = workers.data;
+  const refetch = workers.refetch;
   // 刚委派、列表里还没有它：马上再取一次（之后有任务在跑就自动轮询）。
   useEffect(() => {
-    if (workerId && workers.data && !worker) {
-      const timer = setTimeout(() => void workers.refetch(), 400);
+    if (workerId && workerList && !worker) {
+      const timer = setTimeout(() => void refetch({ cancelRefetch: false }), 400);
       return () => clearTimeout(timer);
     }
-  }, [workerId, worker, workers]);
+  }, [workerId, worker, workerList, refetch]);
   if (!worker) {
+    // 已经有 ID 的旧任务可能不在服务器的最近列表里，不能再画成「正在安排」。
+    if (workerId) return null;
     return (
       <div className="worker-card is-pending" data-testid="worker-card" data-status="pending">
         <div className="worker-head">
@@ -61,9 +67,14 @@ export function WorkerCard({ workerId, pendingTitle }: { workerId?: string; pend
       </div>
     );
   }
+  if (!showsWorkerCard(worker, dismissed)) return null;
   // 同时有不止一个任务在跑：在跑的卡片默认收成一行（点开看清单和按钮），四张展开的卡片会占满一屏。
   const running = workers.data?.filter((item) => ACTIVE_WORKER.includes(item.status)).length ?? 0;
-  return <WorkerCardBody compact={running > 1} threadId={threadId!} worker={worker} />;
+  return <WorkerCardBody compact={running > 1} onDismiss={dismiss} threadId={threadId!} worker={worker} />;
+}
+
+export function showsWorkerCard(worker: WorkerView, dismissed: ReadonlySet<string>): boolean {
+  return ACTIVE_WORKER.includes(worker.status) || (worker.status === "failed" && !dismissed.has(worker.id));
 }
 
 /** 收成一行的摘要是给眼睛看的纯文字：去掉 markdown 记号（审计里出现过「截至 **2026-10-16**」）。 */
@@ -97,7 +108,12 @@ function useNow(active: boolean) {
   return now;
 }
 
-function WorkerCardBody({ compact, threadId, worker }: { compact: boolean; threadId: string; worker: WorkerView }) {
+export function WorkerCardBody({ compact, onDismiss, threadId, worker }: {
+  compact: boolean;
+  onDismiss: (workerId: string) => void;
+  threadId: string;
+  worker: WorkerView;
+}) {
   const active = ACTIVE_WORKER.includes(worker.status);
   const now = useNow(active);
   const [planOpen, setPlanOpen] = useState(true);
@@ -118,7 +134,20 @@ function WorkerCardBody({ compact, threadId, worker }: { compact: boolean; threa
   const started = worker.startedAt ? Date.parse(worker.startedAt) : Date.parse(worker.createdAt);
   const ended = worker.finishedAt ? Date.parse(worker.finishedAt) : now;
   const elapsed = formatElapsed(ended - started);
+  const elapsedLabel = worker.status === "queued" ? "已排队" : worker.startedAt ? active ? "已运行" : "用时" : "已创建";
   const done = worker.plan.filter((step) => step.status === "done").length;
+  const dismissButton = worker.status === "failed" ? (
+    <button
+      aria-label={`关闭后台任务：${worker.title}`}
+      className="worker-btn shrink-0 whitespace-nowrap"
+      onClick={() => onDismiss(worker.id)}
+      title="关闭后台任务"
+      type="button"
+    >
+      <IconX aria-hidden className="size-3.5" />
+      {"关闭"}
+    </button>
+  ) : null;
 
   const run = async (kind: "steer" | "cancel") => {
     setBusy(kind);
@@ -157,8 +186,8 @@ function WorkerCardBody({ compact, threadId, worker }: { compact: boolean; threa
             <IconLoader2 className="size-3.5" />
           </span>
           <span className="worker-title">{worker.title}</span>
-          <span className="worker-line-text" data-testid="worker-step" key={worker.step ?? worker.status}>{stepLine(worker)}</span>
-          <span className="worker-time">{elapsed}</span>
+          <span className="worker-line-text" data-testid="worker-step" key={worker.step ?? worker.status}>{`最近上报步骤：${stepLine(worker)}`}</span>
+          <span className="worker-time">{`${elapsedLabel} ${elapsed}`}</span>
         </button>
         <button aria-expanded={false} aria-label={"展开"} className="worker-more" onClick={() => setRunningOpen(true)} title={"展开"} type="button">
           <IconChevronDown className="size-3.5" />
@@ -180,13 +209,14 @@ function WorkerCardBody({ compact, threadId, worker }: { compact: boolean; threa
           <span className="worker-line-text">
             {ok ? (worker.summary ? plainSummary(worker.summary) : "") || "已完成" : worker.status === "cancelled" ? "已停止" : worker.error || "没有完成"}
           </span>
-          <span className="worker-time">{elapsed}</span>
+          <span className="worker-time">{`${elapsedLabel} ${elapsed}`}</span>
         </button>
         {worker.plan.length ? (
           <button aria-label={"展开详情"} className="worker-more" onClick={() => setExpanded(true)} title={"详情"} type="button">
             <IconChevronDown className="size-3.5" />
           </button>
         ) : null}
+        {dismissButton}
       </div>
     );
   }
@@ -201,7 +231,7 @@ function WorkerCardBody({ compact, threadId, worker }: { compact: boolean; threa
         <span className={cn("worker-chip", `is-${worker.status}`)} data-testid="worker-status">
           {WORKER_STATUS_ZH[worker.status]}
         </span>
-        <span className="worker-time">{elapsed}</span>
+        <span className="worker-time">{`${elapsedLabel} ${elapsed}`}</span>
         {!active || compact ? (
           <button
             aria-expanded
@@ -214,10 +244,11 @@ function WorkerCardBody({ compact, threadId, worker }: { compact: boolean; threa
             <IconChevronDown className="size-3.5 rotate-180" />
           </button>
         ) : null}
+        {dismissButton}
       </div>
       <div className="worker-step" data-testid="worker-step" key={worker.step ?? worker.status}>
         {active
-          ? stepLine(worker)
+          ? `最近上报步骤：${stepLine(worker)}`
           : worker.status === "done"
             ? (worker.summary ? plainSummary(worker.summary) : "") || "已完成"
             : worker.error || WORKER_STATUS_ZH[worker.status]}

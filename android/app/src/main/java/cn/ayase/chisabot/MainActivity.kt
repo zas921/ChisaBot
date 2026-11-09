@@ -130,6 +130,7 @@ class MainActivity : ComponentActivity() {
             when (s) {
                 Screen.Login -> LoginScreen(vm, this@MainActivity)
                 Screen.Bots -> BotsScreen(vm, onCheckUpdate = ::checkUpdate, onLogout = { confirmLogout = true })
+                Screen.Features -> cn.ayase.chisabot.ui.FeaturesScreen(vm)
                 Screen.Settings -> cn.ayase.chisabot.ui.SettingsScreen(vm, onCheckUpdate = ::checkUpdate, onLogout = { confirmLogout = true })
                 is Screen.Chat -> ChatScreen(vm, s.bot)
                 is Screen.Panels -> PanelsScreen(vm, s.bot)

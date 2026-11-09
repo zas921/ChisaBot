@@ -2,6 +2,7 @@ import {
   createContext,
   type ReactNode,
   useContext,
+  useCallback,
   useEffect,
   useRef,
   useState,
@@ -69,22 +70,35 @@ class RunScopedHolder implements BotHolder {
 }
 
 const ActiveBotContext = createContext<BotHolder | null>(null);
-const ActiveBotValueContext = createContext<{
-  botId: string;
-  announce: (botId: string) => void;
-} | null>(null);
+const ActiveBotValueContext = createContext(DEFAULT_BOT_ID);
+const ActiveBotAnnounceContext = createContext<((botId: string) => () => void) | null>(null);
 
 export function ActiveBotProvider({ children }: { children: ReactNode }) {
   const holder = useRef<BotHolder>(new RunScopedHolder());
   const [botId, setBotId] = useState(DEFAULT_BOT_ID);
-  const value = useRef({ botId, announce: setBotId });
-  value.current = { botId, announce: setBotId };
+  const declarations = useRef(new Map<object, string>());
+  const announce = useCallback((nextBotId: string) => {
+    const token = {};
+    declarations.current.set(token, nextBotId);
+    holder.current.current = nextBotId;
+    setBotId(nextBotId);
+    return () => {
+      declarations.current.delete(token);
+      // 删除旧页的声明不能把新页覆盖；恢复的也只能是仍然挂着的声明。
+      const remaining = [...declarations.current.values()];
+      const active = remaining[remaining.length - 1] ?? DEFAULT_BOT_ID;
+      holder.current.current = active;
+      setBotId(active);
+    };
+  }, []);
 
   return (
     <ActiveBotContext.Provider value={holder.current}>
-      <ActiveBotValueContext.Provider value={value.current}>
-        {children}
-      </ActiveBotValueContext.Provider>
+      <ActiveBotAnnounceContext.Provider value={announce}>
+        <ActiveBotValueContext.Provider value={botId}>
+          {children}
+        </ActiveBotValueContext.Provider>
+      </ActiveBotAnnounceContext.Provider>
     </ActiveBotContext.Provider>
   );
 }
@@ -92,26 +106,19 @@ export function ActiveBotProvider({ children }: { children: ReactNode }) {
 /**
  * Declare the Bot this surface drives, for as long as it is mounted.
  *
- * Restores what it found on unmount, so leaving a channel does not leave its Bot addressed by
- * whatever mounts next.
+ * Removes only its own declaration on unmount. The newest still-mounted declaration owns the
+ * holder, so a delayed cleanup cannot restore a Bot from a page that has already gone away.
  *
  * `enabled` false: 这一页还挂着但不是看着的那段（换机器人时它还在回答、被留着等它答完，DESIGN.md §109），
  * 不声明——否则它最后卸载时会把「现在看着的机器人」还原成它挂上之前的那个。它自己的工具调用照样按
  * `bindAgentBot` 认机器人，不靠这里。
  */
 export function useActiveBot(botId: string | undefined, enabled = true): void {
-  const holder = useContext(ActiveBotContext);
-  const value = useContext(ActiveBotValueContext);
+  const announce = useContext(ActiveBotAnnounceContext);
   useEffect(() => {
-    if (!holder || !enabled) return;
-    const previous = holder instanceof RunScopedHolder ? holder.base : holder.current;
-    holder.current = botId ?? DEFAULT_BOT_ID;
-    value?.announce(botId ?? DEFAULT_BOT_ID);
-    return () => {
-      holder.current = previous;
-      value?.announce(previous);
-    };
-  }, [holder, value, botId, enabled]);
+    if (!announce || !enabled) return;
+    return announce(botId ?? DEFAULT_BOT_ID);
+  }, [announce, botId, enabled]);
 }
 
 /** The holder itself, to be read inside a handler at the moment it runs. */
@@ -121,7 +128,7 @@ export function useActiveBotHolder(): BotHolder {
 
 /** The active Bot as a value, for anything that has to re-render when it changes. */
 export function useActiveBotId(): string {
-  return useContext(ActiveBotValueContext)?.botId ?? DEFAULT_BOT_ID;
+  return useContext(ActiveBotValueContext);
 }
 
 /**

@@ -389,3 +389,20 @@ test("a queued model mutation rechecks ownership after a concurrent owner transf
     await named.$client.close();
   }
 }, 10000);
+
+test("reasoning and Fast persist independently, survive model changes, and copy with a BOT", async () => {
+  const owner = await actor();
+  const id = await bot(owner, { override: { futureSetting: true } });
+  await service.set(owner, id, undefined, { reasoningEffort: "xhigh", fastMode: true });
+  expect(await service.resolveSettings(id)).toEqual({ model: null, reasoningEffort: "xhigh", fastMode: true });
+  const reloaded = createAgentModelService({ database, profiles, resolveDefaultModel: async () => "gateway/default", catalog });
+  expect(await reloaded.get(owner, id)).toMatchObject({ model: "gateway/default", reasoningEffort: "xhigh", fastMode: true });
+  await reloaded.set(owner, id, "vendor/second");
+  expect(await reloaded.resolveSettings(id)).toEqual({ model: "vendor/second", reasoningEffort: "xhigh", fastMode: true });
+  const duplicate = await profiles.duplicate(owner, id);
+  ids.bots.push(duplicate.id);
+  expect(await reloaded.resolveSettings(duplicate.id)).toEqual({ model: "vendor/second", reasoningEffort: "xhigh", fastMode: true });
+  await reloaded.set(owner, id, undefined, { reasoningEffort: null, fastMode: false });
+  const [row] = await database.select().from(agents).where(eq(agents.id, id));
+  expect(row!.override).toEqual({ futureSetting: true, model: "vendor/second", fastMode: false });
+});

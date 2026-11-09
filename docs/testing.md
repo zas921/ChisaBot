@@ -7,16 +7,22 @@ ChisaBot 的测试分四层：**单元 / 集成测试 → 预览容器里的端�
 
 | 命令 | 范围 |
 |---|---|
-| `bun run typecheck` | 所有包（`app`、`server`、`agent-computer`、`shared`…）的 `tsc --noEmit` |
-| `bun test` / 各包 `tests/` | ChisaBot 功能的服务器测试在 `server/tests/<功能>*.test.ts`（记忆、保险箱、定时任务、确认、设备、云端 CC…） |
-| `app/tests/*.test.ts(x)` | 网页 DOM 测试；**需要 `NODE_ENV=test`**（镜像里是 production） |
+| `bun run typecheck` | 根工作区 `app`、`server` 的 `tsc --noEmit`。`shared` 中被这两包导入或由其 tsconfig 显式包含的文件随之检查；这不是所有目录的完整类型检查 |
+| `bun run --cwd agent-computer typecheck` | 独立电脑服务的类型检查；`agent-computer` 不在根 `workspaces` 中，需要单独运行并安装该包依赖 |
+| `bun run test` / `bun test <测试文件>` | 前者先通过 `pretest` 生成应用配置，再运行根目录 `bun test`；后者用于定向测试，不经过 package script 的 `pretest`。服务器测试在 `server/tests/<功能>*.test.ts`；前端整套测试使用下一行入口 |
+| `bun run test:app` | 从仓库根目录运行；先生成应用配置，再自动发现 `app/tests/**/*.test.{ts,tsx}`，把需隔离的文件各自放进独立进程。网页 DOM 测试使用 **`NODE_ENV=test`**，在 production 环境中运行前需显式设置 |
+| `bun run test:ci` | 当前只包装 `bun run test`，检查退出码与至少 400 条测试的数量下限；尚未接入前端隔离 runner，也不是当前 GitHub Actions 的统一入口 |
 | `pc/` 下 `npm test` | PC 客户端（含外壳指纹一致性：改了图标 / 安装器要先 `npm run fingerprint`） |
 | `node --test pc/test/proxy-tls.check.js deploy/friend-up.check.cjs` | CB-088：本地代理真实 TLS 校验、好友包隔离构建顺序与失败停止；不连接生产或启动 Docker。Windows 可用 `CHISABOT_TEST_SH` 指定 Git Bash 可执行文件 |
-| `android/` Gradle 测试 | 原生 Android（CI 里跑） |
-| CI「ChisaBot checks」（`.github/workflows/chisabot.yml`） | 每个 PR 必须绿；`bun install --linker hoisted`（和镜像一样） |
+| `android/` 下 `gradle --no-daemon testDebugUnitTest` | 原生 Android 单元测试；客户端发布工作流 `release.yml` 在构建 APK 时运行 |
+| CI「ChisaBot checks」（`.github/workflows/chisabot.yml`） | 每个 PR 必须绿；安装使用 `bun install --frozen-lockfile --linker hoisted`（和镜像一样），检查前后端类型、网页构建及工作流中列出的测试子集 |
 | `pc-shots.yml` | 改到 PC 窗口 UI 的 PR 在 Windows runner 上截图（Windows Server 2025、1024×768、无 GPU：**没有 DWM 圆角**，DPI 用 `--force-device-scale-factor` 模拟） |
 
-比较方法：**分支对比 main 的「新增失败」**，不是要求全绿——main 上有已知失败（§5）。
+当前入口以 [package.json](../package.json)、[前端 runner](../scripts/run-app-tests.ts)、[test:ci 包装器](../scripts/test-ci.ts) 和 [ChisaBot checks](../.github/workflows/chisabot.yml) 为准。前端 runner 的 `ISOLATED` 名单目前有 8 个文件，原因包括进程级 `mock.module()`、DOM 全局状态和性能测试环境；其余文件在共享进程中运行，任一组失败都会返回非零退出码。新测试先避免全局污染，确需隔离时再更新名单并说明原因。
+
+**当前 CI 与拟议改进分开看：**截至 2026-10-23，本地工作流文件仍手工列出测试子集，部分测试已分进程运行，但未调用 `test:app` 或 `test:ci`，也未单独执行 `agent-computer` 类型检查。复用统一分组入口、自动发现新增测试和补齐电脑服务类型检查是后续改进项，尚未在工作流中实现；不能据此把当前 CI 通过解释为整个仓库测试通过。
+
+比较失败时，用相同命令、依赖、环境和隔离方式重跑明确提交的基线与当前改动，记录新增失败。旧审计中的失败数量不作为长期豁免：2026-10-21 的[审查记录](audit-2026-10-21.md)已记录前端测试及隔离修复后 `test:app` 通过；这是历史验证结果，不代表本机当前改动或现有 main 已重新全量验证。当前失败应先按正确入口复现并定位，不能仅凭旧的“main 已知失败”说明忽略（见 §5）。
 
 ## 2. 预览容器约定（端到端）
 
@@ -67,9 +73,9 @@ ChisaBot 的测试分四层：**单元 / 集成测试 → 预览容器里的端�
 | 问题 | 现象 | 处理 |
 |---|---|---|
 | **Bun 1.3.x SQL 连接错位（已加恢复，CB-087）** | 旧预览在事务 EOF 后出现 `bind message supplies 1 parameters, but prepared statement "" requires 8`，随后请求等待不结束；未证实生产发生 | SQL 监督层对协议错误/连接关闭立即淘汰故障池，查询及池等待有期限，取消未完成工作；失败请求不重放，新请求用新池。真实 PostgreSQL 与协议 fixture 覆盖静默连接、未确认 COMMIT、池等待及恢复；预览仍按一容器一轮保持隔离 |
-| `approvals-rules.test.tsx` / `approval-tools.test.tsx` | main 上 2 个失败（「等待点击并入浏览器活动」DOM 用例），不是新改动引起；有时表现为超时 | 对比 main 时视为基线；修复待办 |
-| app 全量测试中的上游英文用例 | 按文件跑时约 45 个上游测试文件在 main 上就失败（英文界面时代的文案断言） | 基线，不在范围内 |
-| 全量跑时测试相互污染 | 个别改名后的测试在全量里失败、单独跑通过 | 单独复跑确认 |
+| `approvals-rules.test.tsx` / `approval-tools.test.tsx` 的旧失败记录 | 旧文档把两项 DOM 失败列为 main 基线；2026-10-21 审查已记录修复后的 `test:app` 通过，两份文件现均在隔离名单中 | 使用 `bun run test:app` 复测；新失败单独定位，不再沿用旧基线豁免，也不据历史结果宣称当前版本已通过 |
+| app 上游英文断言的旧失败记录 | 旧文档曾列约 45 个失败文件；后续审查已记录一批测试修复及前端套件通过 | 该数字只表示旧状态；以当前命令、提交和实际输出为准，当前失败需重新核查 |
+| 前端测试进程污染 | Bun 1.3.14 的进程级模块 mock 和 DOM / SDK 全局状态可能影响后续文件；直接 `bun test app/tests` 或根目录全量测试不会应用隔离名单 | 整套前端测试走 `bun run test:app`；单文件复跑用于定位，不能替代整套验证；根 `test:ci` 与工作流统一入口仍待接入 |
 | chat-scroll 节点替换与结束跳动（CB-087） | 基线七项出现旧消息重挂；结束留白按墙上时间追赶，慢帧倒退 | 渲染前协调窗口、稳定平级 keyed children、每帧有界收白；原七项严格阈值不变，整合构建复测并留 DOM reference / 逐帧数据。reduced-motion 额外覆盖宽窄屏；对应组件测试独立进程避免 Motion 媒体偏好缓存污染 |
 | 长对话历史晚到（CB-047） | 冷预览上第一次打开超长对话，历史约 20 秒后到 → 偶发滚动回归 | 预热后再跑 |
 | `live-screen-keyboard` Dvorak 用例 | 偶发失败，复跑通过 | 视为不稳定 |

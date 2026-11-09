@@ -65,9 +65,20 @@ export function connectScreen(options: Options) {
     };
     current.onmessage = (event) => {
       if (!owns()) return;
+      const raw = event.data;
+      // Binary JPEG frames (ArrayBuffer) prove the socket is live the same way JSON frames did.
+      if (
+        raw instanceof ArrayBuffer ||
+        (typeof ArrayBuffer !== "undefined" &&
+          ArrayBuffer.isView?.(raw as ArrayBufferView))
+      ) {
+        attempts = 0;
+        options.onMessage(event);
+        return;
+      }
       let message: { type?: string; error?: string } | undefined;
       try {
-        message = JSON.parse(String(event.data));
+        message = JSON.parse(String(raw));
       } catch {
         /* Frame parser handles malformed input. */
       }

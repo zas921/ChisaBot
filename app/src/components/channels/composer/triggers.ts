@@ -51,27 +51,14 @@ function matches(query: string, ...fields: (string | undefined)[]): boolean {
  *
  * `reopenOnChipClick` keeps an inserted mention editable without deleting and retyping.
  */
-/**
- * A trigger's option list: the list itself, or a getter read at search time.
- *
- * The getter form is what the composer uses. `prompt-area` treats a new `triggers` array as a
- * reason to re-run its value-sync effect, so the composer builds its triggers ONCE and lets the
- * search read whatever the latest roster is (see `composer.tsx`, "STABLE EDITOR INPUTS").
- */
-export type OptionSource<T> = readonly T[] | (() => readonly T[]);
-
-function read<T>(source: OptionSource<T>): readonly T[] {
-  return typeof source === "function" ? source() : source;
-}
-
-export function agentTrigger(agents: OptionSource<AgentOption>): TriggerConfig {
+export function agentTrigger(agents: readonly AgentOption[]): TriggerConfig {
   return mentionTrigger({
     char: AGENT_TRIGGER,
     accessibilityLabel: "agent",
     reopenOnChipClick: true,
     emptyMessage: "No agents in this channel",
     onSearch: (query): TriggerSuggestion[] =>
-      read(agents)
+      agents
         .filter((agent) => matches(query, agent.name, agent.description))
         .map((agent) => ({
           value: agent.id,
@@ -88,7 +75,7 @@ export function agentTrigger(agents: OptionSource<AgentOption>): TriggerConfig {
  * are really prompts or client actions.
  */
 export function slashCommandTrigger(
-  commands: OptionSource<CommandOption>,
+  commands: readonly CommandOption[],
 ): TriggerConfig {
   return commandTrigger({
     char: COMMAND_TRIGGER,
@@ -96,7 +83,7 @@ export function slashCommandTrigger(
     accessibilityLabel: "command",
     emptyMessage: "No matching commands",
     onSearch: (query): TriggerSuggestion[] =>
-      read(commands)
+      commands
         .filter((command) => matches(query, command.name, command.description))
         .map((command) => ({
           value: command.id,
@@ -111,8 +98,8 @@ export function buildTriggers({
   agents,
   commands,
 }: {
-  agents: OptionSource<AgentOption>;
-  commands: OptionSource<CommandOption>;
+  agents: readonly AgentOption[];
+  commands: readonly CommandOption[];
 }): TriggerConfig[] {
   return [agentTrigger(agents), slashCommandTrigger(commands)];
 }

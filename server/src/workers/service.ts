@@ -7,7 +7,7 @@ import { LocalConversationError, type LocalRunControl, type ThreadWorkerRoutes }
 import type { GrantedTool } from "../plugins/tools";
 import { HeadlessToolSuspension, type HeadlessTool } from "../computer/headless-tools";
 import type { TurnRunner } from "../turns/types";
-import { type ThreadInbox, WORKER_RESULT_MARKER } from "../thread-inbox";
+import { type ThreadInbox, WORKER_RESULT_MARKER, withWorkerResultDelivery } from "../thread-inbox";
 import { reasonWithoutStatement } from "../db/query-failure";
 
 /**
@@ -16,7 +16,7 @@ import { reasonWithoutStatement } from "../db/query-failure";
  * - 工人就是同一个机器人在一个**单独的隐藏对话**（`worker-<id>`）里跑的一轮无头回合：同样的工具
  *   （少了委派，多了 `worker_plan` 维护清单），同样的权限、审批和审计；对话记录存下来，出了事能查。
  * - 并发有上限：每人同时最多 {@link PER_USER_RUNNING} 个在跑，全站 {@link GLOBAL_RUNNING} 个，其余排队；
- *   每人最多 {@link PER_USER_BACKLOG} 个没结束的。每个工人的回合有超时（{@link WORKER_TIMEOUT_MS}），
+ *   每人最多 {@link PER_USER_BACKLOG} 个没结束的。工人不按总运行时长自动停止，
  *   结果截断到 {@link RESULT_LIMIT} 字，内存里只留卡片要显示的几行状态。
  * - 补充说明 = 往工人的对话收件箱里放一条消息，下一步读进去（thread-inbox.ts，和主对话插话同一套）。
  * - 结束后结果作为一条消息回到发起的对话：那边正在回答就进收件箱（下一步读到），没在回答就起一轮
@@ -41,9 +41,15 @@ type WorkerRow = {
 export const PER_USER_RUNNING = Number(process.env.CHISABOT_WORKERS_PER_USER) || 3;
 export const GLOBAL_RUNNING = Number(process.env.CHISABOT_WORKERS_GLOBAL) || 6;
 export const PER_USER_BACKLOG = 6;
-export const WORKER_TIMEOUT_MS = 15 * 60_000;
+/** Long data collection must survive the former 15-minute wall-clock limit. Zero disables the turn deadline. */
+export const WORKER_TURN_TIMEOUT_MS = 0;
 export const RESULT_LIMIT = 6_000;
 const ACTIVE: WorkerStatus[] = ["queued", "running", "waiting"];
+const RESULT_RETRY_MIN_MS = 1_000;
+const RESULT_RETRY_MAX_MS = 15_000;
+const RESULT_STORE_ATTEMPTS = 5;
+const WORKER_RESULT_CONTINUATION =
+  "这些是刚结束的后台任务结果。先核对已有成果和仍在运行的任务，在原授权范围内继续尚未完成的步骤；不要盲目重跑失败的任务或结果不明的操作。需要用户确认时保留等待。";
 /** 用户在卡片上停掉的任务交回对话时的说明（结果行展开后看到的就是这句）。 */
 export const CANCELLED_BY_USER = "你在任务卡片上停止了这个任务，它没有做完。需要的话可以让我重新做。";
 
@@ -100,6 +106,7 @@ export type WorkerServiceOptions = {
 export type WorkerService = ThreadWorkerRoutes & {
   ensure(): Promise<void>;
   recover(): Promise<number>;
+  reconcileDeliveries(): Promise<void>;
   /** 主对话里的机器人可以用的工具（委派、发补充说明、停止、看状态）。 */
   delegationTools(input: { ownerUserId: string; agentId: string; threadId: string }): GrantedTool[];
   /** 工人回合里额外给的工具（维护清单）。 */
@@ -120,6 +127,9 @@ export function createWorkerService(options: WorkerServiceOptions): WorkerServic
   type LiveState = { step?: string | null; initialStep?: string; plan?: WorkerPlanStep[]; controller: AbortController; unobserve?: () => void; flush?: ReturnType<typeof setTimeout> };
   const live = new Map<string, LiveState>();
   let pumping = false;
+  type Delivery = { worker: WorkerRow; message: Message; stored: boolean; storeAttempts: number };
+  type DeliveryGroup = { pending: Map<string, Delivery>; draining: boolean; retryMs: number; timer?: ReturnType<typeof setTimeout> };
+  const deliveries = new Map<string, DeliveryGroup>();
 
   const row = async (id: string) => (await sql.unsafe<WorkerRow[]>("SELECT * FROM chisabot_workers WHERE id = $1", [id]))[0] ?? null;
   const owned = async (id: string, actorId: string, threadId?: string) => {
@@ -167,7 +177,87 @@ export function createWorkerService(options: WorkerServiceOptions): WorkerServic
 
   const statusZh = (status: WorkerStatus) => (status === "done" ? "已完成" : status === "failed" ? "没有完成" : status === "waiting" ? "在等你确认" : "已停止");
 
-  /** 结果回到主对话。 */
+  const drainDelivery = async (threadId: string, group: DeliveryGroup) => {
+    if (group.draining) return;
+    group.draining = true;
+    try {
+      // Persist while the parent is still active, so its current run can read the results.
+      // Repeating either write is safe: the inbox ID is stable and enqueue is idempotent.
+      for (const [id, delivery] of group.pending) {
+        if (delivery.stored) continue;
+        const { worker, message } = delivery;
+        try {
+          await inbox.enqueue({ threadId, ownerUserId: worker.owner_user_id, message, kind: "worker_result" });
+          await sql.unsafe("UPDATE chisabot_workers SET result_message_id = $2 WHERE id = $1", [worker.id, id]);
+          delivery.stored = true;
+        } catch (error) {
+          if (++delivery.storeAttempts >= RESULT_STORE_ATTEMPTS) group.pending.delete(id);
+          console.warn(JSON.stringify({ type: "worker-result-store-failed", worker: worker.id, reason: reasonWithoutStatement(error) }));
+        }
+      }
+      if (!group.pending.size) return;
+      await inbox.retryWorkerResults(threadId, [...group.pending.keys()]);
+      const queued = new Set((await inbox.queued(threadId)).filter((item) => item.kind === "worker_result").map((item) => item.id));
+      for (const [id, delivery] of group.pending) {
+        if (delivery.stored && !queued.has(id)) group.pending.delete(id);
+      }
+      const batch = [...group.pending.values()].filter((delivery) => delivery.stored);
+      if (!batch.length || control.isActive(threadId)) return;
+
+      const ownerUserId = batch[0]!.worker.owner_user_id;
+      // Do not wake an archived conversation or race the existing human/approval continuation.
+      const [parent] = await sql.unsafe<{ archived: boolean; waiting: boolean }[]>(`
+        SELECT t.archived,
+          EXISTS (SELECT 1 FROM approval_requests a WHERE a.owner_user_id = $2
+            AND a.action->>'threadId' = t.id AND a.status IN ('pending', 'approved', 'consumed'))
+          OR COALESCE((SELECT e.event->'outcome'->>'type' = 'interrupt' OR e.event->'metadata' ? 'openbotWaiting'
+            FROM openbot_local_events e WHERE e.thread_id = t.id AND e.event->>'type' IN ('RUN_FINISHED', 'RUN_ERROR')
+            ORDER BY e.sequence DESC LIMIT 1), false) AS waiting
+        FROM openbot_local_threads t WHERE t.id = $1 AND t.owner_user_id = $2`, [threadId, ownerUserId]);
+      const ids = new Set(batch.map((delivery) => delivery.message.id));
+      // Approval can resolve later; keep the durable delivery pending while it is blocked.
+      if (parent?.waiting) return;
+      const agentId = !parent || parent.archived || await inbox.isPaused(threadId)
+        ? null : await options.agentOfThread(threadId);
+      if (!agentId) {
+        for (const id of ids) group.pending.delete(id);
+        return;
+      }
+      if (control.isActive(threadId)) return;
+      try {
+        const runId = randomUUID();
+        await withWorkerResultDelivery(threadId, runId, ids, () => deliverTurn({
+          ownerUserId, routineId: `worker:${batch[0]!.worker.id}`, agentId, threadId, runId,
+          instruction: WORKER_RESULT_CONTINUATION, automationContext: WORKER_RESULT_CONTINUATION,
+          initiator: { kind: "routine", id: `worker:${batch[0]!.worker.id}` },
+          forwardedProps: { chisabotWorkerDelivery: { id: batch[0]!.worker.id } },
+        }));
+        // A normal turn may have won the lock and our request may only have joined it. Keep
+        // observing durable queue state; a result that was actually claimed is never replayed.
+        group.retryMs = RESULT_RETRY_MIN_MS;
+      } catch (error) {
+        console.warn(JSON.stringify({ type: "worker-delivery-queued", worker: batch[0]!.worker.id, reason: reasonWithoutStatement(error) }));
+        // Reconcile persisted inbox state on the next pass. Failed claims have a durable
+        // attempt budget; explicit Stop stays held. Never launch the child again.
+      }
+    } catch (error) {
+      console.warn(JSON.stringify({ type: "worker-result-drain-failed", threadId, reason: reasonWithoutStatement(error) }));
+    } finally {
+      group.draining = false;
+      if (!group.pending.size) {
+        deliveries.delete(threadId);
+      } else {
+        group.timer = setTimeout(() => {
+          group.timer = undefined;
+          void drainDelivery(threadId, group);
+        }, group.retryMs);
+        group.timer.unref?.();
+        group.retryMs = Math.min(RESULT_RETRY_MAX_MS, group.retryMs * 2);
+      }
+    }
+  };
+
+  /** Queue a terminal result without starting a second copy of the worker. */
   const deliver = async (worker: WorkerRow) => {
     const messageId = `worker-result-${worker.id}`;
     // 工人和主机器人读同一份提示词，见过标记的样子，偶尔会在自己的结果里也写一个「⟦chisabot:…⟧」：
@@ -177,28 +267,11 @@ export function createWorkerService(options: WorkerServiceOptions): WorkerServic
       id: messageId, role: "user",
       content: `${WORKER_RESULT_MARKER}${worker.id}:${worker.status}⟧\n后台任务「${worker.title}」${statusZh(worker.status)}。\n\n${clip(body, RESULT_LIMIT)}`,
     } as Message;
-    await sql.unsafe("UPDATE chisabot_workers SET result_message_id = $2 WHERE id = $1", [worker.id, messageId]);
-    const enqueue = () => inbox.enqueue({ threadId: worker.parent_thread_id, ownerUserId: worker.owner_user_id, message, kind: "worker_result" });
-    if (control.isActive(worker.parent_thread_id)) {
-      await enqueue();
-      // 入队和那一轮结束之间的空当：那一轮刚好结束了就自己起一轮。
-      if (control.isActive(worker.parent_thread_id)) return;
-    }
-    const agentId = (await options.agentOfThread(worker.parent_thread_id)) ?? worker.agent_id;
-    try {
-      await inbox.withdraw(worker.parent_thread_id, messageId);
-      await deliverTurn({
-        ownerUserId: worker.owner_user_id, routineId: `worker:${worker.id}`, agentId,
-        threadId: worker.parent_thread_id, instruction: textOfContent(message),
-        initiator: { kind: "routine", id: `worker:${worker.id}` },
-        userMessage: message, forwardedProps: { chisabotWorkerDelivery: { id: worker.id } },
-      });
-    } catch (error) {
-      // 对话刚好被用户占着（锁）或者回合失败：放进收件箱，下一轮一定读到，不丢。
-      console.warn(JSON.stringify({ type: "worker-delivery-queued", worker: worker.id, reason: reasonWithoutStatement(error) }));
-      await sql.unsafe("UPDATE chisabot_thread_inbox SET status = 'queued', updated_at = now() WHERE thread_id = $1 AND id = $2", [worker.parent_thread_id, messageId]);
-      await enqueue().catch(() => {});
-    }
+    const threadId = worker.parent_thread_id;
+    let group = deliveries.get(threadId);
+    if (!group) deliveries.set(threadId, group = { pending: new Map(), draining: false, retryMs: RESULT_RETRY_MIN_MS });
+    if (!group.pending.has(messageId)) group.pending.set(messageId, { worker, message, stored: false, storeAttempts: 0 });
+    if (!group.draining && !group.timer) await drainDelivery(threadId, group);
   };
 
   const launch = async (worker: WorkerRow) => {
@@ -226,8 +299,6 @@ export function createWorkerService(options: WorkerServiceOptions): WorkerServic
         state.step = "正在想怎么做"; persistLive(worker.id);
       }
     });
-    const timer = setTimeout(() => controller.abort(new Error("timeout")), WORKER_TIMEOUT_MS);
-    timer.unref?.();
     let finished: WorkerRow | null = null;
     try {
       const outcome = await runTurn({
@@ -247,13 +318,10 @@ export function createWorkerService(options: WorkerServiceOptions): WorkerServic
       if (current?.status === "cancelled") finished = null;
       else if (error instanceof HeadlessToolSuspension) {
         finished = await finish(worker.id, "failed", { error: `需要你确认一个操作才能继续（${error.message}）。请在「审批」里处理后，让我重新做这件事。` });
-      } else if (controller.signal.aborted && String(controller.signal.reason).includes("timeout")) {
-        finished = await finish(worker.id, "failed", { error: `超过 ${WORKER_TIMEOUT_MS / 60_000} 分钟还没做完，已停止。` });
       } else {
         finished = await finish(worker.id, "failed", { error: error instanceof Error ? clip(error.message, 400) : "后台任务出错了。" });
       }
     } finally {
-      clearTimeout(timer);
       const left = live.get(worker.id);
       left?.unobserve?.();
       live.delete(worker.id);
@@ -304,6 +372,22 @@ export function createWorkerService(options: WorkerServiceOptions): WorkerServic
       await sql.unsafe("CREATE INDEX IF NOT EXISTS chisabot_workers_status ON chisabot_workers(status, created_at)");
     },
 
+    async reconcileDeliveries() {
+      const pending = await sql.unsafe<WorkerRow[]>(`SELECT w.* FROM chisabot_workers w
+        JOIN openbot_local_threads t ON t.id = w.parent_thread_id AND t.owner_user_id = w.owner_user_id
+        LEFT JOIN chisabot_thread_inbox q ON q.thread_id = w.parent_thread_id AND q.id = 'worker-result-' || w.id
+        LEFT JOIN chisabot_thread_inbox_control c ON c.thread_id = w.parent_thread_id
+        WHERE w.status IN ('done', 'failed') AND NOT t.archived
+          AND NOT (coalesce(c.paused, false) AND coalesce(c.pause_reason, 'user') = 'user')
+          AND ((q.id IS NULL AND w.result_message_id IS NULL)
+            OR (q.kind = 'worker_result' AND q.status IN ('queued', 'paused', 'owed') AND q.delivery_attempts < 3
+              AND (q.status <> 'paused' OR q.hold_reason IN ('error', 'recovery'))))
+        ORDER BY w.finished_at LIMIT 100`);
+      // Recovery schedules work; server startup must not wait for the resumed model turn.
+      for (const worker of pending) void deliver(worker).catch((error) =>
+        console.warn(JSON.stringify({ type: "worker-recovery-delivery-failed", worker: worker.id, reason: reasonWithoutStatement(error) })));
+    },
+
     async recover() {
       const rows = await sql.unsafe(
         `UPDATE chisabot_workers SET status = 'failed', finished_at = now(), updated_at = now(), step = NULL,
@@ -311,6 +395,7 @@ export function createWorkerService(options: WorkerServiceOptions): WorkerServic
                       ELSE '服务重启了，任务做到一半被中断（没有完成）。可以让我重新做。' END
          WHERE status IN ('queued', 'running', 'waiting') RETURNING id`,
       );
+      await service.reconcileDeliveries();
       return rows.length;
     },
 

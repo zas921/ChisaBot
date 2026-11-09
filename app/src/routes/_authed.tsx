@@ -1,9 +1,5 @@
 import { createFileRoute, redirect } from "@tanstack/react-router";
 import { AuthedShell } from "../components/layout/authed-shell";
-import {
-  isGoingToLogin,
-  isLoginLoopDetected,
-} from "../lib/auth/login-redirect";
 import { currentUserQueryOptions, needsOnboarding } from "../lib/auth/queries";
 import { ProfileSetupGate } from "../components/layout/profile-dialog";
 import { CopilotProvider } from "../lib/copilot/provider";
@@ -16,9 +12,6 @@ export const Route = createFileRoute("/_authed")({
       currentUserQueryOptions(),
     );
     if (!user) {
-      // 公网网关的 401 已经在去 /login。停在启动画面，不要再闪到应用自己的 /sign。
-      if (isGoingToLogin() || isLoginLoopDetected())
-        await new Promise<never>(() => {});
       throw redirect({ to: "/sign" });
     }
     /*

@@ -21,7 +21,7 @@
 
 `mode: "browser"` 需要包含本次变更的 PC 客户端。它使用 Electron `WebContentsView`，不经 JSON 面板脚本执行远程网页；页面可正常联网，并使用网站自身的滚动、表单和手势。普通浏览器或旧 PC 客户端会提示能力不可用，不会把失败的 iframe 当成已接入。
 
-PC 网页使用独立于 ChisaBot 登录会话的存储分区，不注入 preload 或本机桥，关闭 Node integration，保留 Chromium sandbox 和 context isolation。拒绝权限申请、自动下载、新窗口和非 HTTPS 顶层跳转。最多同时打开四个网页面板。
+PC 网页使用独立于 ChisaBot 登录会话的存储分区，不注入 preload 或本机桥，关闭 Node integration，保留 Chromium sandbox 和 context isolation。拒绝权限申请、自动下载和非 HTTPS 顶层跳转。最多同时打开四个网页面板。每个网页最多打开两个独立网页窗口，供网站登录等流程使用，保留 opener 与同一媒体会话；这些窗口同样没有本机桥、禁止再开窗口，关闭面板时一并关闭。允许登录窗口先打开 about:blank 再跳转 HTTPS，禁止跳转 ChisaBot 自身来源。登录和年龄验证由用户自行操作。
 
 本机桥只接受 ChisaBot 主窗口的受信任顶层框架，校验实例标识和内容区域坐标。远程页面不能调用此桥。原生网页区域被裁切、面板隐藏或其他菜单/对话框覆盖时隐藏并暂停；普通 HTML 媒体通过可见性观察暂停。
 

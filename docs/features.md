@@ -28,6 +28,7 @@ ChisaBot 现在所有的功能，一项一行：**做什么 · 入口 · 代码 
 
 | 功能 | 做什么 | 入口 | 代码 | 数据 | DESIGN | 状态 · 文档 |
 |---|---|---|---|---|---|---|
+| 长任务自动续跑 | 工具批次用尽后自动携带进度继续，不要求用户反复发「继续」；保留停止与审批等待 | 聊天自动生效 | `server/src/agents/tool-continuation.ts`、`server/src/computer/headless-tools.ts` | 复用会话事件，无新表 | §101.4 | 本地实现，待发布 · [long-tasks.md](long-tasks.md) |
 | 频道聊天（唯一的聊天） | 和一个机器人对话；`/bot?agent=` 旧地址跳转过来 | 左栏点机器人 | `app/src/components/channels/`、`app/src/components/chat/`、`server/src/channels/`、`server/src/local-conversations.ts` | `openbot_local_threads/_runs/_events`、`intelligence_channel_mappings`、`channel_agents` | §68 · ADR-0013 | 上线 · [streaming.md](streaming.md) |
 | 留着的聊天 | 去设置 / 待处理 / 设备 / Claude Code 再回来，聊天是同一个没卸载过的实例（不重连、不重读、滚动原样）；藏 10 分钟后放掉 | — | `app/src/components/layout/authed-shell.tsx`、`app/src/components/layout/keep-alive.tsx`、`app/src/components/channels/channel-page.tsx` | — | §98 | 上线 |
 | 流式回复 | 按帧匀速放字；断线先问服务器、能接上就接上 | — | `app/src/lib/typed-reveal.ts`、`app/src/lib/chat/` | — | §30、§89 | 上线 · [streaming.md](streaming.md) |

@@ -1,7 +1,6 @@
 import type { ComponentProps } from "react";
 import { Streamdown } from "streamdown";
 import { cjkFriendlyEmphasis } from "@/lib/chat/cjk-emphasis";
-import { escapeUnknownTags } from "@/lib/chat/escape-unknown-tags";
 import { workspaceLinks } from "@/lib/chat/workspace-links";
 import { useDeclaredBotId } from "@/lib/copilot/active-bot";
 import { STREAMDOWN_ZH } from "@/lib/chat/streamdown-zh";
@@ -20,7 +19,7 @@ export function SmoothStreamdown({ children, ...props }: Omit<ComponentProps<typ
   const origin = typeof window === "undefined" ? "" : window.location.origin;
   return (
     <Streamdown translations={STREAMDOWN_ZH} {...props}>
-      {escapeUnknownTags(workspaceLinks(cjkFriendlyEmphasis(shown), bot, origin))}
+      {workspaceLinks(cjkFriendlyEmphasis(shown), bot, origin)}
     </Streamdown>
   );
 }

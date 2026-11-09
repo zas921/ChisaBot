@@ -143,22 +143,26 @@ describe("开场帧与地址栏", () => {
 
   test("开播后先发一张截图，静止的页面也有画面", async () => {
     const { page } = castable({ screenshot: "SHOT" });
-    const frames: unknown[] = [];
-    await startScreencast(page, (frame) => frames.push(frame));
+    const frames: { type?: string; jpeg?: Uint8Array; width?: number; height?: number; url?: string }[] = [];
+    await startScreencast(page, (frame) => frames.push(frame as (typeof frames)[number]));
     await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(frames).toEqual([
-      { type: "frame", data: "SHOT", width: 1280, height: 800, url: "about:blank" },
-    ]);
+    expect(frames).toHaveLength(1);
+    expect(frames[0]?.type).toBe("frame");
+    expect(frames[0]?.width).toBe(1280);
+    expect(frames[0]?.height).toBe(800);
+    expect(frames[0]?.url).toBe("about:blank");
+    expect(frames[0]?.jpeg).toEqual(new Uint8Array(Buffer.from("SHOT", "base64")));
   });
 
   test("Chrome 自己的帧先到时，不再补开场帧", async () => {
     const { page, emit } = castable({ screenshot: "SHOT" });
-    const frames: { data?: string }[] = [];
-    const cast = startScreencast(page, (frame) => frames.push(frame as { data?: string }));
+    const frames: { jpeg?: Uint8Array }[] = [];
+    const cast = startScreencast(page, (frame) => frames.push(frame as { jpeg?: Uint8Array }));
     await cast;
     emit({ data: "CAST", sessionId: 1, metadata: { deviceWidth: 1280, deviceHeight: 800 } });
     await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(frames.map((f) => f.data)).toContain("CAST");
+    const castJpeg = new Uint8Array(Buffer.from("CAST", "base64"));
+    expect(frames.some((f) => f.jpeg && Buffer.from(f.jpeg).equals(Buffer.from(castJpeg)))).toBe(true);
   });
 
   test("地址栏打开网址，结果发回去", async () => {
@@ -211,7 +215,7 @@ describe("直播画面的流量控制", () => {
   }
   const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-  test("ack 不早于帧间隔：最多每秒 20 帧", async () => {
+  test("ack 不早于帧间隔", async () => {
     const { page, acks, frame } = chrome();
     await startScreencast(page, () => {});
     frame(1);
@@ -236,9 +240,14 @@ describe("直播画面的流量控制", () => {
     cast.frameDelivered?.(); // 这个查看端会回确认
     frame(1);
     await sleep(MIN_FRAME_INTERVAL_MS + 15);
+    // 默认在途上限 1：第一帧要等查看端确认后才 ack Chrome。
+    expect(acks).toEqual([]);
+    cast.frameDelivered?.();
+    await sleep(5);
+    expect(acks).toEqual([1]);
     frame(2);
     await sleep(MIN_FRAME_INTERVAL_MS + 15);
-    expect(acks).toEqual([1]); // 在途 2 帧，第 2 帧先不 ack
+    expect(acks).toEqual([1]); // 在途已满，第 2 帧先不 ack
     cast.frameDelivered?.();
     await sleep(5);
     expect(acks).toEqual([1, 2]);
@@ -250,9 +259,9 @@ describe("直播画面的流量控制", () => {
     cast.frameDelivered?.();
     frame(1);
     await sleep(MIN_FRAME_INTERVAL_MS + 15);
-    frame(2);
-    await sleep(FRAME_ACK_STALL_MS + MIN_FRAME_INTERVAL_MS + 50);
-    expect(acks).toEqual([1, 2]);
+    expect(acks).toEqual([]); // 在途已满，等查看端
+    await sleep(FRAME_ACK_STALL_MS + 50);
+    expect(acks).toEqual([1]); // 超时清零后放行
     await cast.stop();
   });
 });

@@ -50,7 +50,7 @@ import {
   type BotAttention,
   botAttentionQueryOptions,
 } from "@/lib/bot-lifecycle/queries";
-import { latestChannelFor } from "@/lib/channels/latest";
+import { assuredLatestChannelFor } from "@/lib/channels/latest";
 import { prefetchBotChat, usePrefetchBotChats } from "@/lib/channels/prefetch";
 import {
   type ChannelSummary,
@@ -278,7 +278,7 @@ function SearchHitRow({
 }
 
 /** Kept exported from here for existing callers; lives in lib/channels/latest.ts. */
-export { latestChannelFor };
+export { latestChannelFor } from "@/lib/channels/latest";
 
 type RosterBot = {
   id: string;
@@ -695,7 +695,7 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
       attention={attentionById.get(bot.id)}
       bot={bot}
       key={bot.id}
-      latest={latestChannelFor(bot.id, channels.data)}
+      latest={assuredLatestChannelFor(bot.id, channels.data, channels.hasNextPage)}
       main={isMain}
       onToggleMain={() => setMainBot(isMain ? null : bot.id)}
       selected={selectedBotId === bot.id}
@@ -713,6 +713,7 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
           attentionById={attentionById}
           bots={railBots}
           channels={channels.data}
+          hasNextPage={channels.hasNextPage}
           mainBotId={mainBot?.id}
           selectedBotId={selectedBotId}
           setMainBot={setMainBot}
@@ -926,6 +927,7 @@ function BotMiniRail({
   mainBotId,
   selectedBotId,
   channels,
+  hasNextPage,
   attentionById,
   setMainBot,
 }: {
@@ -933,6 +935,7 @@ function BotMiniRail({
   mainBotId: string | undefined;
   selectedBotId: string | null | undefined;
   channels: ChannelSummary[] | undefined;
+  hasNextPage: boolean;
   attentionById: Map<string, BotAttention>;
   setMainBot: (id: string | null) => void;
 }) {
@@ -957,7 +960,7 @@ function BotMiniRail({
               attention={attentionById.get(bot.id)}
               bot={bot}
               key={bot.id}
-              latest={latestChannelFor(bot.id, channels)}
+              latest={assuredLatestChannelFor(bot.id, channels, hasNextPage)}
               main={bot.id === mainBotId}
               onToggleMain={() =>
                 setMainBot(bot.id === mainBotId ? null : bot.id)

@@ -33,6 +33,7 @@ const ISOLATED = [
   "app/tests/approvals-rules.test.tsx",
   "app/tests/device-connection-card.test.tsx",
   "app/tests/channel-new-error-state.test.tsx",
+  "app/tests/channel-page-recovery.test.tsx",
   "app/tests/home-fallback-routing.test.tsx",
   "app/tests/startup-resilience.test.tsx",
   "app/tests/tail-first-paint.test.ts",

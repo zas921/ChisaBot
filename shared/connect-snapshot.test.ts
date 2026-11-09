@@ -16,6 +16,23 @@ function many(n: number, content = "x"): Msg[] {
 }
 
 describe("capConnectMessages", () => {
+  test("large reconnects inspect each message at most once and retain the exact tail", () => {
+    let encodes = 0;
+    const messages = many(400, "字".repeat(25_000)).map((message) => ({
+      ...message, toJSON() { encodes++; return message; },
+    }));
+    const result = capConnectMessages(messages);
+    expect(result.messages.slice(1)).toEqual(messages.slice(-20));
+    expect(result.dropped).toBe(380);
+    expect(encodes).toBeLessThanOrEqual(21);
+  });
+
+  test("a single oversized latest message survives and empty histories stay empty", () => {
+    const messages = many(2, "x".repeat(20_000));
+    expect(capConnectMessages(messages, { maxJsonBytes: 8192 }).messages.at(-1)).toBe(messages[1]);
+    expect(capConnectMessages([])).toEqual({ messages: [], dropped: 0, truncated: false });
+  });
+
   test("short threads pass through unchanged", () => {
     const messages = many(10);
     const result = capConnectMessages(messages);

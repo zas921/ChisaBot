@@ -29,6 +29,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.relocation.BringIntoViewRequester
+import androidx.compose.foundation.relocation.bringIntoViewRequester
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
@@ -353,7 +355,7 @@ private fun PendingFileView(vm: AppViewModel, f: PendingFile) {
 
 /**
  * 用户气泡（右侧）：附件 + 文字。长按 → 复制 / 编辑；最后一条人发的消息下面常显「✎ 编辑」（手机上没有悬停）。
- * 编辑：气泡原地变成玻璃编辑框（淡入 180ms），说明一行 + 取消 / 发送（§67.4）；没改或为空时发送不可点。
+ * 编辑：可直接重发原内容；仅空文字且无附件时不可发送。
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -385,13 +387,15 @@ fun UserMessage(vm: AppViewModel, msg: ChatMessage, editable: Boolean) {
 }
 
 @Composable
+@OptIn(ExperimentalFoundationApi::class)
 private fun EditBox(vm: AppViewModel, msg: ChatMessage, close: () -> Unit) {
     val sky = LocalSky.current
     var text by remember(msg.id) { mutableStateOf(msg.text) }
     val focus = remember { FocusRequester() }
-    LaunchedEffect(Unit) { runCatching { focus.requestFocus() } }
-    val changed = text.trim() != msg.text.trim() && (text.isNotBlank() || msg.files.isNotEmpty())
-    Column(Modifier.fillMaxWidth().glass(sky, RoundedCornerShape(16.dp), level = 3).padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+    val bringIntoView = remember { BringIntoViewRequester() }
+    LaunchedEffect(Unit) { delay(180); runCatching { focus.requestFocus(); bringIntoView.bringIntoView() } }
+    val canResend = text.isNotBlank() || msg.files.isNotEmpty()
+    Column(Modifier.fillMaxWidth().bringIntoViewRequester(bringIntoView).glass(sky, RoundedCornerShape(16.dp), level = 3).padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         BasicTextField(
             text, { text = it }, textStyle = TextStyle(color = sky.ink1, fontSize = 15.5.sp, lineHeight = 22.sp), cursorBrush = SolidColor(sky.accent),
             maxLines = 10, modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp).focusRequester(focus).semantics { contentDescription = "编辑消息" },
@@ -400,7 +404,7 @@ private fun EditBox(vm: AppViewModel, msg: ChatMessage, close: () -> Unit) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
             Text("取消", color = sky.ink2, fontSize = 14.sp, modifier = Modifier.clip(RoundedCornerShape(18.dp)).clickable(role = Role.Button) { close() }.padding(horizontal = 14.dp, vertical = 9.dp))
             Spacer(Modifier.width(6.dp))
-            SmallAsyncButton("发送", "发送中…", "已发送", Modifier.width(96.dp), enabled = changed && !vm.running) {
+            SmallAsyncButton("发送", "发送中…", "已发送", Modifier.width(96.dp), enabled = canResend && !vm.running && !vm.turnPreparing && !vm.modelSaving && !vm.selectedModelMissing) {
                 val ok = vm.editAndResend(msg.id, text)
                 if (ok) close()
                 ok

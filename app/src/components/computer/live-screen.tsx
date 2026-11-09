@@ -22,6 +22,7 @@ import {
 import { keyOf } from "@/lib/hotkeys/hotkeys";
 import { socketUrl } from "@/lib/socket-url";
 import { currentPageVisible } from "./preview-visibility";
+import { decodeScreencastFrame } from "../../../../shared/screencast-frame";
 import { pageCoordinates } from "./take-the-wheel";
 
 /** The viewer's "one frame reached me" (agent-computer screencast flow control). */
@@ -131,7 +132,8 @@ export type LiveScreenController = {
 };
 
 type FrameMessage = {
-  data: string;
+  /** Raw JPEG bytes from the binary WebSocket frame. */
+  jpeg: Uint8Array;
   width: number;
   height: number;
   /** 这一帧所在页面的网址（旧的计算机不带）。 */
@@ -273,13 +275,11 @@ export function LiveScreen({
        * `createImageBitmap` rather than assigning a data URI to an `<img>`: the image path decodes
        * synchronously on the main thread for every frame, which at screencast rates is the difference
        * between a smooth page and one that stutters while you are trying to click something on it.
+       * JPEG arrives as raw bytes on the WebSocket (no Base64/atob).
        */
       try {
-        const binary = Uint8Array.from(atob(frame.data), (c) =>
-          c.charCodeAt(0),
-        );
         const bitmap = await createImageBitmap(
-          new Blob([binary], { type: "image/jpeg" }),
+          new Blob([frame.jpeg], { type: "image/jpeg" }),
         );
         if (
           closed ||
@@ -323,10 +323,58 @@ export function LiveScreen({
       void drawFrame(frame, latestFrameId.current);
     };
 
+    const acceptFrame = (frame: FrameMessage) => {
+      if (closed) return;
+      if (typeof frame.url === "string" && frame.url.length < 4096) {
+        if (frame.url.startsWith("chrome-error:")) {
+          if (lastAttempt.current) setPageUrl(lastAttempt.current);
+        } else {
+          setPageUrl(frame.url === "about:blank" ? "" : frame.url);
+        }
+      }
+      frameSize.current = { width: frame.width, height: frame.height };
+      latestFrame.current = frame;
+      const frameId = ++latestFrameId.current;
+      /*
+       * 收到一帧就回 frame-ack（2026-10-21 流量控制，agent-computer/src/screencast.ts）：电脑端据此限制在途帧数，
+       * 网络慢时不再把旧帧排成长队，下一帧总是最新画面。和 pong 一样不需要握着方向盘。
+       */
+      const ackSocket = socketRef.current;
+      if (ackSocket?.readyState === WebSocket.OPEN) {
+        try {
+          ackSocket.send(FRAME_ACK);
+        } catch {
+          /* reconnect path will replace the socket */
+        }
+      }
+      if (!currentPageVisible()) return;
+      void drawFrame(frame, frameId);
+    };
+
     const onMessage = (event: { data: unknown }) => {
+      const raw = event.data;
+      // Binary JPEG frame (shared/screencast-frame.ts). Preferred path — no Base64/JSON.
+      if (
+        raw instanceof ArrayBuffer ||
+        (typeof ArrayBuffer !== "undefined" &&
+          ArrayBuffer.isView(raw as ArrayBufferView))
+      ) {
+        const decoded = decodeScreencastFrame(
+          raw as ArrayBuffer | ArrayBufferView,
+        );
+        if (!decoded) return;
+        acceptFrame({
+          jpeg: decoded.jpeg,
+          width: decoded.width,
+          height: decoded.height,
+          ...(decoded.url ? { url: decoded.url } : {}),
+        });
+        return;
+      }
+
       let parsed: unknown;
       try {
-        parsed = JSON.parse(String(event.data));
+        parsed = JSON.parse(String(raw));
       } catch {
         return;
       }
@@ -395,61 +443,30 @@ export function LiveScreen({
         onProblem?.(screenProblem(message.error ?? "无法显示屏幕。"));
         return;
       }
-      if (message.type !== "frame" || !message.data) return;
-      // Live-run JSON only checks `typeof type === "string"` upstream. Non-finite or negative
-      // dimensions would poison frameSize and every coordinate scaled from it; a huge payload
-      // would hit `atob` before any bound. Both are dropped as corrupt frames.
+      // Legacy JSON+Base64 frames (pre binary cutover). Keep reading so a mixed deploy still paints.
+      if (message.type !== "frame" || typeof message.data !== "string") return;
       const width = message.width ?? 1280;
       const height = message.height ?? 800;
       if (
-        typeof width !== "number" ||
-        typeof height !== "number" ||
         !Number.isFinite(width) ||
         !Number.isFinite(height) ||
         width <= 0 ||
         height <= 0 ||
         width > 8192 ||
-        height > 8192
-      ) {
-        return;
-      }
-      if (
-        typeof message.data !== "string" ||
+        height > 8192 ||
         message.data.length > 20_000_000
       ) {
         return;
       }
-
-      const canvas = canvasRef.current;
-      if (!canvas || closed) return;
-
-      frameSize.current = {
-        width: message.width ?? 1280,
-        height: message.height ?? 800,
-      };
-      const frame: FrameMessage = {
-        data: message.data,
+      const binary = Uint8Array.from(atob(message.data), (c) =>
+        c.charCodeAt(0),
+      );
+      acceptFrame({
+        jpeg: binary,
         width,
         height,
         ...(typeof message.url === "string" ? { url: message.url } : {}),
-      };
-      latestFrame.current = frame;
-      const frameId = ++latestFrameId.current;
-      /*
-       * 收到一帧就回 frame-ack（2026-10-21 流量控制，agent-computer/src/screencast.ts）：电脑端据此限制在途帧数，
-       * 网络慢时不再把旧帧排成长队，下一帧总是最新画面。和 pong 一样不需要握着方向盘。
-       */
-      const ackSocket = socketRef.current;
-      if (ackSocket?.readyState === WebSocket.OPEN) {
-        try {
-          ackSocket.send(FRAME_ACK);
-        } catch {
-          /* reconnect path will replace the socket */
-        }
-      }
-
-      if (!currentPageVisible()) return;
-      void drawFrame(frame, frameId);
+      });
     };
 
     const connection = connectScreen({
@@ -457,6 +474,8 @@ export function LiveScreen({
         const socket = new WebSocket(
           socketUrl(`/api/computers/${encodeURIComponent(computerId)}/stream`),
         );
+        // Binary JPEG frames arrive as ArrayBuffer; the default "blob" path would force an async read.
+        socket.binaryType = "arraybuffer";
         socketRef.current = socket;
         // Event handlers use only data, so adapt the native event surface without changing the protocol.
         return {

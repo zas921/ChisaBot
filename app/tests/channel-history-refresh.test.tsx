@@ -16,6 +16,8 @@ import {
 } from "@/lib/channels/queries";
 import { applyChannelEvent } from "@/lib/channels/use-channel-events";
 import { queryClient } from "@/query-client";
+import { cachedTranscript, clearTranscriptCache, rememberTranscript } from "@/lib/copilot/transcript-cache";
+import { settleReactWork } from "./settle-react-work";
 
 type ChannelCache = InfiniteData<ChannelPage>;
 const ActivityRequestSchema = z.object({
@@ -74,6 +76,7 @@ let history: (threadId: string) => Promise<Response>;
 let historyReads: string[];
 let gatewaySnapshot: readonly Message[] = [];
 let runRequests: { path: string; input: RunAgentInput }[] = [];
+let truncateRequests: unknown[] = [];
 let activityRequests: ActivityRequest[] = [];
 let runEvents: (input: RunAgentInput) => unknown[];
 let core: ReturnType<typeof useCopilotKit>["copilotkit"] | undefined;
@@ -133,6 +136,12 @@ beforeAll(() => {
         runRequests.push({ path: url.pathname, input: body });
         return sse(runEvents(body));
       }
+      if (url.pathname.endsWith("/truncate")) {
+        const request = input instanceof Request ? input : new Request(url, init);
+        truncateRequests.push(await request.json());
+        return NativeResponse.json({ removed: [], revision: "1" });
+      }
+      if (url.pathname.endsWith("/workers")) return NativeResponse.json({ workers: [] });
       if (/\/api\/channels\/[^/]+\/activity$/.test(url.pathname)) {
         const request =
           input instanceof Request ? input : new Request(url, init);
@@ -166,12 +175,15 @@ beforeAll(() => {
     },
   );
 });
-afterEach(() => {
+afterEach(async () => {
   cleanup();
   queryClient.clear();
+  clearTranscriptCache();
   core = undefined;
+  await settleReactWork();
 });
-afterAll(() => {
+afterAll(async () => {
+  await settleReactWork();
   globalThis.fetch = originalFetch;
   GlobalRegistrator.unregister();
 });
@@ -220,6 +232,7 @@ function mounting(
   historyReads = [];
   gatewaySnapshot = snapshot;
   runRequests = [];
+  truncateRequests = [];
   activityRequests = [];
   runEvents = (input) => [
     { type: "RUN_STARTED", threadId: input.threadId, runId: input.runId },
@@ -234,6 +247,25 @@ async function mounted() {
   await view.findByText("Stored opening");
   return view;
 }
+
+test("editing a sent task and sending unchanged text truncates once and starts one new turn", async () => {
+  const original: Message = { id: "original-task", role: "user", content: "继续完成同一个任务" };
+  const answer: Message = { id: "old-task-answer", role: "assistant", content: "上一轮任务结果" };
+  const view = mounting(async () => stored([initial, original, answer]));
+  await view.findByText("上一轮任务结果");
+  const user = userEvent.setup({ document: view.container.ownerDocument });
+  await user.click(view.getByTestId("msg-edit"));
+  const send = view.getByTestId("msg-editor-send") as HTMLButtonElement;
+  expect(send.disabled).toBe(false);
+  await user.click(send);
+  await waitFor(() => expect(runRequests).toHaveLength(1));
+  expect(truncateRequests).toEqual([{ fromMessageId: original.id, mode: "edit" }]);
+  const messages = runRequests[0]!.input.messages;
+  expect(messages.at(-1)).toMatchObject({ role: "user", content: original.content });
+  expect(messages.at(-1)!.id).not.toBe(original.id);
+  expect(messages.some((message) => message.id === answer.id)).toBe(false);
+  expect(messages.some((message) => message.id === initial.id)).toBe(true);
+});
 
 function currentAgent(selected = channel) {
   const agent = core?.getAgent(`channel:${selected.id}`);
@@ -273,6 +305,54 @@ function delayedResponse() {
   });
   return { promise, resolve };
 }
+
+test("failed history and an empty join retain the cached transcript in the live agent", async () => {
+  rememberTranscript(channel.threadId, [initial]);
+  const view = mounting(async () => new NativeResponse("failed", { status: 500 }));
+  await waitFor(() => expect(currentAgent().messages).toEqual([initial]));
+  expect(view.getByText(initial.content)).toBeTruthy();
+  const user = userEvent.setup({ document: view.container.ownerDocument });
+  await user.type(view.getByRole("textbox", { name: "消息" }), "Use the restored context");
+  await user.click(view.getByRole("button", { name: "发送消息" }));
+  await waitFor(() => expect(runRequests).toHaveLength(1));
+  expect(runRequests[0]!.input.messages[0]).toEqual(initial);
+});
+
+test("successful retry replaces a cached fallback with authoritative empty history", async () => {
+  rememberTranscript(channel.threadId, [initial]);
+  let reads = 0;
+  const view = mounting(async () => ++reads === 1
+    ? new NativeResponse("failed", { status: 500 })
+    : stored([]));
+  await waitFor(() => expect(currentAgent().messages).toEqual([initial]));
+  await waitFor(() => expect(historyReads.length).toBeGreaterThan(1), { timeout: 3000 });
+  await waitFor(() => expect(currentAgent().messages).toEqual([]));
+  expect(view.queryByText(initial.content)).toBeNull();
+  expect(cachedTranscript(channel.threadId)).toBeNull();
+});
+
+test("retry cannot erase a message added in place after a cached fallback", async () => {
+  rememberTranscript(channel.threadId, [initial]);
+  const retry = delayedResponse();
+  let reads = 0;
+  mounting(async () => ++reads === 1
+    ? new NativeResponse("failed", { status: 500 })
+    : retry.promise);
+  await waitFor(() => expect(currentAgent().messages).toEqual([initial]));
+  await act(async () => { currentAgent().addMessage(local); });
+  await waitFor(() => expect(historyReads.length).toBeGreaterThan(1), { timeout: 3000 });
+  await act(async () => { retry.resolve(stored([])); });
+  expect(currentAgent().messages.map((message) => message.id)).toEqual([initial.id, local.id]);
+});
+
+test("leaving a restored conversation cleared by sync forgets its old cached history", async () => {
+  const view = mounting();
+  await waitFor(() => expect(currentAgent().messages).toEqual([initial]));
+  rememberTranscript(channel.threadId, [initial]);
+  await act(async () => { currentAgent().setMessages([]); });
+  view.unmount();
+  expect(cachedTranscript(channel.threadId)).toBeNull();
+});
 
 // Real provider, ChannelChat, history reader, and query cache; only the HTTP boundary is synthetic.
 /*
@@ -671,7 +751,9 @@ test.each([false, true])(
         ]),
       snapshot,
     );
-    await view.findByText(fresh.content);
+    // Consecutive assistant messages in one turn fold into the final answer.
+    // The earlier reply remains in agent history; only the final one is visible.
+    await view.findByText(longerStore ? latest.content : fresh.content);
     if (longerStore) expect(view.getByText(latest.content)).toBeTruthy();
     expect(view.getByText(oneHole)).toBeTruthy();
     expect(currentAgent().messages).toEqual([...snapshot, ...later]);

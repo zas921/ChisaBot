@@ -300,7 +300,7 @@ export function createTurnRunner(options: {
    * decided exactly as the browser would for this Bot; see `components/headless.ts`.
    */
   components?: { store: ComponentStore; auditStore?: AuditStore };
-  /** How long one headless turn may take before it is stopped. */
+  /** How long one headless turn may take before it is stopped. Zero disables the wall-clock deadline. */
   turnTimeoutMs?: number;
   lockTtlSeconds?: number;
   heartbeatMs?: number;
@@ -563,6 +563,10 @@ export function createTurnRunner(options: {
      */
     let stopPromise: Promise<boolean | undefined> | undefined;
     let cancelTurn: (() => void) | undefined;
+    let rejectLostLock: (error: unknown) => void = () => {};
+    const lostLock = new Promise<never>((_resolve, reject) => {
+      rejectLostLock = reject;
+    });
 
     const clearHeartbeat = () => {
       if (heartbeat === undefined) return;
@@ -596,6 +600,11 @@ export function createTurnRunner(options: {
           clearHeartbeat();
           heartbeatError = error;
           stopTurn();
+          // Unlimited workers still have to release their slot if an aborted runner never settles.
+          if (turnTimeoutMs <= 0) {
+            backstop = setTimeout(() => rejectLostLock(error), abortGraceMs);
+            backstop.unref?.();
+          }
         });
     }, heartbeatMs);
     // So a heartbeat that is still pending cannot hold a one-shot process open.
@@ -668,7 +677,7 @@ export function createTurnRunner(options: {
         backstop.unref?.();
       });
 
-      await Promise.race([completed, timeout, cancelled]);
+      await Promise.race([completed, timeout, cancelled, lostLock]);
     } finally {
       /*
        * THE SINGLE MOST IMPORTANT LINES IN THIS FILE, on every exit path — success, a thrown run, the

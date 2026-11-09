@@ -1,7 +1,7 @@
 import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { agentListQueryOptions } from "@/lib/agents/queries";
 import { type ChannelSummary, channelListQueryOptions } from "@/lib/channels/queries";
-import { latestChannelFor } from "@/lib/channels/latest";
+import { assuredLatestChannelFor } from "@/lib/channels/latest";
 import { readStoredPanelBot } from "@/lib/panels/active-bot";
 import { useMainBot } from "@/lib/settings/message-list";
 
@@ -44,15 +44,16 @@ export function useLanding(): Landing {
   const roster = (agents.data ?? []).filter((bot) => !bot.hidden);
   const botId = pickLandingBot(roster, readStoredPanelBot(), mainBotId);
   if (!botId) return agents.isError && agents.data === undefined ? { state: "error" } : { state: "empty" };
-  return { state: "ready", botId, target: chatTargetFor(botId, channels.data) };
+  return { state: "ready", botId, target: chatTargetFor(botId, channels.data, channels.hasNextPage) };
 }
 
 /** A Bot's conversation: its latest one-to-one channel, or its empty chat when it has none yet. */
 export function chatTargetFor(
   botId: string,
   channels: ChannelSummary[] | undefined,
+  hasNextPage = false,
 ): LandingTarget {
-  const latest = latestChannelFor(botId, channels);
+  const latest = assuredLatestChannelFor(botId, channels, hasNextPage);
   return latest
     ? { to: "/channel/$channelId", params: { channelId: latest.id } }
     : { to: "/channel/new", search: { agent: botId } };

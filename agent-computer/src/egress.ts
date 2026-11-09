@@ -812,6 +812,42 @@ function refuse(socket: Socket, reason: string) {
   );
 }
 
+/**
+ * Ask the client to prove which Bot it is.
+ *
+ * Chromium (and Playwright's proxy username/password) only attach `Proxy-Authorization` after a
+ * 407 challenge. An anonymous CONNECT that the fallback policy refuses used to answer 403, so the
+ * browser never retried with credentials and every page became ERR_TUNNEL_CONNECTION_FAILED —
+ * even when that Bot's pushed policy was allow_all. Challenge instead; a Bot that still may not
+ * leave is refused on the authenticated retry.
+ */
+const PROXY_AUTH_REALM = 'Basic realm="chisabot-egress"';
+const PROXY_AUTH_HINT =
+  "Proxy authentication required. Retry with this Bot's egress credentials.";
+
+function challengeConnect(socket: Socket) {
+  const body = PROXY_AUTH_HINT;
+  socket.end(
+    `HTTP/1.1 407 Proxy Authentication Required\r\nproxy-authenticate: ${PROXY_AUTH_REALM}\r\ncontent-type: text/plain\r\nx-openbot-egress: auth-required\r\ncontent-length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
+  );
+}
+
+function challengeHttp(
+  response: {
+    writeHead: (code: number, headers: Record<string, string>) => {
+      end: (body: string) => void;
+    };
+  },
+) {
+  response
+    .writeHead(407, {
+      "proxy-authenticate": PROXY_AUTH_REALM,
+      "content-type": "text/plain",
+      "x-openbot-egress": "auth-required",
+    })
+    .end(PROXY_AUTH_HINT);
+}
+
 /** Open a tunnel to host:port, through the upstream proxy when there is one. */
 function tunnel(
   target: { host: string; port: number; addresses?: readonly string[] },
@@ -987,6 +1023,11 @@ export async function startEgressFilter(
     );
     const decision = await decide(caller, target.hostname, port);
     if (!decision.allowed) {
+      // Anonymous denials are a challenge so Chromium can attach Bot credentials (see challengeConnect).
+      if (caller.kind === "anonymous") {
+        challengeHttp(response);
+        return;
+      }
       response
         .writeHead(403, {
           "content-type": "text/plain",
@@ -1029,6 +1070,10 @@ export async function startEgressFilter(
       );
       const decision = await decide(caller, host, port);
       if (!decision.allowed) {
+        if (caller.kind === "anonymous") {
+          challengeConnect(client);
+          return;
+        }
         refuse(client, decision.reason);
         return;
       }

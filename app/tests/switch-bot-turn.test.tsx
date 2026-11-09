@@ -117,15 +117,16 @@ test("留着等它答完的那段不声明「现在看着的机器人」，也�
 describe("接线", () => {
   const chat = src("components/channels/channel-chat.tsx");
 
-  test("看门狗先查落库再停：静默超时后第一次 stop 在「没落库（hang）」分支里", () => {
+  test("发送静默只触发轻量接收确认，不停止或解锁状态未知的任务", () => {
     const timeout = chat.indexOf('if (race === "timeout") {');
-    const read = chat.indexOf("const stored = await readThreadMessages(", timeout);
-    const hang = chat.indexOf('if (first.kind === "hang") {', timeout);
-    const firstStop = chat.indexOf("copilotkit.stopAgent({ agent: target });", timeout);
+    const finallyAt = chat.indexOf("runWatch.unsubscribe();", timeout);
+    const watchdog = chat.slice(timeout, finallyAt);
     expect(timeout).toBeGreaterThan(0);
-    expect(read).toBeGreaterThan(timeout);
-    expect(firstStop).toBeGreaterThan(hang);
-    expect(hang).toBeGreaterThan(read);
+    expect(watchdog).toContain("readSendReceipt(channel.threadId, runtimeAgentId, userMessageId)");
+    expect(watchdog).toContain("waitForSendReceipt(runPromise");
+    expect(watchdog).not.toContain("stopAgent");
+    expect(watchdog).not.toContain("forceUnlockThread");
+    expect(watchdog).not.toContain("SEND_HANG_REASON");
   });
 
   test("看门狗的进展订阅挂在这一轮在跑的 agent 上，跑完撤掉", () => {

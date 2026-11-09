@@ -12,6 +12,7 @@
 
 
 > 状态最后核对：2026-10-17（origin/main `0e23321`）。
+> 2026-10-23 局部更新：新增 CB-089～CB-097 并细化 CB-031；仅完成优化方案与验收文档，相关实现均未开始。详见[优化方案](optimization-plan-2026-10-23.md)。其他历史条目未重新全量核验。
 >
 > **为什么是文件**：仓库的 GitHub Issues 目前是关闭的（fork 默认关闭，自动化令牌没有仓库管理权限，开不了）。在仓库所有者打开
 > Settings → General → Features → Issues 之前，这里就是 issue 列表；打开之后每一条按 ID 原样建成 GitHub issue，标签、里程碑、
@@ -20,7 +21,7 @@
 规则：
 
 - 一条 = 一个可验收的结果。新需求先在这里加一条（下一个 ID），再开分支；PR 描述写 `Backlog: CB-0xx`。
-- 状态写在标签行：`status: in-progress`（有人在做）、`blocked`（写明卡在哪）、`needs-user`（要用户操作 / 决定）、`deferred`（以后再做）。
+- 状态写在标签行：`status: planned`（已定义、待实施）、`in-progress`（有人在做）、`blocked`（写明卡在哪）、`needs-user`（要用户操作 / 决定）、`deferred`（以后再做）。
 - 做完：勾掉验收标准，整条移到文末「已完成」，写 PR 号和合并提交。
 - 优先级：P0 立刻 / P1 这一轮 / P2 排队。里程碑见 [ROADMAP](ROADMAP.md)。
 
@@ -108,14 +109,22 @@
 | [CB-086](#cb-086) | 连续补话不重复执行；停止按钮终止当次计算机命令 | 成熟度 Maturity | `type: bug` · `area: chat` · `area: computer` · `P1` · `status: done` |
 | [CB-087](#cb-087) | 聊天可靠性全面修复：滚动、队列恢复、请求与编码 | 成熟度 Maturity | `type: bug` · `area: chat` · `area: computer` · `P1` · `status: done` |
 | [CB-088](#cb-088) | 代理 IP 证书与好友包首次构建修复 | 成熟度 Maturity | `type: bug` · `area: pc` · `area: infra` · `P1` · `status: in-progress` |
-
-| [CB-098](#cb-098) | Bot 对话支持常见办公文档、文本和压缩包 | 成熟度 Maturity | `type: feat` · `area: chat` · `area: android` · `P1` · `status: in-progress` |
+| [CB-089](#cb-089) | Android 消息同步、会话隔离与并发请求一致性 | 成熟度 Maturity | `type: bug` · `area: android` · `P1` · `status: planned` |
+| [CB-090](#cb-090) | 对话恢复使用一致的快照与事件检查点 | 成熟度 Maturity | `type: bug` · `area: chat` · `P1` · `status: planned` |
+| [CB-091](#cb-091) | CI 与本地共用自动发现和隔离验证入口 | 成熟度 Maturity | `type: chore` · `area: infra` · `P1` · `status: planned` |
+| [CB-092](#cb-092) | 发布产物绑定标签提交与不可变校验清单 | 成熟度 Maturity | `type: bug` · `area: infra` · `P1` · `status: planned` |
+| [CB-093](#cb-093) | 快速更新覆盖全部运行时镜像输入 | 成熟度 Maturity | `type: bug` · `area: infra` · `P1` · `status: planned` |
+| [CB-094](#cb-094) | 测量并减少长对话快照写放大 | 成熟度 Maturity | `type: perf` · `area: chat` · `P2` · `status: planned` |
+| [CB-095](#cb-095) | Android 旁观按变化增量同步并跟随前台生命周期 | 成熟度 Maturity | `type: perf` · `area: android` · `P2` · `status: planned` |
+| [CB-096](#cb-096) | 工具、接力和对话持久化指标进入现有健康视图 | 成熟度 Maturity | `type: chore` · `area: infra` · `P2` · `status: planned` |
+| [CB-097](#cb-097) | 工作流并行步骤共享 token 预算 | 成熟度 Maturity | `type: bug` · `area: workflows` · `P2` · `status: planned` |
+| [CB-098](#cb-098) | Bot 对话支持常见办公文档、文本和压缩包 | 成熟度 Maturity | `type: feat` · `area: chat` · `area: android` · `P1` · `status: done` |
 
 ## CB-098
 
 **Bot 对话支持常见办公文档、文本和压缩包**
 
-里程碑：成熟度 Maturity · 标签：`type: feat` `area: chat` `area: android` `P1` `status: in-progress`
+里程碑：成熟度 Maturity · 标签：`type: feat` `area: chat` `area: android` `P1` `status: done`
 
 用户要求支持 DOC，并扩展到常规文件。上传、格式校验、模型读取及 Android 原生入口一起处理，格式矩阵见[聊天文件](chat-files.md)，设计见 DESIGN §112。
 
@@ -123,9 +132,142 @@
 
 - [x] 网页/PC 和 Android 支持选择常见办公文件、文本/代码与压缩包，前后端保留类型和体积校验
 - [x] DOCX/PDF/XLSX/PPTX/OpenDocument 提取实际文字，压缩包不执行内容；损坏、截断和未提取情况明确说明
-- [ ] 上传接口、下载权限和模型引用在隔离数据库验证；旧版 DOC/XLS/PPT 在候选运行镜像验证
-- [ ] 前后端类型检查、相关聊天回归和 Android 测试/签名包通过
-- [ ] 服务器备份、部署及上线健康/版本检查完成，记录客户端更新要求
+- [x] 上传接口、下载权限和模型引用在隔离数据库验证；旧版 DOC/XLS/PPT 在候选运行镜像验证
+- [x] 前后端类型检查、相关聊天回归和 Android 测试/签名包通过
+- [x] 服务器备份、部署及上线健康/版本检查完成，记录客户端更新要求
+
+2026-10-23：个人定制版 0.1.58 已部署，源码 `e9303ab03f1b`；[验证记录](pipeline-runs/20261023-common-chat-files.md)记录相关测试、7 项既有前端失败及上线检查。网页/PC 刷新即可；Android 需要安装 0.1.58（versionCode 256）。
+
+## CB-089
+
+**Android 消息同步、会话隔离与并发请求一致性**
+
+里程碑：成熟度 Maturity · 标签：`type: bug` `area: android` `P1` `status: planned`
+
+代码检查发现短回合可能在两次忙闲轮询间完成，旧聊天加载可能覆盖新会话，并发 401 续期和首次多附件建频道也缺少共享进行中请求。详见[方案 O-01](optimization-plan-2026-10-23.md#o-01android-同步和并发边界)。尚未真机复现。
+
+#### 验收标准
+
+- [ ] 消息按 seq/revision 同步；另一端 500ms 内完成、后台完成和编辑重发均能补齐，无重复
+- [ ] 反转 A/B 加载响应顺序、切服务器和退出登录时，旧结果不能覆盖当前会话
+- [ ] 10 个并发 401 只续期一次；成功全部重试，撤销设备令牌只退出一次
+- [ ] 首次 8 个附件只创建一次频道；切机器人后旧上传不覆盖新状态
+- [ ] 加入可控延迟与虚拟时间测试；完成 PC ↔ Android 切网、锁屏、停止和重生成对测
+
+## CB-090
+
+**对话恢复使用一致的快照与事件检查点**
+
+里程碑：成熟度 Maturity · 标签：`type: bug` `area: chat` `P1` `status: planned`
+
+当前 connect 分开读取消息与最大事件序号，存在序号领先快照、缓冲增量被跳过的窗口。先完成[方案 O-02 的一致性部分](optimization-plan-2026-10-23.md#o-02先保证恢复一致再减少对话写放大)，再开展 CB-094。
+
+#### 验收标准
+
+- [ ] messages/state 与 snapshot_sequence 同一次提交，恢复从对应检查点补齐增量
+- [ ] 可控交错测试覆盖快照读取途中到达的新事件，断言无漏字、重复或工具重执行
+- [ ] 停止、重启、审批/前端接力、编辑重发和队列恢复通过；持久化失败仍停止生产事件
+- [ ] 新字段兼容旧数据与旧代码，记录迁移和回滚办法
+
+## CB-091
+
+**CI 与本地共用自动发现和隔离验证入口**
+
+里程碑：成熟度 Maturity · 标签：`type: chore` `area: infra` `P1` `status: planned`
+
+复用已有前端隔离 runner，统一服务端单元/数据库集成分组及 computer 类型检查。当前命令与拟议调整见[测试手册](testing.md)及[方案 O-03](optimization-plan-2026-10-23.md#o-03统一验证入口)。
+
+#### 验收标准
+
+- [ ] 本地与 CI 使用同一分组，记录发现和执行文件数；新增普通测试无需修改 workflow
+- [ ] 隔离文件不污染其他测试；人为失败能使对应门禁非零退出
+- [ ] app、server、agent-computer 均有独立类型检查结果
+- [ ] 真实外部服务测试继续显式启用；文档不再把历史 mock 污染当作允许失败的现状
+
+## CB-092
+
+**发布产物绑定标签提交与不可变校验清单**
+
+里程碑：成熟度 Maturity · 标签：`type: bug` `area: infra` `P1` `status: planned`
+
+手工输入标签时目前只检查版本字符串，测试与构建未统一 checkout 该标签解析出的提交。详见[方案 O-04](optimization-plan-2026-10-23.md#o-04发布来源与快速更新完整性)。
+
+#### 验收标准
+
+- [ ] 所有测试和构建使用同一个已解析 SHA，清单含版本、提交、锁文件摘要和产物哈希
+- [ ] 主分支与旧标签不同但版本相同时，明确构建标签提交或在构建前拒绝
+- [ ] 同名且哈希不同的 Release 资产不能静默覆盖；保留 Android 签名与包信息校验
+- [ ] 发版提交满足现有 PC/Android 版本一致门禁；无部署或发布副作用的本地夹具测试通过
+
+## CB-093
+
+**快速更新覆盖全部运行时镜像输入**
+
+里程碑：成熟度 Maturity · 标签：`type: bug` `area: infra` `P1` `status: planned`
+
+完整镜像 COPY 的迁移等待脚本与 Composio 自检脚本未进入快速替换或完整构建指纹。详见[方案 O-04](optimization-plan-2026-10-23.md#o-04发布来源与快速更新完整性)。
+
+#### 验收标准
+
+- [ ] 单改 migrate-wait.sh 或 composio-smoke.ts 均触发完整构建
+- [ ] 每个运行时镜像输入都有快速替换或完整构建分类，并有覆盖检查
+- [ ] 隔离镜像中关键启动脚本哈希与目标源码相符；不以更新版本号代替文件核对
+
+## CB-094
+
+**测量并减少长对话快照写放大**
+
+里程碑：成熟度 Maturity · 标签：`type: perf` `area: chat` `P2` `status: planned`
+
+依赖 CB-090。详见[方案 O-02](optimization-plan-2026-10-23.md#o-02先保证恢复一致再减少对话写放大)；性能收益尚未测量。
+
+#### 验收标准
+
+- [ ] 固定 100/500/2,000 条历史与长工具参数样本，记录延迟、写入次数/字节量和峰值内存
+- [ ] 仅在一致性检查点完成后合并快照；工具/审批/终止边界强制持久化
+- [ ] 以同机前后基准解释收益，恢复与持久化失败回归仍通过
+
+## CB-095
+
+**Android 旁观按变化增量同步并跟随前台生命周期**
+
+里程碑：成熟度 Maturity · 标签：`type: perf` `area: android` `P2` `status: planned`
+
+依赖 CB-089，增量恢复依赖 CB-090。详见[方案 O-05](optimization-plan-2026-10-23.md#o-05android-旁观改为增量同步)。
+
+#### 验收标准
+
+- [ ] 无变化不重复下载全历史；后台暂停高频旁观，前台恢复立即同步
+- [ ] 500/2,000 条历史各旁观 10 分钟，记录请求数、字节量和主线程耗时
+- [ ] 网络正常时回前台以 3 秒内追齐为目标；断流重试不丢消息、不重复工具
+
+## CB-096
+
+**工具、接力和对话持久化指标进入现有健康视图**
+
+里程碑：成熟度 Maturity · 标签：`type: chore` `area: infra` `P2` `status: planned`
+
+随 CB-094 实施，复用现有轻量指标。详见[方案 O-07](optimization-plan-2026-10-23.md#o-07补齐可衡量的运行指标)。
+
+#### 验收标准
+
+- [ ] 工具失败、接力超时以及快照次数/字节量有固定分类统计
+- [ ] 模拟故障能在健康视图定位；同一负载优化前后可直接比较
+- [ ] 不使用聊天正文、工具参数或线程 ID 作为指标标签
+
+## CB-097
+
+**工作流并行步骤共享 token 预算**
+
+里程碑：成熟度 Maturity · 标签：`type: bug` `area: workflows` `P2` `status: planned`
+
+内存场景已复现并行步骤覆盖总计，使用的是程序估算 token。工作流默认隐藏；若实际使用并行工作流，提升为 P1。详见[方案 O-08](optimization-plan-2026-10-23.md#o-08工作流并行预算漏计)。
+
+#### 验收标准
+
+- [ ] 汇总已完成和所有在途回合；预算判断不能仅修成完成时累加
+- [ ] 两个步骤各未超限、合计超限时不能成功；不超限时总计等于各调用之和
+- [ ] JSON 修正、取消与错误场景不漏记用量，测试不连接真实模型
 
 ## CB-088
 
@@ -770,6 +912,9 @@ delegate_task 的工具参数还在流式输出时（默认模型约 6–8 秒�
 - [ ] 给出保留策略（按对话 / 时间），不影响历史对话显示
 - [ ] 迁移可回滚
 - [ ] docs/operations.md 写明
+- [ ] 先完成 CB-090；保留重生成、停止、用量、回退及等待审批依赖的运行语义，不能直接按日期删除事件
+- [ ] 提供按类型/会话的体积统计和 dry-run，运行中/等待中的回合不清理
+- [ ] 在隔离数据副本中验证历史、旧消息重生成、审批恢复与备份恢复一致；详见[方案 O-06](optimization-plan-2026-10-23.md#o-06事件保留与存储维护)
 
 ## CB-032
 

@@ -33,7 +33,7 @@ import {
 } from "@/lib/channels/queries";
 import { queryClient } from "@/query-client";
 import { settleReactWork } from "./settle-react-work";
-import { SEND_REPLY_WAITING_NOTICE } from "@/lib/copilot/connection-drop";
+import { SEND_HANG_REASON, SEND_RECEIPT_WAITING_NOTICE, SEND_REPLY_WAITING_NOTICE } from "@/lib/copilot/connection-drop";
 
 /**
  * WHAT A FAILED SEND DOES TO THE FILES IT WAS CARRYING, DRIVEN THROUGH THE REAL CHANNEL.
@@ -92,7 +92,15 @@ let uploads: string[];
 let runAnswers: ((input: RunAgentInput) => Promise<Response>)[];
 let core: ReturnType<typeof useCopilotKit>["copilotkit"] | undefined;
 let originalFetch: typeof fetch;
-let watchdogFixture: { running: boolean; mutations: string[] } | null = null;
+let watchdogFixture: {
+  running: boolean;
+  mutations: string[];
+  received?: true | null;
+  historyFailed?: boolean;
+  historyReads?: number;
+  receiptReads?: number;
+  savedReply?: string;
+} | null = null;
 
 function CoreProbe() {
   core = useCopilotKit().copilotkit;
@@ -138,13 +146,30 @@ beforeAll(() => {
         "http://localhost",
       );
       if (watchdogFixture) {
+        if (/\/threads\/[^/]+\/send-status$/.test(url.pathname)) {
+          watchdogFixture.receiptReads = (watchdogFixture.receiptReads ?? 0) + 1;
+          return NativeResponse.json({
+            threadId: channel.threadId,
+            messageId: url.searchParams.get("messageId"),
+            received: watchdogFixture.received === undefined ? true : watchdogFixture.received,
+            persisted: false,
+            running: watchdogFixture.running,
+            runId: runs[0]?.runId ?? null,
+          });
+        }
         if (/\/api\/bot-threads\/[^/]+\/sync$/.test(url.pathname))
           return NativeResponse.json({ current: null, thread: {
             threadId: channel.threadId, seq: "1", running: watchdogFixture.running,
             live: watchdogFixture.running, waiting: false, workers: null, inbox: null,
           } });
-        if (/\/threads\/[^/]+\/messages$/.test(url.pathname))
-          return NativeResponse.json({ messages: runs[0]?.messages ?? [opening] });
+        if (/\/threads\/[^/]+\/messages$/.test(url.pathname)) {
+          watchdogFixture.historyReads = (watchdogFixture.historyReads ?? 0) + 1;
+          if (watchdogFixture.historyFailed) return new NativeResponse("slow history", { status: 504 });
+          return NativeResponse.json({ messages: [
+            ...(runs[0]?.messages ?? [opening]),
+            ...(watchdogFixture.savedReply ? [{ id: "recovered-answer", role: "assistant", content: watchdogFixture.savedReply }] : []),
+          ] });
+        }
         if (url.pathname.endsWith("/unlock") || url.pathname.includes("/stop/") || url.pathname === "/api/ops/budget") {
           watchdogFixture.mutations.push(url.pathname);
           return NativeResponse.json({ ok: true, stopped: true });
@@ -222,6 +247,75 @@ beforeEach(() => {
   deletes = [];
   uploads = [];
   runAnswers = [];
+});
+
+test.each([true, null] as const)("slow history cannot stop or repeat a pending send (receipt=%s)", async (received) => {
+  const response = deferred();
+  runAnswers = [() => response.promise];
+  const view = await mounted();
+  const user = userEvent.setup({ document: view.container.ownerDocument });
+  await user.type(view.getByRole("textbox", { name: "消息" }), "Collect data once");
+  await user.click(view.getByRole("button", { name: "发送消息" }));
+  await waitFor(() => expect(runs).toHaveLength(1));
+  watchdogFixture = { running: received === true, received, historyFailed: true, mutations: [] };
+  const realNow = Date.now;
+  let offset = 13_000;
+  const clock = spyOn(Date, "now").mockImplementation(() => realNow() + offset);
+  try {
+    await waitFor(() => expect(watchdogFixture?.receiptReads).toBeGreaterThan(0), { timeout: 4_000 });
+    if (received === null) expect(view.queryByText(SEND_RECEIPT_WAITING_NOTICE)).not.toBeNull();
+    expect(watchdogFixture.historyReads ?? 0).toBe(0);
+    expect(watchdogFixture.mutations).toEqual([]);
+    expect(view.queryByText(SEND_HANG_REASON)).toBeNull();
+    expect(view.queryByLabelText("停止机器人")).not.toBeNull();
+    expect(runs).toHaveLength(1);
+    watchdogFixture.received = true;
+    watchdogFixture.running = true;
+    offset = 181_000;
+    await waitFor(() => expect(view.queryByText(SEND_REPLY_WAITING_NOTICE)).not.toBeNull(), { timeout: 4_000 });
+    expect(watchdogFixture.mutations).toEqual([]);
+    expect(runs).toHaveLength(1);
+    await user.click(view.getByLabelText("停止机器人"));
+    await waitFor(() => expect(watchdogFixture?.mutations.some((path) => path.endsWith("/unlock"))).toBe(true));
+  } finally {
+    clock.mockRestore();
+    response.settle(finished(runs[0]!));
+  }
+});
+
+test.each(["eof", "network error"] as const)("a native command result followed by %s recovers the saved answer without another run", async (closure) => {
+  const view = await mounted();
+  const user = userEvent.setup({ document: view.container.ownerDocument });
+  if (!core) throw new Error("Missing SDK core");
+  const original = core.runAgent.bind(core);
+  // Keep the real SDK and wire events, but inject a rejected request at the
+  // delivery boundary rather than erroring Bun's internal response reader.
+  const transport = closure === "network error" ? spyOn(core, "runAgent").mockImplementation(async (options) => {
+    await original(options);
+    throw new TypeError("network error");
+  }) : undefined;
+  try {
+    const received = deferred();
+    runAnswers = [() => received.promise];
+    await user.type(view.getByRole("textbox", { name: "消息" }), "Read this once");
+    await user.click(view.getByRole("button", { name: "发送消息" }));
+    await waitFor(() => expect(runs).toHaveLength(1));
+    watchdogFixture = { running: false, mutations: [], savedReply: "Recovered server answer" };
+    const input = runs[0]!;
+    received.settle(sse([
+      { type: "RUN_STARTED", threadId: input.threadId, runId: input.runId },
+      { type: "TOOL_CALL_START", toolCallId: "native", toolCallName: "computer_run_command", parentMessageId: "native-message" },
+      { type: "TOOL_CALL_ARGS", toolCallId: "native", delta: '{"command":"safe probe"}' },
+      { type: "TOOL_CALL_END", toolCallId: "native" },
+      { type: "TOOL_CALL_RESULT", toolCallId: "native", messageId: "native-result", content: '{"ok":true}', role: "tool" },
+    ]));
+    await waitFor(() => expect(view.getByText("Recovered server answer")).toBeTruthy());
+    expect(view.queryByText(/这一轮没有做完/)).toBeNull();
+    expect(runs).toHaveLength(1);
+    expect(watchdogFixture.mutations).toEqual([]);
+  } finally {
+    transport?.mockRestore();
+  }
 });
 
 test("a persisted silent run keeps its Stop button beyond three minutes without stop/unlock", async () => {

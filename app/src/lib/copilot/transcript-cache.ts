@@ -18,6 +18,12 @@ type Entry = { messages: readonly Message[]; at: number };
 const cache = new Map<string, Entry>();
 const inflight = new Map<string, Promise<void>>();
 
+/** A confirmed empty/truncated transcript must not reappear on a later failed load. */
+export function forgetTranscript(threadId: string): void {
+  cache.delete(threadId);
+  inflight.delete(threadId);
+}
+
 /** 这段对话上次看到的样子；没有就是 null。 */
 export function cachedTranscript(threadId: string): readonly Message[] | null {
   const hit = cache.get(threadId);
@@ -25,14 +31,14 @@ export function cachedTranscript(threadId: string): readonly Message[] | null {
   // 最近用过的排到最后（LRU）。
   cache.delete(threadId);
   cache.set(threadId, hit);
-  return hit.messages;
+  return structuredClone(hit.messages);
 }
 
 /** 记下这段对话现在的样子（空的不记：空白不比骨架好）。 */
 export function rememberTranscript(threadId: string, messages: readonly Message[]): void {
   if (!threadId || messages.length === 0) return;
   cache.delete(threadId);
-  cache.set(threadId, { messages: [...messages], at: Date.now() });
+  cache.set(threadId, { messages: structuredClone(messages), at: Date.now() });
   while (cache.size > MAX) {
     const oldest = cache.keys().next().value;
     if (oldest === undefined) break;
@@ -50,8 +56,9 @@ export function prefetchTranscript(threadId: string, agentId: string): Promise<v
   const running = inflight.get(threadId);
   if (running) return running;
   const startedAt = Date.now();
-  const read = readThreadMessages(threadId, agentId)
+  const read: Promise<void> = readThreadMessages(threadId, agentId, { sharePending: true })
     .then((stored) => {
+      if (inflight.get(threadId) !== read) return;
       // 对话打开期间记下的（离开时）比预取的新：不覆盖。
       const now = cache.get(threadId);
       if (now && now.at > startedAt) return;
@@ -59,7 +66,7 @@ export function prefetchTranscript(threadId: string, agentId: string): Promise<v
     })
     .catch(() => {})
     .finally(() => {
-      inflight.delete(threadId);
+      if (inflight.get(threadId) === read) inflight.delete(threadId);
     });
   inflight.set(threadId, read);
   return read;

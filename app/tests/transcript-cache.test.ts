@@ -4,10 +4,12 @@ import { QueryClient } from "@tanstack/react-query";
 import {
   cachedTranscript,
   clearTranscriptCache,
+  forgetTranscript,
   prefetchTranscript,
   rememberTranscript,
 } from "@/lib/copilot/transcript-cache";
 import { channelFromRoster, channelKeys } from "@/lib/channels/queries";
+import { readThreadMessages } from "@/lib/copilot/thread-messages";
 
 /**
  * 打开对话 / 切机器人「秒开」（DESIGN.md §83）：切回刚看过的机器人时，第一帧画的是这里记下的那一份，
@@ -48,6 +50,20 @@ describe("transcript cache", () => {
     expect(cachedTranscript("t1")).toBeNull();
   });
 
+  test("消息正文和工具参数不会被仍在运行的 agent 或另一个消费者改写", () => {
+    const live: Message[] = [{
+      id: "tool-message", role: "assistant", content: "original",
+      toolCalls: [{ id: "call-1", type: "function", function: { name: "fetch", arguments: "{}" } }],
+    }];
+    rememberTranscript("nested", live);
+    live[0]!.content = "streamed later";
+    const first = cachedTranscript("nested")!;
+    expect(first[0]!.content).toBe("original");
+    if (first[0]!.role === "assistant") first[0]!.toolCalls![0]!.function.arguments = "mutated";
+    const second = cachedTranscript("nested")!;
+    expect(second[0]!.role === "assistant" && second[0]!.toolCalls![0]!.function.arguments).toBe("{}");
+  });
+
   test("最多记 12 段，最久没用的先丢", () => {
     for (let i = 0; i < 13; i += 1) rememberTranscript(`t${i}`, [msg(`m${i}`)]);
     expect(cachedTranscript("t0")).toBeNull();
@@ -67,6 +83,14 @@ describe("transcript cache", () => {
     expect(calls).toBe(1);
   });
 
+  test("悬停预取后立即打开会话，共用同一条历史请求", async () => {
+    const prefetch = prefetchTranscript("hover-click", "bot");
+    const mount = readThreadMessages("hover-click", "bot", { sharePending: true });
+    await Promise.all([prefetch, mount]);
+    expect(calls).toBe(1);
+    expect((await mount).messages).toEqual([...(cachedTranscript("hover-click") ?? [])]);
+  });
+
   test("预取读不到不报错、不记", async () => {
     globalThis.fetch = mock(async () => new Response("no", { status: 500 })) as unknown as typeof fetch;
     await prefetchTranscript("t9", "bot");
@@ -79,6 +103,16 @@ describe("transcript cache", () => {
     rememberTranscript("t1", [msg("local-newer")]);
     await pending;
     expect(cachedTranscript("t1")?.map((m) => m.id)).toEqual(["local-newer"]);
+  });
+
+  test("确认空历史后清掉旧缓存，迟到的预取也不能把旧消息放回来", async () => {
+    rememberTranscript("deleted", [msg("old")]);
+    const pending = prefetchTranscript("prefetch-before-delete", "bot");
+    forgetTranscript("deleted");
+    forgetTranscript("prefetch-before-delete");
+    await pending;
+    expect(cachedTranscript("deleted")).toBeNull();
+    expect(cachedTranscript("prefetch-before-delete")).toBeNull();
   });
 });
 

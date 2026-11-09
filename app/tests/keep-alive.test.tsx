@@ -243,6 +243,111 @@ test("离开的那段没在回答：照旧让出位置（新对话复用它，�
   expect(view.getByTestId("page").textContent).toBe("c2");
 });
 
+function cachedStage(
+  Page: (p: { id: string; state: KeptState }) => ReactNode,
+  address: Addr,
+  working: ReadonlySet<string> = new Set(),
+  maxIdlePages = 5,
+  ttlMs?: number,
+) {
+  return (
+    <KeepAliveStage
+      address={address}
+      keyOf={(kept) => kept.id}
+      maxIdlePages={maxIdlePages}
+      renderKept={(kept, state) => <Page id={kept.id} state={state} />}
+      same={same}
+      ttlMs={ttlMs}
+      working={working}
+    >
+      {null}
+    </KeepAliveStage>
+  );
+}
+
+test("闲置聊天 A / B 快速来回切换：复用各自的 DOM 实例，只有当前对话可见", () => {
+  const { log, Page } = counterPage();
+  const view = render(cachedStage(Page, { id: "a" }));
+  const firstA = view.getByText("a");
+  view.rerender(cachedStage(Page, { id: "b" }));
+  const firstB = view.getByText("b");
+  for (const id of ["a", "b", "a", "b", "a"]) {
+    view.rerender(cachedStage(Page, { id }));
+    expect(view.getAllByTestId("kept-page")).toHaveLength(2);
+    const visible = view.getAllByTestId("kept-page").filter((page) => page.getAttribute("data-visible") === "true");
+    expect(visible).toHaveLength(1);
+    expect(visible[0]!.textContent).toBe(id);
+    const hidden = view.getAllByTestId("kept-page").find((page) => page.getAttribute("data-visible") === "false")!;
+    expect(hidden.hasAttribute("inert")).toBe(true);
+    expect(hidden.getAttribute("aria-hidden")).toBe("true");
+  }
+  expect(view.getByText("a")).toBe(firstA);
+  expect(view.getByText("b")).toBe(firstB);
+  expect(log.mounts).toBe(2);
+  expect(log.unmounts).toBe(0);
+});
+
+test("闲置聊天按最近访问淘汰，正在回答的页不占闲置容量", () => {
+  const { Page } = counterPage();
+  const busy = new Set(["busy"]);
+  const view = render(cachedStage(Page, { id: "busy" }, busy, 2));
+  const busyNode = view.getByText("busy");
+  for (const id of ["a", "b", "c"]) view.rerender(cachedStage(Page, { id }, busy, 2));
+  const firstA = view.getByText("a");
+  view.rerender(cachedStage(Page, { id: "a" }, busy, 2));
+  expect(view.getByText("a")).toBe(firstA);
+  view.rerender(cachedStage(Page, { id: "d" }, busy, 2));
+  expect(view.queryByText("b")).toBeNull();
+  expect(view.getByText("a")).toBe(firstA);
+  expect(view.getByText("busy")).toBe(busyNode);
+  expect(view.getAllByTestId("kept-page")).toHaveLength(4);
+});
+
+test("闲置 held 到期释放，当前聊天和仍在回答的聊天继续保留", async () => {
+  const { Page } = counterPage();
+  const busy = new Set(["busy"]);
+  const view = render(cachedStage(Page, { id: "busy" }, busy, 5, 30));
+  const busyNode = view.getByText("busy");
+  view.rerender(cachedStage(Page, { id: "idle" }, busy, 5, 30));
+  view.rerender(cachedStage(Page, { id: "current" }, busy, 5, 30));
+  const currentNode = view.getByText("current");
+  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 80)); });
+  expect(view.queryByText("idle")).toBeNull();
+  expect(view.getByText("busy")).toBe(busyNode);
+  expect(view.getByText("current")).toBe(currentNode);
+  // 忙页答完以后才开始计时，不因已在后台很久而立即丢掉。
+  view.rerender(cachedStage(Page, { id: "current" }, new Set(), 5, 30));
+  expect(view.getByText("busy")).toBe(busyNode);
+  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 80)); });
+  expect(view.queryByText("busy")).toBeNull();
+  expect(view.getByText("current")).toBe(currentNode);
+});
+
+test("缓存聊天开关设置窗格：保持同一实例，不创建相同聊天的第二页", () => {
+  const { log, Page } = counterPage();
+  type Address = Addr & { settings?: boolean };
+  const make = (address: Address) => (
+    <KeepAliveStage
+      address={address}
+      keyOf={(kept) => kept.id}
+      maxIdlePages={5}
+      renderKept={(kept, state) => <Page id={kept.id} state={state} />}
+      same={(a, b) => a.id === b.id && a.settings === b.settings}
+    >
+      {null}
+    </KeepAliveStage>
+  );
+  const view = render(make({ id: "a" }));
+  const first = view.getByText("a");
+  view.rerender(make({ id: "a", settings: true }));
+  view.rerender(make({ id: "b" }));
+  view.rerender(make({ id: "a", settings: false }));
+  expect(view.getByText("a")).toBe(first);
+  expect(view.getAllByTestId("kept-page")).toHaveLength(2);
+  expect(log.mounts).toBe(2);
+  expect(log.unmounts).toBe(0);
+});
+
 test("两段都在回答，来回切：两页都留着，DOM 里的先后不变（挪节点会丢滚动位置）", () => {
   const { Page } = counterPage();
   const busy = new Set(["c1", "c2"]);
@@ -343,6 +448,28 @@ test("藏着的聊天登记它的机器人：全局的组件授权轮询为它�
   const again = render(<Global />);
   expect(onScreen.at(-1)).toBe(true);
   again.unmount();
+});
+
+test("同一机器人有隐藏历史和可见对话：全局组件轮询继续，可见对话离开才暂停", () => {
+  let onScreen = true;
+  function Global() {
+    onScreen = useBotOnScreen("same_bot");
+    return null;
+  }
+  function Chat({ hidden }: { hidden: boolean }) {
+    useMarkBotHidden("same_bot", hidden);
+    return null;
+  }
+  const make = (showCurrent: boolean) => <><Global /><Chat hidden key="history" />{showCurrent ? <Chat hidden={false} key="current" /> : null}</>;
+  const view = render(make(true));
+  expect(onScreen).toBe(true);
+  view.rerender(make(false));
+  expect(onScreen).toBe(false);
+  view.rerender(make(true));
+  expect(onScreen).toBe(true);
+  view.unmount();
+  render(<Global />);
+  expect(onScreen).toBe(true);
 });
 
 test("计算机控制权：只剩藏着的订阅者时不再每秒问，回来马上补读", async () => {

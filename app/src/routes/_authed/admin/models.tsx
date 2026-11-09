@@ -1,4 +1,4 @@
-import { IconCheck, IconKey, IconNetwork } from "@tabler/icons-react";
+import { IconCheck, IconKey, IconNetwork, IconRefresh } from "@tabler/icons-react";
 import { useAsyncAction } from "@/components/ui/async-action";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ImageDefaultCard, VisionDefaultCard } from "@/components/settings/media-models";
@@ -6,7 +6,7 @@ import { FallbackModelsCard } from "@/components/settings/fallback-models";
 import { ErrorCard } from "@/components/ui/skyglass";
 import { mediaAdminQueryOptions } from "@/lib/media-models";
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { PageSection, PageShell, PageSkeleton } from "@/components/layout/page-shell";
 import { Button } from "@/components/ui/button";
 import {
@@ -20,7 +20,9 @@ import { Input } from "@/components/ui/input";
 import {
   Select,
   SelectContent,
+  SelectGroup,
   SelectItem,
+  SelectLabel,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
@@ -36,6 +38,13 @@ import {
   testModelConnectionMutationOptions,
 } from "@/lib/model-settings/mutations";
 import { modelSettingsQueryOptions } from "@/lib/model-settings/queries";
+import {
+  loadModelCatalog,
+  modelCatalogQueryOptions,
+  modelSelectionKeys,
+} from "@/lib/model-selection/queries";
+import { notifyModelSelectionChanged } from "@/lib/model-selection/sync";
+import type { ModelCatalogEntry } from "../../../../shared/model-selection";
 
 export const Route = createFileRoute("/_authed/admin/models")({
   component: ModelSettingsPage,
@@ -124,8 +133,23 @@ function MediaDefaults() {
   );
 }
 
+function modelOptionLabel(model: ModelCatalogEntry) {
+  return model.label && model.label !== model.id
+    ? `${model.label} · ${model.id}`
+    : model.id;
+}
+
 function ModelSettingsForm({ config }: { config: ModelSettingsCurrent }) {
   const queryClient = useQueryClient();
+  const catalog = useQuery(modelCatalogQueryOptions());
+  const refreshCatalog = useMutation({
+    mutationFn: () => loadModelCatalog(true),
+    onSuccess: (next) => {
+      queryClient.setQueryData(modelSelectionKeys.catalog, next);
+      void queryClient.invalidateQueries({ queryKey: modelSelectionKeys.agents });
+      notifyModelSelectionChanged();
+    },
+  });
   const save = useMutation(saveModelSettingsMutationOptions(queryClient));
   const testConnection = useMutation(testModelConnectionMutationOptions());
   const [current, setCurrent] = useState(config);
@@ -142,6 +166,28 @@ function ModelSettingsForm({ config }: { config: ModelSettingsCurrent }) {
     message: string;
   } | null>(null);
   const busy = save.isPending || testConnection.isPending;
+  const catalogModels = catalog.data?.models ?? [];
+  const modelGroups = useMemo(() => {
+    const byProvider = new Map<string, { label: string; items: ModelCatalogEntry[] }>();
+    for (const model of catalogModels) {
+      const key = model.provider || "other";
+      const label = model.providerName || model.provider || "其他";
+      const group = byProvider.get(key) ?? { label, items: [] };
+      group.items.push(model);
+      byProvider.set(key, group);
+    }
+    return [...byProvider.entries()].map(([value, group]) => ({
+      value,
+      label: group.label,
+      items: group.items,
+    }));
+  }, [catalogModels]);
+  const modelInCatalog = catalogModels.some((model) => model.id === draft.model);
+  const selectedModelLabel = useMemo(() => {
+    const hit = catalogModels.find((model) => model.id === draft.model);
+    if (hit) return modelOptionLabel(hit);
+    return draft.model || "选择 Magpie 已配置的模型";
+  }, [catalogModels, draft.model]);
 
   function change<Key extends keyof ModelSettingsDraft>(
     key: Key,
@@ -262,20 +308,63 @@ function ModelSettingsForm({ config }: { config: ModelSettingsCurrent }) {
               </FieldDescription>
             </Field>
             <Field data-invalid={Boolean(errors.model)}>
-              <FieldLabel htmlFor="model-name">模型名称</FieldLabel>
-              <Input
-                aria-describedby="model-name-help"
-                aria-invalid={Boolean(errors.model)}
-                autoComplete="off"
-                disabled={busy}
-                id="model-name"
-                onChange={(event) => change("model", event.target.value)}
-                placeholder="例如 MiniMax-M3.1-Flash-Preview"
-                spellCheck={false}
-                value={draft.model}
-              />
+              <div className="flex flex-wrap items-end justify-between gap-2">
+                <FieldLabel htmlFor="model-name">部署默认模型</FieldLabel>
+                <Button
+                  disabled={busy || refreshCatalog.isPending || catalog.isFetching}
+                  onClick={() => void refreshCatalog.mutateAsync()}
+                  size="sm"
+                  type="button"
+                  variant="ghost"
+                >
+                  <IconRefresh />
+                  {"同步 Magpie 模型"}
+                </Button>
+              </div>
+              <Select
+                disabled={busy || (!catalogModels.length && !draft.model)}
+                onValueChange={(value) => {
+                  if (typeof value === "string" && value) change("model", value);
+                }}
+                value={draft.model || undefined}
+              >
+                <SelectTrigger
+                  aria-describedby="model-name-help"
+                  aria-invalid={Boolean(errors.model) || (Boolean(draft.model) && catalog.isSuccess && !modelInCatalog)}
+                  id="model-name"
+                >
+                  <SelectValue>{selectedModelLabel}</SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  {draft.model && !modelInCatalog ? (
+                    <SelectGroup>
+                      <SelectLabel>{"当前已保存（目录里没有）"}</SelectLabel>
+                      <SelectItem value={draft.model}>{`${draft.model} · 目录里暂时没有`}</SelectItem>
+                    </SelectGroup>
+                  ) : null}
+                  {modelGroups.map((group) => (
+                    <SelectGroup key={group.value}>
+                      <SelectLabel>{group.label}</SelectLabel>
+                      {group.items.map((model) => (
+                        <SelectItem key={model.id} value={model.id}>
+                          {modelOptionLabel(model)}
+                        </SelectItem>
+                      ))}
+                    </SelectGroup>
+                  ))}
+                </SelectContent>
+              </Select>
               <FieldDescription id="model-name-help">
-                填写接口支持的完整模型 ID。
+                {catalog.isPending
+                  ? "正在读取 Magpie 已开放的模型…"
+                  : catalog.error
+                    ? `无法读取模型目录：${catalog.error.message}`
+                    : catalogModels.length
+                      ? "从 Magpie 当前开放的模型里选择；点「同步 Magpie 模型」可立刻刷新列表。"
+                      : "Magpie 还没有开放模型。打开 Magpie 管理勾选模型后再同步。"}
+                {draft.model && catalog.isSuccess && !modelInCatalog
+                  ? " 当前填写的模型不在目录里，测连很容易失败；请改选目录里的模型。"
+                  : null}
               </FieldDescription>
               <FieldError>{errors.model}</FieldError>
             </Field>

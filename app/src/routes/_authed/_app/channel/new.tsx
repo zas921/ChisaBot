@@ -1,12 +1,11 @@
 import type { Message } from "@ag-ui/core";
-import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useState } from "react";
 import { useBotComputerTab } from "@/lib/chat/use-bot-computer";
 import { RegisterBotChat } from "@/components/agents/bot-chat-actions";
 import { LandingRedirect } from "@/components/agents/landing-redirect";
-import { channelListQueryOptions } from "@/lib/channels/queries";
-import { latestChannelFor } from "@/lib/channels/latest";
+import { channelKeys, latestDirectChannelQueryOptions } from "@/lib/channels/queries";
 import { ChannelAvatar } from "@/components/channels/avatar";
 import { PermissionChip } from "@/components/chat/permission-chip";
 import { BotModelSelector } from "@/components/agents/bot-model-selector";
@@ -62,7 +61,6 @@ function RouteComponent() {
 function BotChat({ agent, fresh, watch }: { agent: string; fresh: boolean; watch: boolean }) {
   const modelQueryClient = useQueryClient();
   const navigate = useNavigate();
-  const channels = useInfiniteQuery(channelListQueryOptions());
   const { startChosen, pending } = useStartChannel();
   const { data: profiles, isError: rosterError } = useQuery(
     agentListQueryOptions(),
@@ -72,12 +70,21 @@ function BotChat({ agent, fresh, watch }: { agent: string; fresh: boolean; watch
   // Optimistic seed shown before the first channel record exists.
   const [sent, setSent] = useState<Message | null>(null);
 
-  // This Bot already has a conversation: open it rather than an empty chat beside it.
-  const existing = sent || fresh ? undefined : latestChannelFor(agent, channels.data)?.id;
+  // The sidebar is paged. A Bot absent from those pages may still have a complete conversation.
+  const latest = useQuery({
+    ...latestDirectChannelQueryOptions(agent),
+    enabled: !fresh && !sent,
+  });
+  const existing = sent || fresh ? undefined : latest.data?.id;
+  const findingConversation = !fresh && !sent &&
+    (latest.isPending || (latest.isFetching && latest.data === null));
+  const conversationLookupFailed = !fresh && !sent && latest.isError && !latest.data;
   useEffect(() => {
-    if (existing)
+    if (existing) {
+      if (latest.data) modelQueryClient.setQueryData(channelKeys.detail(existing), latest.data);
       void navigate({ to: "/channel/$channelId", params: { channelId: existing }, search: watch ? { watch: true } : {}, replace: true });
-  }, [existing, navigate, watch]);
+    }
+  }, [existing, latest.data, modelQueryClient, navigate, watch]);
 
   // 右栏「计算机」开关（DESIGN.md §79）：和对话页一样记在 `watch` 搜索参数里（刷新保留、后退关闭）。
   // 按机器人记住选的是哪个标签（DESIGN.md §88）：地址里没有 `watch` 时用上次的。
@@ -134,7 +141,9 @@ function BotChat({ agent, fresh, watch }: { agent: string; fresh: boolean; watch
           detailFailure?.message === AGENT_NOT_FOUND
           ? "这个机器人不存在或已被删除。"
           : "这个机器人没有加载出来，请刷新重试。"
-        : null;
+        : conversationLookupFailed
+          ? "这个机器人的对话暂时没有加载出来，请重试。"
+          : null;
   const recipients: Recipient[] = chosen
     ? [{ id: chosen.id, name: chosen.name }]
     : [];
@@ -142,6 +151,7 @@ function BotChat({ agent, fresh, watch }: { agent: string; fresh: boolean; watch
   const modelSaving = useModelSelectionSaving(chosen?.id ?? "");
 
   const start = async (text: string) => {
+    if (findingConversation || conversationLookupFailed || existing) return;
     const recipient = recipients[0];
     if (!recipient || !canSend(recipients, text)) return;
     assertModelSelectionNotSaving(modelQueryClient, recipient.id);
@@ -161,7 +171,9 @@ function BotChat({ agent, fresh, watch }: { agent: string; fresh: boolean; watch
     }
   };
 
-  if ((profiles === undefined && !rosterError) || channels.isPending || existing) return null;
+  if ((profiles === undefined && !rosterError) || existing) return null;
+  if (findingConversation && !loadError)
+    return <p className="p-8 text-sm text-muted-foreground" role="status">{"正在加载对话…"}</p>;
 
   return (
     <div className="relative flex h-full flex-col">
@@ -217,6 +229,9 @@ function BotChat({ agent, fresh, watch }: { agent: string; fresh: boolean; watch
           loadError || error ? (
             <p className="pb-2 text-sm text-destructive" role="alert">
               {loadError ?? error}
+              {conversationLookupFailed ? (
+                <button className="ml-2 underline" onClick={() => void latest.refetch()} type="button">{"重试"}</button>
+              ) : null}
             </p>
           ) : null
         }

@@ -65,6 +65,7 @@ export function useWorkingChats(): ReadonlySet<string> {
  * 读不到上面的 context：藏着的聊天把它的机器人登记成「不在屏幕上」，那两处就不再每 5 秒问一次。
  */
 const hiddenBots = new Map<string, number>();
+const visibleBots = new Map<string, number>();
 const listeners = new Set<() => void>();
 const notify = () => {
   for (const listener of listeners) listener();
@@ -76,26 +77,27 @@ const subscribeHidden = (listener: () => void) => {
   };
 };
 
-/** 聊天藏着时登记它的机器人（卸载或变回可见时撤销）。 */
+/** 按聊天实例登记可见性；同一个机器人可能同时有可见新话题和藏着的历史对话。 */
 export function useMarkBotHidden(botId: string | undefined, hidden: boolean): void {
   useEffect(() => {
-    if (!botId || !hidden) return;
-    hiddenBots.set(botId, (hiddenBots.get(botId) ?? 0) + 1);
+    if (!botId) return;
+    const bots = hidden ? hiddenBots : visibleBots;
+    bots.set(botId, (bots.get(botId) ?? 0) + 1);
     notify();
     return () => {
-      const left = (hiddenBots.get(botId) ?? 1) - 1;
-      if (left > 0) hiddenBots.set(botId, left);
-      else hiddenBots.delete(botId);
+      const left = (bots.get(botId) ?? 1) - 1;
+      if (left > 0) bots.set(botId, left);
+      else bots.delete(botId);
       notify();
     };
   }, [botId, hidden]);
 }
 
-/** 这个机器人的聊天在屏幕上（没有被藏着的那段登记成不在）。 */
+/** 有任一可见对话就算在屏幕上；没有聊天登记时保留全局调用者原来的默认行为。 */
 export function useBotOnScreen(botId: string | undefined): boolean {
   return useSyncExternalStore(
     subscribeHidden,
-    () => !botId || !hiddenBots.has(botId),
+    () => !botId || visibleBots.has(botId) || !hiddenBots.has(botId),
     () => true,
   );
 }

@@ -65,13 +65,27 @@ app.whenReady().then(async () => {
     await main.webContents.executeJavaScript("[...document.querySelectorAll('button')].find(b=>b.textContent==='弹出小窗').click()");
     await until(() => popups.length === 1 && popups[0].isAlwaysOnTop(), "pinned popup");
     check("same page moves to pinned popup", views[0].webContents.getTitle().includes("Example Domain"));
+    const created = new Promise(resolve => remoteContents.once("did-create-window", resolve));
+    await remoteContents.executeJavaScript("window.__loginChild=window.open('about:blank','media-login-test');window.__childMessage=null;window.addEventListener('message',event=>{if(event.source===window.__loginChild)window.__childMessage=event.data})", true);
+    const loginChild = await created;
+    await until(() => !loginChild.webContents.isLoading(), "website login child");
+    check("website child shares isolated session and remains above pinned media", loginChild.webContents.session === remoteContents.session && loginChild.isAlwaysOnTop());
+    check("website child has no local bridge", await loginChild.webContents.executeJavaScript("typeof window.chisabotPC==='undefined' && typeof require==='undefined'"));
+    await loginChild.webContents.executeJavaScript("window.opener.postMessage('media-login-callback','*')");
+    await until(() => remoteContents.executeJavaScript("window.__childMessage==='media-login-callback'"), "opener callback");
+    check("website login callback reaches original page", true);
+    loginChild.close();
     fs.writeFileSync(path.join(output, "native-web-page.png"), (await views[0].webContents.capturePage()).toPNG());
     await main.webContents.executeJavaScript("[...document.querySelectorAll('button')].find(b=>b.textContent==='放回面板').click()");
     await until(() => popups[0].isDestroyed(), "dock popup");
     check("popup docks back without reloading page", views[0].webContents.getTitle().includes("Example Domain"));
+    const createdBeforeRelease = new Promise(resolve => remoteContents.once("did-create-window", resolve));
+    await remoteContents.executeJavaScript("window.open('about:blank','media-release-test');void 0", true);
+    const childBeforeRelease = await createdBeforeRelease;
     await main.webContents.executeJavaScript("[...document.querySelectorAll('button')].find(b=>b.textContent==='关闭网页').click()");
     await until(() => remoteContents.isDestroyed(), "release view");
     check("closing component destroys remote contents", true);
+    check("closing component also destroys website windows", childBeforeRelease.isDestroyed());
     result.success = true;
   } catch (error) {
     result.error = error.stack || String(error);

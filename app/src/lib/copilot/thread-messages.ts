@@ -71,6 +71,8 @@ export const HISTORY_RETRY_DELAYS_MS = [1500, 4000, 10000] as const;
 type ReadThreadMessagesOptions = {
   /** Shorter only in tests; production uses the mount/send ordering deadline. */
   deadlineMs?: number;
+  /** Mount and prefetch may share work; activity/retry reads always need fresh data. */
+  sharePending?: boolean;
 };
 
 /**
@@ -185,7 +187,29 @@ function argumentsOf(args: unknown): string {
   }
 }
 
-export async function readThreadMessages(
+// Prefetch and mount often overlap. Share only pending reads with the same budget;
+// a later refresh must still ask the server for the latest transcript.
+const pendingReads = new Map<string, Promise<StoredThread>>();
+
+export function readThreadMessages(
+  threadId: string,
+  agentId: string,
+  options: ReadThreadMessagesOptions = {},
+): Promise<StoredThread> {
+  if (!options.sharePending) return fetchThreadMessages(threadId, agentId, options);
+  const key = JSON.stringify([agentId, threadId, options.deadlineMs ?? THREAD_MESSAGES_DEADLINE_MS]);
+  let pending = pendingReads.get(key);
+  if (!pending) {
+    pending = fetchThreadMessages(threadId, agentId, options).finally(() => {
+      if (pendingReads.get(key) === pending) pendingReads.delete(key);
+    });
+    pendingReads.set(key, pending);
+  }
+  // SDK agents may mutate messages in place. Each consumer owns its copy.
+  return pending.then((stored) => ({ ...stored, messages: structuredClone(stored.messages) }));
+}
+
+async function fetchThreadMessages(
   threadId: string,
   agentId: string,
   options: ReadThreadMessagesOptions = {},

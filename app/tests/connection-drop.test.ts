@@ -297,10 +297,15 @@ test("decideSendWatchdogAction: run done → proceed (never fake hang)", () => {
   ).toEqual({ kind: "proceed" });
 });
 
-test("decideSendWatchdogAction: timeout + not persisted → hang (catches fake success)", () => {
+test("decideSendWatchdogAction: missing history requires confirmation", () => {
+  expect(decideSendWatchdogAction({ firstRace: "timeout", persisted: false })).toEqual({ kind: "confirm" });
+});
+
+test("decideSendWatchdogAction: only an explicit rejection can fail an unconfirmed send", () => {
   const d = decideSendWatchdogAction({
     firstRace: "timeout",
     persisted: false,
+    rejected: true,
   });
   expect(d.kind).toBe("hang");
   if (d.kind === "hang") {
@@ -310,10 +315,10 @@ test("decideSendWatchdogAction: timeout + not persisted → hang (catches fake s
   }
 });
 
-test("decideSendWatchdogAction: timeout + persist check failed (null) → hang", () => {
+test("decideSendWatchdogAction: a failed history read is unknown", () => {
   expect(
     decideSendWatchdogAction({ firstRace: "timeout", persisted: null }).kind,
-  ).toBe("hang");
+  ).toBe("confirm");
 });
 
 test("decideSendWatchdogAction: timeout + persisted + reply timeout → reply_hang", () => {

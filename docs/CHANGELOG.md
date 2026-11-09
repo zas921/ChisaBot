@@ -17,8 +17,16 @@
 
 ## 未发版
 
+- CB-099（2026-10-28，本地修复，未部署）：原生工具按 12 / 20 步自动续跑、移除提前收尾提示及后台 30 段总上限；同一轮保留完整进度、停止、审批与用量。见 [long-tasks.md](long-tasks.md)、DESIGN §101.4；无数据库迁移。
+
+- 2026-10-23 文档：新增[优化方案与本地验收](optimization-plan-2026-10-23.md)，登记 CB-089～CB-097、补充 CB-031，更新 ROADMAP、索引与测试入口说明；实现尚未开始，本轮不涉及部署或客户端发版。
 - CB-088（个人 Fork 独立分支，PR 尚未创建）：代理 IP SAN 证书校验与好友包首次配置生成修复；新增 HTTP CONNECT / SOCKS5 真实 TLS 和隔离 shell 回归。PC 发布测试会发现新增的 TLS 用例；部署回归可按测试手册运行。
 - CB-087：修复长聊天节点替换和结束时跳动；Stop/失败/重启后补话持久暂停，由用户单条恢复；请求期限、长命令预算、数据库异常恢复及 Python 生成编码指导一并补齐。
+
+## 0.1.58（个人定制版，2026-10-23）
+
+- CB-098：Bot 对话支持 DOC/DOCX、PDF、Excel、PowerPoint、RTF、OpenDocument、常见文本/代码及压缩包；办公文件提取实际文字，压缩包提供目录，音视频仅保存和下载。格式、体积与读取限制见[聊天文件](chat-files.md)。
+- Android 0.1.58（versionCode 256）放开原生文件选择并保留有界读取；网页/PC 刷新即可。服务器及签名 APK 已交付，验证和既有失败基线见[发布记录](pipeline-runs/20261023-common-chat-files.md)。
 
 ## 0.1.52
 
@@ -114,7 +122,7 @@ ChisaBot 自己的版本史，从 0.1.0（首个公开版本）起，按**发版
 
 | 项 | 值 |
 |---|---|
-| [#231](https://github.com/ChisaAlter/ChisaBot/pull/231) | 10-19 | 信任边界网络隔离；Local-Caller 绑定；deny-by-default 端口；CI red-line | `83a17422` |
+| [#231](https://github.com/ChisaAlter/ChisaBot/pull/231)（2026-10-19） | 信任边界网络隔离；Local-Caller 绑定；deny-by-default 端口；CI red-line（`83a17422`） |
 | 服务器 / 网页（main） | 本发版提交，`/api/version` = **0.1.32** |
 | 最新客户端发版 | **v0.1.32**（2026-10-19） |
 | PC 外壳指纹 `chisabotShell` | `059438f4e6c98c74`（0.1.12 起；0.1.11 及更早更新时提示「重新安装」） |

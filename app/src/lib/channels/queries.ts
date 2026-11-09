@@ -1,5 +1,5 @@
 import { type QueryClient, infiniteQueryOptions, queryOptions } from "@tanstack/react-query";
-import { client } from "@/lib/client";
+import { client, tryClient } from "@/lib/client";
 
 /**
  * A channel as the browser sees it.
@@ -50,6 +50,7 @@ export const channelKeys = {
   all: ["channels"] as const,
   list: () => ["channels", "list"] as const,
   detail: (channelId: string) => ["channels", "detail", channelId] as const,
+  latestDirect: (agentId: string) => ["channels", "direct", agentId] as const,
 };
 
 /** One page of channels, and where the next one starts. */
@@ -87,13 +88,41 @@ export function channelListQueryOptions() {
   });
 }
 
+export class ChannelReadError extends Error {
+  constructor(message: string, readonly status: number) { super(message); this.name = "ChannelReadError"; }
+}
+
 export function channelQueryOptions(channelId: string) {
   return queryOptions({
     queryKey: channelKeys.detail(channelId),
-    queryFn: async (): Promise<AgentChannel> => {
-      return client(`/api/channels/${channelId}`, "channel", {
-        fallback: "无法加载此会话",
-      });
+    queryFn: async ({ signal }): Promise<AgentChannel> => {
+      const response = await tryClient(`/api/channels/${encodeURIComponent(channelId)}`, { signal });
+      const body = await response.json().catch(() => null) as { channel?: AgentChannel; error?: string } | null;
+      if (!response.ok) throw new ChannelReadError(body?.error || "无法加载此会话", response.status);
+      const channel = body?.channel;
+      if (!channel || channel.id !== channelId || typeof channel.threadId !== "string" || !Array.isArray(channel.agentIds))
+        throw new ChannelReadError("无法加载此会话", 502);
+      return channel;
+    },
+  });
+}
+
+/** A partial roster cannot establish that a Bot has no conversation. Check the complete store. */
+export function latestDirectChannelQueryOptions(agentId: string) {
+  return queryOptions({
+    queryKey: channelKeys.latestDirect(agentId),
+    staleTime: 0,
+    queryFn: async ({ signal }): Promise<AgentChannel | null> => {
+      const channel = await client<AgentChannel | null | undefined>(
+        `/api/channels/direct/${encodeURIComponent(agentId)}`,
+        "channel",
+        { signal, fallback: "无法加载这个机器人的对话，请重试。" },
+      );
+      if (channel === null) return null;
+      if (!channel || typeof channel.id !== "string" || typeof channel.threadId !== "string" ||
+          !Array.isArray(channel.agentIds) || channel.agentIds.length !== 1 || channel.agentIds[0] !== agentId)
+        throw new Error("无法加载这个机器人的对话，请重试。");
+      return channel;
     },
   });
 }

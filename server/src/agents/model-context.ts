@@ -100,8 +100,8 @@ function toolNameBefore(
 }
 
 /**
- * 截图 / 大图 base64 进模型极贵。保留尺寸与 url，去掉像素。
- * 也裁掉 data:image… 长串。
+ * 工具结果等纯文本中的 base64 不会作为图片解析，去掉字节而保留尺寸与 url。
+ * 真正的多模态 image part 必须保留；它不经过这个字符串过滤器。
  */
 export function stripHeavyBlobs(text: string): string {
   let next = text;
@@ -130,6 +130,37 @@ function capToolContent(
 
 function sameContent(a: Message["content"], b: string): boolean {
   return contentText(a) === b;
+}
+
+/** Images/audio are protocol parts, not JSON text. Compact only text while a message is kept. */
+function mapTextContent(
+  content: Message["content"],
+  transform: (text: string) => string,
+): Message["content"] {
+  if (!Array.isArray(content)) {
+    const next = transform(contentText(content));
+    return sameContent(content, next) ? content : next;
+  }
+  let changed = false;
+  const parts = content.map((part) => {
+    if (part.type !== "text") return part;
+    const text = transform(part.text);
+    if (text === part.text) return part;
+    changed = true;
+    return { ...part, text };
+  });
+  return changed ? parts : content;
+}
+
+function hasMediaContent(message: Message): boolean {
+  return Array.isArray(message.content) && message.content.some((part) => part.type !== "text");
+}
+
+/** A discarded turn's text anchor never needs to serialize its original media bytes. */
+function anchorText(message: Message): string {
+  return Array.isArray(message.content)
+    ? message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n")
+    : contentText(message.content);
 }
 
 /** 就地折叠 tool 结果；返回新数组（未改动的元素保持原引用）。 */
@@ -185,14 +216,11 @@ export function shrinkOlderTurnsForModel(
   if (users.length <= budgets.keepUserTurns) {
     return messages.map((message) => {
       if (message.role !== "user" && message.role !== "assistant") return message;
-      const text = stripHeavyBlobs(contentText(message.content));
-      if (text.length <= 2_000 && text === contentText(message.content))
-        return message;
-      const next =
-        text.length <= 2_000
-          ? text
-          : `${cutAtCodeUnits(text, 1_900)}\n\n[truncated older turn]`;
-      return sameContent(message.content, next)
+      const next = mapTextContent(message.content, (value) => {
+        const text = stripHeavyBlobs(value);
+        return text.length <= 2_000 ? text : `${cutAtCodeUnits(text, 1_900)}\n\n[truncated older turn]`;
+      });
+      return next === message.content
         ? message
         : ({ ...message, content: next } as Message);
     });
@@ -202,19 +230,20 @@ export function shrinkOlderTurnsForModel(
   const out = messages.map((message, index) => {
     if (index >= keepFrom) {
       if (message.role !== "user" && message.role !== "assistant") return message;
-      const text = stripHeavyBlobs(contentText(message.content));
-      if (sameContent(message.content, text)) return message;
+      const next = mapTextContent(message.content, stripHeavyBlobs);
+      if (next === message.content) return message;
       changed = true;
-      return { ...message, content: text } as Message;
+      return { ...message, content: next } as Message;
     }
     if (message.role === "tool") return message;
     if (message.role !== "user" && message.role !== "assistant") return message;
-    const text = stripHeavyBlobs(contentText(message.content));
-    const next =
-      text.length === 0
+    const next = mapTextContent(message.content, (value) => {
+      const text = stripHeavyBlobs(value);
+      return text.length === 0
         ? "[earlier turn omitted from model context]"
         : `${cutAtCodeUnits(text, 240)}\n\n[earlier turn truncated for model context]`;
-    if (sameContent(message.content, next)) return message;
+    });
+    if (next === message.content) return message;
     changed = true;
     return { ...message, content: next } as Message;
   });
@@ -235,6 +264,7 @@ export function alignKeepFrom(
 
 /**
  * 真正丢掉旧轮（仅模型视图）。保留首条 user 摘要 + 最近 K 个 user 轮 / 最多 N 条。
+ * 当前用户的多模态请求若在消息条数上限之外，仍作为一条完整媒体锚点保留。
  * 被丢掉的 id 仍在 DB/UI 的 visible 里；不要生成新 id。
  */
 export function dropOlderTurnsForModel(
@@ -259,13 +289,18 @@ export function dropOlderTurnsForModel(
   if (keepFrom <= 0) return messages as Message[];
 
   const tail = messages.slice(keepFrom);
+  // A single active review can span more than maxKeptMessages while paging evidence.
+  // Keep its actual media request even when we retire the middle of that same turn.
+  const latestUserIdx = users.at(-1);
+  if (latestUserIdx !== undefined && latestUserIdx < keepFrom && hasMediaContent(messages[latestUserIdx]!))
+    tail.unshift(messages[latestUserIdx]!);
   const firstUserIdx = users[0];
   if (firstUserIdx === undefined || firstUserIdx >= keepFrom) return tail;
 
   const first = messages[firstUserIdx]!;
   if (tail.some((message) => message.id === first.id)) return tail;
 
-  const text = stripHeavyBlobs(contentText(first.content));
+  const text = stripHeavyBlobs(anchorText(first));
   const dropped = keepFrom;
   const anchor = {
     ...first,

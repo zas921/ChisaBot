@@ -1,7 +1,8 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { Message } from "@ag-ui/client";
 import { AbstractAgent, EventType } from "@ag-ui/client";
 import { EMPTY } from "rxjs";
+import { WORKER_TURN_TIMEOUT_MS } from "../src/workers/service";
 import {
   createTurnRunner,
   drawnComponents,
@@ -221,19 +222,26 @@ function harness(options: {
       : { lockTtlSeconds: options.lockTtlSeconds }),
   });
 
-  const run = () =>
+  const run = (signal?: AbortSignal) =>
     runTurn({
       ownerUserId: OWNER,
       routineId: ROUTINE_ID,
       agentId: AGENT_ID,
       threadId: THREAD_ID,
       instruction: INSTRUCTION,
+      signal,
     });
 
   return { run, agent, calls, order, builtFor };
 }
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// The real service has listening sockets. Keep a referenced handle while testing its unref'ed
+// watchdogs too; otherwise Bun on Windows can park with only an awaited promise left alive.
+let keepAlive: ReturnType<typeof setInterval>;
+beforeAll(() => { keepAlive = setInterval(() => {}, 100); });
+afterAll(() => clearInterval(keepAlive));
 
 const THREE_ROWS: HistoryRow[] = [
   { id: "m1", role: "user", content: "Hello." },
@@ -603,6 +611,49 @@ describe("persistedInputMessages is the subtraction", () => {
 });
 
 describe("the lock is released on every exit path", () => {
+  test("a worker with no wall-clock deadline keeps renewing its lock until it completes", async () => {
+    let complete!: () => void;
+    const { run, calls, agent } = harness({
+      turnTimeoutMs: WORKER_TURN_TIMEOUT_MS,
+      heartbeatMs: 2,
+      drive: (context) => { complete = () => answers(context); },
+    });
+    const pending = run();
+    await wait(20);
+    expect(calls.renewed.length).toBeGreaterThan(1);
+    expect(agent.aborts).toBe(0);
+    expect(calls.stops).toHaveLength(0);
+    complete();
+    expect((await pending).replyText).toBe("Three things happened.");
+    expect(calls.cleaned).toHaveLength(1);
+  });
+
+  test("an unlimited worker can still be cancelled while the runner never completes", async () => {
+    const controller = new AbortController();
+    const { run, calls, agent } = harness({ drive: () => undefined, turnTimeoutMs: WORKER_TURN_TIMEOUT_MS });
+    const pending = run(controller.signal);
+    await wait(5);
+    controller.abort();
+    await expect(pending).rejects.toThrow("cancelled");
+    expect(agent.aborts).toBe(1);
+    expect(calls.stops).toHaveLength(1);
+    expect(calls.cleaned).toHaveLength(1);
+  });
+
+  test("an unlimited worker releases a lost lock even if abort does not settle the runner", async () => {
+    const { run, calls, agent } = harness({
+      drive: () => undefined,
+      turnTimeoutMs: WORKER_TURN_TIMEOUT_MS,
+      heartbeatMs: 2,
+      abortGraceMs: 5,
+      renew: () => { throw new Error("worker lock lost"); },
+    });
+    await Promise.all([expect(run()).rejects.toThrow("worker lock lost"), wait(20)]);
+    expect(agent.aborts).toBe(1);
+    expect(calls.stops).toHaveLength(1);
+    expect(calls.cleaned).toHaveLength(1);
+  });
+
   test("on success", async () => {
     const { run, calls } = harness({});
 

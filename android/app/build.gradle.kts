@@ -37,8 +37,8 @@ android {
         applicationId = "cn.ayase.chisabot"
         minSdk = 24
         targetSdk = 34
-        versionCode = 259        // 只增不减（已安装的 Android 按它判断更新）；2026-10-12 版本号重置为 0.1.0 时从 206 接着往上
-        versionName = "0.1.67"
+        versionCode = 262        // 修复最近会话定位并提供原生历史入口；沿用原签名
+        versionName = "0.1.70"
         buildConfigField("String", "DEFAULT_SERVER", quoted(defaultServer))
         buildConfigField("String", "UPDATE_FEED", quoted(updateFeed))
         // 只有 debug 包允许 http://10.0.2.2（模拟器连本机预览）；正式包一律 https。
@@ -59,6 +59,7 @@ android {
 
     buildTypes {
         debug {
+            applicationIdSuffix = ".debug"
             buildConfigField("boolean", "ALLOW_LOCAL_HTTP", "true")
         }
         release {

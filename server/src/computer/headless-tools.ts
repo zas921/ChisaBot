@@ -9,7 +9,7 @@ import {
   type Tool,
   type ToolCall,
 } from "@ag-ui/client";
-import { Observable, type Subscription } from "rxjs";
+import { catchError, defer, EMPTY, from, Observable, type Subscription, switchMap } from "rxjs";
 import { z } from "zod";
 import {
   currentApprovalContext,
@@ -27,7 +27,9 @@ import {
 } from "./gateway";
 import { HUMAN_CONTROL_ZH, isUnattendedInitiator, noteHumanControlBlock, suspendsOnHumanControl } from "./control-blocks";
 import type { ControlState } from "./schema";
-import { withConfirmActor } from "../confirmations/context";
+import { currentToolAbort, withConfirmActor, withConfirmToolCall } from "../confirmations/context";
+import { FrontendToolHandoff, frontendToolFinish } from "../frontend-tool-handoff";
+import { HeadlessStreamCheckpoint, headlessRecovery, waitForHeadlessRecovery } from "./headless-recovery";
 import {
   COMMAND_DEFAULT_TIMEOUT_SEC,
   COMMAND_MAX_TIMEOUT_SEC,
@@ -91,6 +93,8 @@ export class HeadlessToolsMiddleware extends Middleware {
   constructor(
     private readonly tools: HeadlessTool[],
     private readonly initiator?: AuditInitiator,
+    private readonly browserOwnedOnly = false,
+    private readonly recovery: { maxRetries?: number; delayMs?: number } = {},
   ) {
     super();
     const names = tools.map((tool) => tool.definition.name);
@@ -104,12 +108,16 @@ export class HeadlessToolsMiddleware extends Middleware {
   ): Observable<BaseEvent> {
     return new Observable((subscriber) => {
       const controller = new AbortController();
+      const stop = currentToolAbort();
+      const signal = stop ? AbortSignal.any([stop, controller.signal]) : controller.signal;
       const tools = new Map(
         this.tools.map((tool) => [tool.definition.name, tool]),
       );
       const executed = new Set<string>();
       let subscription: Subscription | undefined;
       let started = false;
+      let recoveries = 0;
+      const maxRecoveries = this.browserOwnedOnly ? 0 : Math.max(0, Math.min(2, this.recovery.maxRetries ?? 2));
       const work = async () => {
         let request: RunAgentInput = {
           ...originalInput,
@@ -121,7 +129,7 @@ export class HeadlessToolsMiddleware extends Middleware {
           ],
         };
         for (;;) {
-          if (subscriber.closed) return;
+          if (subscriber.closed || signal.aborted) return;
           const historical = new Set(
             request.messages.flatMap((message) =>
               message.role === "assistant"
@@ -133,19 +141,35 @@ export class HeadlessToolsMiddleware extends Middleware {
           let messages = request.messages;
           let state = request.state;
           let terminal: RunFinishedEvent | undefined;
-          let failed = false;
-          await new Promise<void>((resolve, reject) => {
+          let failure: BaseEvent | undefined;
+          let streamError: unknown;
+          const checkpoint = maxRecoveries > 0 ? new HeadlessStreamCheckpoint(request.messages, request.state) : undefined;
+          const wire = this.browserOwnedOnly ? new FrontendToolHandoff(request.tools) : undefined;
+          let sameRun = true;
+          await new Promise<void>((resolve) => {
+            const settled = () => { signal.removeEventListener("abort", settled); resolve(); };
+            signal.addEventListener("abort", settled, { once: true });
             subscription = this.runNextWithState(
               request,
-              new InvocationTransport(next, request),
+              new InvocationTransport(next, request, (error) => { streamError = error; }),
             ).subscribe({
               next: ({
                 event,
                 messages: updatedMessages,
                 state: updatedState,
               }) => {
+                if (!sameRun) return;
+                if ((event.type === EventType.RUN_STARTED || event.type === EventType.RUN_FINISHED)
+                  && (event.threadId !== request.threadId || event.runId !== request.runId)) {
+                  sameRun = false;
+                  failure = { type: EventType.RUN_ERROR, code: "HEADLESS_RUN_MISMATCH", message: "The model stream belongs to another run; no pending tools were executed." };
+                  return;
+                }
                 messages = updatedMessages;
                 state = updatedState;
+                if (wire) {
+                  wire.observe(event);
+                }
                 if (event.type === EventType.TOOL_CALL_START)
                   emitted.add(String(event.toolCallId));
                 if (event.type === EventType.MESSAGES_SNAPSHOT) {
@@ -164,19 +188,40 @@ export class HeadlessToolsMiddleware extends Middleware {
                   if (started) return;
                   started = true;
                 }
-                if (event.type === EventType.RUN_ERROR) failed = true;
-                subscriber.next(event);
+                if (event.type === EventType.RUN_ERROR) { failure = event; return; }
+                for (const outgoing of checkpoint ? checkpoint.observe(event, messages, state) : [event]) subscriber.next(outgoing);
               },
-              error: reject,
-              complete: resolve,
+              error: (error: unknown) => { streamError = error; settled(); },
+              complete: settled,
             });
           });
-          if (subscriber.closed || failed) return;
+          // Finish teardown before another generation can start, including transports that throw.
+          subscription?.unsubscribe();
+          subscription = undefined;
+          if (subscriber.closed || signal.aborted) return;
+          // Reconnect only an incomplete generation, before its error pauses the outer run.
+          // A closed tool call without a retained result has an unknown outcome and is never replayed.
+          const recovery = !terminal ? headlessRecovery(failure ?? streamError, this.recovery.delayMs) : undefined;
+          if (recovery && recoveries < maxRecoveries && checkpoint?.canRetry(messages)) {
+            recoveries++;
+            console.warn(JSON.stringify({ type: "headless-stream-recovery", attempt: recoveries, reason: recovery.reason, delayMs: recovery.delayMs }));
+            if (started) subscriber.next({ type: EventType.CUSTOM, name: "openbot.headless.recovering", value: { attempt: recoveries, limit: maxRecoveries, delayMs: recovery.delayMs } });
+            await waitForHeadlessRecovery(recovery.delayMs, signal);
+            if (subscriber.closed || signal.aborted) return;
+            request = { ...request, messages: checkpoint.messages, state: checkpoint.state, resume: undefined };
+            continue;
+          }
+          for (const outgoing of checkpoint?.flush() ?? []) subscriber.next(outgoing);
+          if (failure) { subscriber.next(failure); return; }
+          if (streamError !== undefined) throw streamError;
           if (!terminal)
             throw new Error(
               "The headless agent ended without a terminal event (the model connection closed before the turn finished).",
             );
-          if (terminal.outcome?.type === "cancelled") {
+          if (
+            terminal.outcome?.type === "cancelled" ||
+            (wire && !frontendToolFinish(terminal))
+          ) {
             subscriber.next(terminal);
             return;
           }
@@ -199,15 +244,35 @@ export class HeadlessToolsMiddleware extends Middleware {
           const owned = pending.filter(
             (call) =>
               tools.has(call.function.name) ||
-              call.function.name.startsWith("computer_"),
+              (!this.browserOwnedOnly && call.function.name.startsWith("computer_")),
           );
+          if (wire && owned.length) {
+            // Match the browser's whole-batch guard: an incomplete sibling must not
+            // turn an otherwise valid command into an unexpected side effect.
+            const names = new Set(request.tools.map((tool) => tool.name));
+            const batch = pending.filter((call) => names.has(call.function.name));
+            const selected = new Set(batch.map((call) => call.id));
+            const candidate = messages.map((message) => message.role === "assistant"
+              ? { ...message, toolCalls: (message.toolCalls ?? []).filter((call) => selected.has(call.id)) }
+              : message);
+            const authorized = new Set(wire.pending(candidate));
+            if (!sameRun || selected.size !== batch.length || batch.some((call) => !authorized.has(call.id))) {
+              subscriber.next({
+                type: EventType.RUN_ERROR,
+                code: "INCOMPLETE_TOOL_CALL",
+                message: "工具参数不完整，本次调用未执行。已完成的步骤仍保留。",
+              });
+              return;
+            }
+          }
           if (owned.length === 0) {
             subscriber.next(terminal);
             return;
           }
           const results = new Map<string, string>();
           for (const call of owned) {
-            if (subscriber.closed) return;
+            if (subscriber.closed || signal.aborted) return;
+            if (executed.has(call.id)) continue;
             executed.add(call.id);
             let content: string;
             let error: string | undefined;
@@ -230,12 +295,15 @@ export class HeadlessToolsMiddleware extends Middleware {
                 forwardedProps: request.forwardedProps,
                 initiator: this.initiator,
               };
-              const result = await withApprovalContext(continuation, () =>
+              const execute = () => withApprovalContext(continuation, () =>
                 tool.execute(args, {
                   toolCallId: call.id,
-                  signal: controller.signal,
+                  signal,
                 }),
               );
+              const result = wire
+                ? await withConfirmToolCall(call.id, call.function.name, execute)
+                : await execute();
               content =
                 typeof result === "string" ? result : JSON.stringify(result);
               if (content === undefined)
@@ -286,7 +354,7 @@ export class HeadlessToolsMiddleware extends Middleware {
                 failure instanceof Error ? failure.message : String(failure);
               content = JSON.stringify({ ok: false, error });
             }
-            if (subscriber.closed) return;
+            if (subscriber.closed || signal.aborted) return;
             const message: Message = {
               id: crypto.randomUUID(),
               role: "tool",
@@ -360,16 +428,66 @@ export class HeadlessToolsMiddleware extends Middleware {
   }
 }
 
+const COMMAND = "computer_run_command";
+const WORKSPACE_TOOLS = new Set([COMMAND, "computer_read_file", "computer_list_files"]);
+
+function browserOwnedTools(
+  load: (input: RunAgentInput) => Promise<readonly HeadlessTool[]>,
+  initiator: AuditInitiator,
+  allowed: ReadonlySet<string>,
+): Middleware {
+  return new class extends Middleware {
+    run(input: RunAgentInput, next: AbstractAgent): Observable<BaseEvent> {
+      const offered = new Set(input.tools.filter((tool) => allowed.has(tool.name)).map((tool) => tool.name));
+      if (!offered.size) return next.run(input);
+      return defer(() => from(load(input))).pipe(switchMap((available) => {
+        const selected = available.filter((tool) => offered.has(tool.definition.name));
+        return selected.length
+          ? new HeadlessToolsMiddleware(selected, initiator, true).run(input, next)
+          : next.run(input);
+      }));
+    }
+  }();
+}
+
+/**
+ * Run only offered, authorized hosted workspace tools on the local runner,
+ * independently of its SSE observers. Other browser tools keep their handoff.
+ */
+export function managedBrowserWorkspace(
+  load: (input: RunAgentInput) => Promise<readonly HeadlessTool[]>,
+  initiator: AuditInitiator,
+): Middleware {
+  return browserOwnedTools(load, initiator, WORKSPACE_TOOLS);
+}
+
+/** Command-only variant used by callers that do not offer the workspace readers. */
+export function managedBrowserCommand(
+  load: (input: RunAgentInput) => Promise<HeadlessTool | undefined>,
+  initiator: AuditInitiator,
+): Middleware {
+  return browserOwnedTools(async (input) => {
+    const tool = await load(input);
+    return tool ? [tool] : [];
+  }, initiator, new Set([COMMAND]));
+}
+
 /** AG-UI accumulation reads transport history, so seed each continuation explicitly. */
 class InvocationTransport extends AbstractAgent {
   constructor(
     private readonly transport: AbstractAgent,
     input: RunAgentInput,
+    private readonly onTransportError: (error: unknown) => void,
   ) {
     super({ initialMessages: input.messages, initialState: input.state });
   }
   run(input: RunAgentInput) {
-    return this.transport.run(input);
+    // runNextWithState reduces events asynchronously. A source error must become a completion
+    // here so its queued tool results drain before recovery chooses a checkpoint.
+    return defer(() => this.transport.run(input)).pipe(catchError((error: unknown) => {
+      this.onTransportError(error);
+      return EMPTY;
+    }));
   }
 }
 

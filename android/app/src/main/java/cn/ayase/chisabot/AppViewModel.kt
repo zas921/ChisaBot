@@ -18,6 +18,10 @@ import cn.ayase.chisabot.chat.AgUiReducer
 import cn.ayase.chisabot.chat.Attachment
 import cn.ayase.chisabot.chat.ChatMessage
 import cn.ayase.chisabot.chat.ConfirmCard
+import cn.ayase.chisabot.chat.ThreadTasks
+import cn.ayase.chisabot.chat.TaskSession
+import cn.ayase.chisabot.chat.QueuedNote
+import cn.ayase.chisabot.chat.pathPart
 import cn.ayase.chisabot.chat.contentAll
 import cn.ayase.chisabot.chat.withEditedText
 import cn.ayase.chisabot.chat.BotModelState
@@ -35,6 +39,7 @@ import cn.ayase.chisabot.net.Api
 import cn.ayase.chisabot.net.Unauthorized
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
@@ -76,6 +81,7 @@ data class Panel(
 sealed class Screen {
     data object Login : Screen()
     data object Bots : Screen()
+    data object Features : Screen()
     data class Chat(val bot: Bot) : Screen()
     data class Panels(val bot: Bot) : Screen()
     data class Web(val path: String, val title: String) : Screen()
@@ -233,7 +239,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun back(): Boolean {
         if (stack.size <= 1) return false
         val top = stack.removeAt(stack.lastIndex)
-        if (top is Screen.Chat) { stopWatching(); stopSync() }
+        if (top is Screen.Chat) { stopWatching(); stopSync(); chatLoadJob?.cancel(); chatEpoch++; tasks.stop(); chatLoading = false }
         // 从设置 / 面板等页面回到聊天：重新开始看服务器上这一轮的忙闲
         (stack.lastOrNull() as? Screen.Chat)?.let { startSync(it.bot) }
         return true
@@ -289,11 +295,29 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     var runError by mutableStateOf<String?>(null)
     var chatLoading by mutableStateOf(false)
     var chatLoadError by mutableStateOf<String?>(null)
+    val tasks = ThreadTasks(viewModelScope,
+        loadDismissed = { prefs.getStringSet(it, emptySet())?.toSet() ?: emptySet() },
+        saveDismissed = { key, ids -> prefs.edit().putStringSet(key, ids).apply() })
+    private var chatLoadJob: Job? = null
+    private var chatEpoch = 0
+
+    fun observeTasks() {
+        if (screen !is Screen.Chat) return
+        val t = threadId ?: return
+        val bot = chatBot ?: return
+        val api = api ?: return
+        tasks.start(TaskSession(api.origin, bot.id, t)) { path, method, body ->
+            api.call(path, method, body, timeoutMs = 8000) as? JsonObject ?: error("服务器返回格式不正确")
+        }
+    }
+
+    fun pauseTaskObservation() = tasks.stop()
     /** 这台手机上看着干活卡跑起来的时间（turnKey → 毫秒），收成一行时才能写用时（§70.2）。 */
     val workStarted = HashMap<String, Long>()
     val workEnded = HashMap<String, Long>()
     private var runJob: Job? = null
     private var watchJob: Job? = null
+    private var watchEpoch = 0
     private var liveCall: Call? = null
 
     // Same per-BOT setting as PC/web; the server applies it to every subsequent run.
@@ -393,12 +417,25 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         return true
     }
 
-    fun openChat(bot: Bot) {
+    private var requestedThreadId: String? = null
+
+    suspend fun conversationHistory(bot: Bot): List<cn.ayase.chisabot.chat.ConversationEntry> {
+        val api = api ?: error("请先登录")
+        val result = api.get("/api/bot-threads/${pathPart(bot.id)}/history")
+        if (origin() != api.origin) throw CancellationException("服务器已切换")
+        return cn.ayase.chisabot.chat.parseConversations(result)
+    }
+
+    fun openChat(bot: Bot, selectedThreadId: String? = null) {
         stopRun()
+        requestedThreadId = selectedThreadId
+        chatLoadJob?.cancel(); chatEpoch++; tasks.clear()
+        queuedDraft = null; turnPreparing = false
         modelsJob?.cancel(); modelEpoch++
         modelState = null; modelOptions = null; modelsError = null; modelsLoading = false; modelsStale = false
         chatBot = bot; threadId = null; channelId = null; messages = emptyList(); runError = null; chatLoadError = null
         confirms = emptyMap(); files.clear(); confirmJob?.cancel()
+        stack.removeAll { it is Screen.Chat || it is Screen.Panels }
         push(Screen.Chat(bot))
         loadChat(bot)
         startSync(bot)
@@ -406,36 +443,44 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun loadChat(bot: Bot) {
         val api = api ?: return
+        chatLoadJob?.cancel()
+        val epoch = ++chatEpoch
+        val selected = requestedThreadId
+        fun current() = epoch == chatEpoch && chatBot?.id == bot.id && origin() == api.origin
         chatLoading = true
-        viewModelScope.launch {
+        chatLoadJob = viewModelScope.launch {
             try {
-                val channels = api.get("/api/channels?limit=100").a("channels") ?: JsonArray(emptyList())
-                // 机器人这一行打开它最近的一对一会话（和网页 latestChannelFor 一样；列表按最近排序）
-                val mine = channels.mapNotNull { it as? JsonObject }.filter { c ->
-                    val ids = c.a("agentIds")?.map { (it as? JsonPrimitive)?.content }
-                    ids?.size == 1 && ids[0] == bot.id
-                }
-                val chosen = mine.maxByOrNull { it.s("lastMessageAt") ?: "" } ?: mine.firstOrNull()
-                val t = chosen?.s("threadId")
+                // Resolve against the full store, not the first page of all Bots' channels.
+                val body = if (selected == null) api.get("/api/channels/direct/${pathPart(bot.id)}")
+                    else api.post("/api/channels/open-thread", buildJsonObject { put("agentId", bot.id); put("threadId", selected) })
+                val chosen = cn.ayase.chisabot.chat.parseConversation(body, bot.id, selected)
+                val t = chosen?.threadId
+                if (!current()) return@launch
                 threadId = t
-                channelId = chosen?.s("id")
+                channelId = chosen?.channelId
                 if (t != null) {
+                    observeTasks()
                     val hist = api.get("/api/copilotkit/threads/$t/messages").a("messages") ?: JsonArray(emptyList())
+                    if (!current()) return@launch
                     if (!running) messages = parseHistory(hist)
                     val inbox = runCatching { api.get("/api/copilotkit/threads/$t/inbox") }.getOrNull()
+                    if (!current()) return@launch
                     if (inbox?.get("running")?.toString() == "true" && !running) watch(bot, t)
                     kickConfirms()
                 }
                 chatLoadError = null
-            } catch (_: Unauthorized) { expired() }
-            catch (e: Exception) { chatLoadError = e.message ?: "无法加载对话" }
-            finally { chatLoading = false }
+            } catch (e: CancellationException) { throw e }
+            catch (_: Unauthorized) { if (current()) expired() }
+            catch (e: Exception) { if (current()) chatLoadError = e.message ?: "无法加载对话" }
+            finally { if (current()) chatLoading = false }
         }
     }
 
     /** 别的设备上正在回答（或刷新前开始的一轮）：每 1.5 秒读一次历史，直到这一轮结束。流式续接放到第二阶段。 */
     private fun watch(bot: Bot, t: String) {
         watchJob?.cancel()
+        val watchToken = ++watchEpoch
+        val epoch = chatEpoch
         watchJob = viewModelScope.launch {
             val api = api ?: return@launch
             running = true
@@ -448,6 +493,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     if (chatBot?.id != bot.id || threadId != t) break
                     try {
                         val hist = api.get("/api/copilotkit/threads/$t/messages").a("messages") ?: break
+                        if (chatEpoch != epoch || threadId != t) break
                         messages = parseHistory(hist)
                         val inbox = api.get("/api/copilotkit/threads/$t/inbox")
                         if (inbox["running"]?.toString() != "true") break
@@ -455,11 +501,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     } catch (e: CancellationException) { throw e }
                     catch (_: Exception) { if (++failures >= 4) break }
                 }
-            } catch (_: Exception) { } finally { running = false }
+            } catch (_: Exception) { } finally { if (watchEpoch == watchToken && chatEpoch == epoch && threadId == t) running = false }
         }
     }
 
-    private fun stopWatching() { watchJob?.cancel(); watchJob = null }
+    private fun stopWatching() { watchEpoch++; watchJob?.cancel(); watchJob = null }
 
     private var syncJob: Job? = null
     /** 本机自己这一轮是从什么时候开始的（毫秒）；给「流卡死了」的判断留出服务器还没记上锁的头几秒。 */
@@ -477,16 +523,28 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         stopSync()
         syncJob = viewModelScope.launch {
             var idleWhileRunning = 0
+            var lastSeq: String? = null
             while (chatBot?.id == bot.id && screen is Screen.Chat) {
                 delay(3000)
                 val api = api ?: break
                 val t = threadId ?: continue
                 val inbox = runCatching { api.get("/api/copilotkit/threads/$t/inbox") }.getOrNull() ?: continue
+                if (chatBot?.id != bot.id || threadId != t) continue
                 val serverRunning = inbox["running"]?.toString() == "true"
                 if (watchJob?.isActive == true) { idleWhileRunning = 0; continue }
                 if (!running) {
                     idleWhileRunning = 0
                     if (serverRunning && !turnPreparing && chatBot?.id == bot.id && threadId == t) watch(bot, t)
+                    // A reply can finish entirely between polls. Compare the small event cursor
+                    // before pulling history; this also delivers worker results while idle.
+                    if (!serverRunning && !turnPreparing) {
+                        val stamp = runCatching { api.get("/api/bot-threads/${pathPart(bot.id)}/sync?threadId=${pathPart(t)}").o("thread")?.let { it.s("seq") + ":" + it.s("revision") } }.getOrNull()
+                        if (stamp != null && stamp != lastSeq) {
+                            runCatching { api.get("/api/copilotkit/threads/$t/messages").a("messages") }.getOrNull()?.let {
+                                if (threadId == t && chatBot?.id == bot.id && !running && !turnPreparing) { messages = parseHistory(it); lastSeq = stamp }
+                            }
+                        }
+                    }
                 } else if (serverRunning || stopping) {
                     idleWhileRunning = 0
                 } else if (System.currentTimeMillis() - turnStartedAt >= 12_000 && ++idleWhileRunning >= 3) {
@@ -505,14 +563,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** 这段对话的会话（频道）：没有就先建一个一对一的（POST /api/channels）。附件要先有会话才能上传。 */
     private val channelCreationMutex = Mutex()
     private suspend fun ensureChannel(api: Api, bot: Bot): Pair<String, String> = channelCreationMutex.withLock {
+        val epoch = chatEpoch
         if (chatBot?.id != bot.id) throw CancellationException("会话已切换")
+        check(!chatLoading && chatLoadError == null) { "请先完成对话加载，或重试加载" }
         val t = threadId; val c = channelId
         if (t != null && c != null) return@withLock c to t
         val created = api.post("/api/channels", buildJsonObject { putJsonArray("agentIds") { add(JsonPrimitive(bot.id)) } })
-        if (chatBot?.id != bot.id) throw CancellationException("会话已切换")
+        if (chatBot?.id != bot.id || chatEpoch != epoch || origin() != api.origin) throw CancellationException("会话已切换")
         val nt = created.o("channel")?.s("threadId") ?: throw IllegalStateException("无法开始会话")
         val nc = created.o("channel")?.s("id") ?: throw IllegalStateException("无法开始会话")
         threadId = nt; channelId = nc
+        observeTasks()
         nc to nt
     }
 
@@ -520,6 +581,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     suspend fun send(text: String): Boolean {
         val bot = chatBot ?: return false
         val api = api ?: return false
+        val epoch = chatEpoch
         if (running || turnPreparing) return false
         if (!modelReadyToSend()) return false
         if (files.any { it.state == "uploading" }) return false
@@ -549,21 +611,59 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             files.clear(); uploadGroup = UUID.randomUUID().toString()
             startTurn(api, bot, t, userMsg)
             return true
-        } catch (_: Unauthorized) { expired(); return false }
-        catch (e: Exception) { runError = e.message ?: "发送失败"; return false }
-        finally { turnPreparing = false }
+        } catch (e: CancellationException) { throw e }
+        catch (_: Unauthorized) { if (epoch == chatEpoch) expired(); return false }
+        catch (e: Exception) { if (epoch == chatEpoch) runError = e.message ?: "发送失败"; return false }
+        finally { if (epoch == chatEpoch) turnPreparing = false }
     }
 
-    private fun startTurn(api: Api, bot: Bot, t: String, userMsg: ChatMessage) {
+    /** Queue a running-turn follow-up with a stable id, preserving the draft on failure. */
+    private var queuedDraft: Pair<String, String>? = null
+    suspend fun queueFollowUp(text: String): Boolean {
+        val api = api ?: return false; val bot = chatBot ?: return false; val t = threadId ?: return false
+        if (text.isBlank() || files.isNotEmpty() || turnPreparing) return false
+        val epoch = chatEpoch
+        val id = queuedDraft?.takeIf { it.second == text }?.first ?: UUID.randomUUID().toString()
+        queuedDraft = id to text
+        turnPreparing = true
+        return try {
+            val result = api.post("/api/copilotkit/threads/$t/inbox", buildJsonObject { put("id", id); put("text", text) })
+            if (epoch != chatEpoch || threadId != t) return false
+            check(result["queued"]?.toString() in listOf("true", "false")) { "发送状态无法确认，请重试" }
+            if (result["queued"]?.toString() == "false") {
+                stopWatching()
+                liveCall?.cancel(); runJob?.cancelAndJoin()
+                if (epoch != chatEpoch || threadId != t) return false
+                startTurn(api, bot, t, ChatMessage(id, "user", text, content = JsonPrimitive(text)))
+            }
+            queuedDraft = null; tasks.refresh(); notice = "已发送补充消息"; true
+        } catch (e: CancellationException) { throw e }
+        catch (e: Exception) { if (epoch == chatEpoch) notice = e.message ?: "补充消息未发出，请重试"; false }
+        finally { if (epoch == chatEpoch) turnPreparing = false }
+    }
+
+    suspend fun resumeQueued(note: QueuedNote): Boolean {
+        val api = api ?: return false; val bot = chatBot ?: return false; val t = threadId ?: return false
+        if (running || turnPreparing || !modelReadyToSend()) return false
+        startTurn(api, bot, t, ChatMessage(UUID.randomUUID().toString(), "user", "继续处理这条消息", content = JsonPrimitive("继续处理这条消息")), note.id)
+        return true
+    }
+
+    private fun startTurn(api: Api, bot: Bot, t: String, userMsg: ChatMessage, inboxSourceId: String? = null) {
         messages = messages + userMsg
         running = true
         stopping = false
         turnStartedAt = System.currentTimeMillis()
-        runJob = viewModelScope.launch { runTurn(api, bot, t, userMsg) }
+        runJob = viewModelScope.launch { runTurn(api, bot, t, userMsg, inboxSourceId) }
         kickConfirms()
     }
 
-    private suspend fun runTurn(api: Api, bot: Bot, t: String, userMsg: ChatMessage) {
+    private suspend fun runTurn(api: Api, bot: Bot, t: String, userMsg: ChatMessage, inboxSourceId: String? = null) {
+        val epoch = chatEpoch
+        val activityChannel = channelId
+        var reportedStart = false
+        var reportedFinish = false
+        fun current() = chatEpoch == epoch && threadId == t && chatBot?.id == bot.id && origin() == api.origin
         val reducer = AgUiReducer(messages)
         val body = buildJsonObject {
             put("threadId", t)
@@ -573,33 +673,47 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             putJsonArray("tools") {}
             putJsonArray("context") {}
             putJsonObject("state") {}
-            putJsonObject("forwardedProps") {}
+            putJsonObject("forwardedProps") {
+                if (inboxSourceId != null) putJsonObject("chisabotInboxResume") { put("sourceId", inboxSourceId); put("messageId", userMsg.id) }
+            }
         }
         var lastPush = 0L
         try {
-            api.stream("/api/copilotkit/agent/${bot.id}/run", body, onCall = { liveCall = it }) { event ->
+            api.stream("/api/copilotkit/agent/${bot.id}/run", body, onCall = { if (current()) liveCall = it else it.cancel() }) { event ->
                 reducer.apply(event)
+                // Capture the channel before streaming: switching Bots must not stamp the next Bot.
+                if (event.s("type") == "RUN_STARTED" && !reportedStart) {
+                    reportedStart = true
+                    reportChannelActivity(api, activityChannel, userMsg.text.ifBlank { "[附件]" }, null)
+                }
+                if (event.s("type") == "RUN_FINISHED" && !reportedFinish) {
+                    reportedFinish = true
+                    reducer.messages.lastOrNull { it.role == "assistant" && it.text.isNotBlank() }?.let {
+                        reportChannelActivity(api, activityChannel, it.text, bot.id)
+                    }
+                }
                 val now = System.currentTimeMillis()
                 // 每 50ms 最多推一次画面（逐字平滑由界面负责，§ streaming.md）
                 if (now - lastPush >= 50 || event.s("type") == "RUN_FINISHED" || event.s("type")?.startsWith("TOOL_CALL") == true) {
                     lastPush = now
                     val snapshot = reducer.messages.toList()
-                    withContext(Dispatchers.Main) { if (threadId == t) messages = snapshot }
+                    withContext(Dispatchers.Main) { if (current()) messages = snapshot }
                 }
             }
             withContext(Dispatchers.Main) {
-                if (threadId == t) {
+                if (current()) {
                     messages = reducer.messages.toList()
                     runError = reducer.error
                 }
             }
-        } catch (_: Unauthorized) { withContext(Dispatchers.Main) { expired() } }
+        } catch (_: Unauthorized) { withContext(Dispatchers.Main) { if (current()) expired() } }
         catch (e: Exception) {
             withContext(Dispatchers.Main) {
-                if (threadId == t && liveCall?.isCanceled() != true) runError = "连接断了：${e.message ?: e.javaClass.simpleName}"
+                if (current() && liveCall?.isCanceled() != true) runError = "连接断了：${e.message ?: e.javaClass.simpleName}"
             }
         } finally {
             withContext(Dispatchers.Main) {
+                if (chatEpoch != epoch || threadId != t) return@withContext
                 running = false
                 stopping = false
                 liveCall = null
@@ -607,8 +721,26 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 // 读一次服务器存下的历史，让本机和别的设备一致（含 MESSAGES_SNAPSHOT 之外的整理）
                 if (threadId == t) runCatching { api.get("/api/copilotkit/threads/$t/messages").a("messages") }.getOrNull()?.let {
                     val parsed = parseHistory(it)
-                    if (parsed.isNotEmpty()) messages = parsed
+                    if (parsed.isNotEmpty() && chatEpoch == epoch && threadId == t) messages = parsed
                 }
+                tasks.refresh()
+            }
+        }
+    }
+
+    /** Preview writes are independent of screen switches and must never block or replay a task. */
+    private fun reportChannelActivity(api: Api, cid: String?, text: String, agentId: String?) {
+        if (cid == null || text.isBlank()) return
+        val body = buildJsonObject {
+            put("text", text.take(500)); put("agentId", agentId?.let(::JsonPrimitive) ?: kotlinx.serialization.json.JsonNull)
+            put("at", java.time.Instant.now().toString())
+        }
+        viewModelScope.launch {
+            repeat(2) { attempt ->
+                if (origin() != api.origin) return@launch
+                try { api.call("/api/channels/${pathPart(cid)}/activity", "POST", body, timeoutMs = 8000); return@launch }
+                catch (e: CancellationException) { throw e }
+                catch (_: Exception) { if (attempt == 0) delay(1000) }
             }
         }
     }
@@ -620,14 +752,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val t = threadId ?: return
         val api = api ?: return
         if (stopping) return
+        val epoch = chatEpoch
         stopping = true
         viewModelScope.launch {
             runCatching { api.post("/api/copilotkit/agent/${bot.id}/stop/$t") }
             delay(400)
+            if (epoch != chatEpoch || threadId != t) return@launch
             liveCall?.cancel()
             watchJob?.cancel()
             delay(2500)
-            stopping = false
+            if (epoch == chatEpoch && threadId == t) stopping = false
         }
     }
 
@@ -648,6 +782,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** 重新生成最后一轮：截掉最后一条用户消息那一轮，原内容（文字 + 附件段）换个新 id 重发。 */
     suspend fun regenerate(): Boolean {
         val bot = chatBot ?: return false; val api = api ?: return false; val t = threadId ?: return false
+        val epoch = chatEpoch
         if (running || turnPreparing) return false
         if (!modelReadyToSend()) return false
         val at = messages.indexOfLast { it.role == "user" && !cn.ayase.chisabot.chat.ServerRows.isServerRow(it.text) }
@@ -657,17 +792,19 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         runError = null
         return try {
             truncate(api, t, last.id, "regenerate")
+            if (epoch != chatEpoch || threadId != t) return false
             messages = messages.take(at)
             startTurn(api, bot, t, last.copy(id = UUID.randomUUID().toString()))
             true
         } catch (_: Unauthorized) { expired(); false }
         catch (e: Exception) { notice = e.message ?: "没能重发"; false }
-        finally { turnPreparing = false }
+        finally { if (epoch == chatEpoch) turnPreparing = false }
     }
 
     /** 编辑后重发：从这条起截掉，新文字（附件保留）作为新的一条发出。 */
     suspend fun editAndResend(messageId: String, text: String): Boolean {
         val bot = chatBot ?: return false; val api = api ?: return false; val t = threadId ?: return false
+        val epoch = chatEpoch
         if (running || turnPreparing) return false
         if (!modelReadyToSend()) return false
         val at = messages.indexOfFirst { it.id == messageId }
@@ -678,13 +815,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         runError = null
         return try {
             truncate(api, t, old.id, "edit")
+            if (epoch != chatEpoch || threadId != t) return false
             messages = messages.take(at)
             val (tx, imgs, fl) = contentAll(content)
             startTurn(api, bot, t, ChatMessage(UUID.randomUUID().toString(), "user", tx, images = imgs, files = fl, content = content))
             true
         } catch (_: Unauthorized) { expired(); false }
         catch (e: Exception) { notice = e.message ?: "没能重发"; false }
-        finally { turnPreparing = false }
+        finally { if (epoch == chatEpoch) turnPreparing = false }
     }
 
     // ---------- 附件（§56）：选了就传到这段会话（POST /api/channels/<id>/attachments），传好才能发 ----------
@@ -866,7 +1004,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     /** 新话题：下一条消息建一个新的一对一会话（和网页「新话题」一样，旧会话留在历史里）。 */
     fun newTopic() {
-        if (running) return
+        if (running || turnPreparing) return
+        chatLoadJob?.cancel(); chatEpoch++; tasks.clear(); queuedDraft = null
+        requestedThreadId = null; chatLoading = false; chatLoadError = null
         threadId = null; channelId = null; messages = emptyList(); runError = null
         workStarted.clear(); workEnded.clear(); confirms = emptyMap(); files.clear()
     }

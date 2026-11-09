@@ -13,6 +13,8 @@
  * Protocol.
  */
 import type { CDPSession, Page } from "playwright";
+import { jpegFromBase64 } from "../../shared/screencast-frame";
+import { numberFromEnv } from "./env";
 import { whileNavigating } from "./start-page";
 
 /** What the surface sends us. */
@@ -67,8 +69,11 @@ export type NavigationMessage = {
 /** What we send back. */
 export type FrameMessage = {
   type: "frame";
-  /** Base64 JPEG. Chrome's own encoding; we do not re-encode. */
-  data: string;
+  /**
+   * Raw JPEG bytes (Chrome's own encoding, Base64-decoded once here).
+   * The computer socket sends these as a binary WebSocket frame — see shared/screencast-frame.ts.
+   */
+  jpeg: Uint8Array;
   width: number;
   height: number;
   /** 这一帧所在页面的网址，接管时的地址栏显示它。旧的计算机不带。 */
@@ -158,24 +163,48 @@ export type Screencast = {
 };
 
 /*
- * 直播画面的流量控制（2026-10-21，用户：内置浏览器用起来太卡）。
+ * 直播画面的流量控制（2026-10-21，用户：内置浏览器用起来太卡；2026-11-02 再收一档）。
  *
  * 以前收到 Chrome 的每一帧就立刻 ack，Chrome 于是按合成器的速度（动起来时每秒最多 60 帧）编码 JPEG：
- * 四核的服务器上软件渲染 + 编码本身就和机器人抢 CPU；帧又一路排进 API 转发、nginx 和 20 Mbps 跨洋链路的
+ * 四核的服务器上软件渲染 + 编码本身就和机器人抢 CPU；帧又一路排进 API 转发、nginx 和跨洋链路的
  * 缓冲里，画面越积越旧，点一下要等好几秒才看到结果。
  *
  * 现在两道闸：
- * 1. 帧率上限：距上一帧不到 MIN_FRAME_INTERVAL_MS 就晚一点再 ack，Chrome 最多每秒 20 帧。
+ * 1. 帧率上限：距上一帧不到 MIN_FRAME_INTERVAL_MS 就晚一点再 ack（默认约 15 fps）。
  * 2. 端到端信用：查看端每收到一帧回一个 frame-ack；在途（发出未确认）满 MAX_FRAMES_IN_FLIGHT 帧就先不 ack
  *    Chrome，等查看端追上。Chrome 在 ack 之前不出下一帧，所以等到的下一帧永远是最新画面，而不是排队的旧帧。
+ *    默认在途 1 帧：跨洋 RTT 下宁可略顿，也不让点击反馈落在旧画面上。
  *    旧版查看端不回 frame-ack：收到第一个 frame-ack 之前不启用这道闸，行为和以前一样（只多了帧率上限）。
  *    确认丢了也不会卡死：在途帧 FRAME_ACK_STALL_MS 内没有任何确认，就清零重来。
+ *
+ * 编码尺寸 / 画质也可经环境变量下调（SCREENCAST_MAX_WIDTH / HEIGHT / QUALITY）：软渲染机器上这比抬帧率更管用。
  */
-export const MIN_FRAME_INTERVAL_MS = 50;
-export const MAX_FRAMES_IN_FLIGHT = 2;
+export const MIN_FRAME_INTERVAL_MS = numberFromEnv(
+  "SCREENCAST_MIN_FRAME_INTERVAL_MS",
+  66,
+  { min: 16, max: 250 },
+);
+export const MAX_FRAMES_IN_FLIGHT = numberFromEnv(
+  "SCREENCAST_MAX_FRAMES_IN_FLIGHT",
+  1,
+  { min: 1, max: 4 },
+);
 export const FRAME_ACK_STALL_MS = 2_000;
-/** 画质：0–100。70 → 60 大约省两成流量，文字仍清楚。 */
-export const SCREENCAST_QUALITY = 60;
+/** 画质：0–100。默认 45，优先省 CPU / 带宽；文字仍大致可读。 */
+export const SCREENCAST_QUALITY = numberFromEnv("SCREENCAST_QUALITY", 45, {
+  min: 20,
+  max: 100,
+});
+/** 编码上限。比视口小：Chrome 缩 JPEG，点击坐标仍按 metadata 里的视口 CSS 像素映射。 */
+export const SCREENCAST_MAX_WIDTH = numberFromEnv("SCREENCAST_MAX_WIDTH", 1024, {
+  min: 640,
+  max: 1920,
+});
+export const SCREENCAST_MAX_HEIGHT = numberFromEnv(
+  "SCREENCAST_MAX_HEIGHT",
+  640,
+  { min: 400, max: 1200 },
+);
 
 /**
  * Start casting `page` to `onFrame`, and return a handle that accepts input.
@@ -265,7 +294,7 @@ export async function startScreencast(
     const url = pageUrl();
     onFrame({
       type: "frame",
-      data,
+      jpeg: jpegFromBase64(data),
       width: metadata.deviceWidth,
       height: metadata.deviceHeight,
       ...(url ? { url } : {}),
@@ -276,8 +305,8 @@ export async function startScreencast(
   await client.send("Page.startScreencast", {
     format: "jpeg",
     quality: options.quality ?? SCREENCAST_QUALITY,
-    maxWidth: options.maxWidth ?? 1280,
-    maxHeight: options.maxHeight ?? 800,
+    maxWidth: options.maxWidth ?? SCREENCAST_MAX_WIDTH,
+    maxHeight: options.maxHeight ?? SCREENCAST_MAX_HEIGHT,
     // One frame per change, not per interval. Chrome decides when something moved.
     everyNthFrame: 1,
   });
@@ -301,9 +330,9 @@ export async function startScreencast(
       const url = pageUrl();
       onFrame({
         type: "frame",
-        data: shot.data,
-        width: size?.width ?? options.maxWidth ?? 1280,
-        height: size?.height ?? options.maxHeight ?? 800,
+        jpeg: jpegFromBase64(shot.data),
+        width: size?.width ?? options.maxWidth ?? SCREENCAST_MAX_WIDTH,
+        height: size?.height ?? options.maxHeight ?? SCREENCAST_MAX_HEIGHT,
         ...(url ? { url } : {}),
       });
     } catch {

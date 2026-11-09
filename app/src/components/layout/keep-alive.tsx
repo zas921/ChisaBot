@@ -19,7 +19,7 @@ export type KeptState = {
 };
 
 /** 一页占的「位置」：同一个 slot 就是同一个实例（换对话时复用位置 = 以前的行为，交给页面自己决定要不要重挂）。 */
-type Slot<T> = { slot: number; kept: T };
+type Slot<T> = { slot: number; kept: T; idleSince?: number };
 type Pages<T> = { current: Slot<T> | null; held: Slot<T>[]; next: number };
 
 /**
@@ -33,7 +33,7 @@ type Pages<T> = { current: Slot<T> | null; held: Slot<T>[]; next: number };
  * - `idleVisible`：地址不是那一页，但正在跳过去（`/` → 最近的对话），留着的那页先露着，不空一下。
  * - 换一段对话时，离开的那段**正在回答**（`working` 里有它的 `keyOf`，DESIGN.md §109）：不卸载，挪到「留着等它答完」
  *   的那几页里藏着（叠在主区里，不占位置），这一轮在浏览器里的工具、接力、看门狗照常跑；切回来还是同一个实例。
- *   答完（不在 `working` 里了）且没在看它，就放掉。不在回答的那段照旧：新对话复用它的位置。
+ *   默认答完且没在看它就放掉；配置 `maxIdlePages` 时，最近访问的闲置页也留着，到期或超出容量才放掉。
  *
  * 路由那一层永远是同一个元素、只换样式，路由内容不会因为留没留着而重新挂载。
  */
@@ -45,6 +45,7 @@ export function KeepAliveStage<T>({
   working,
   renderKept,
   ttlMs = KEPT_TTL_MS,
+  maxIdlePages = 0,
   children,
 }: {
   address: T | null;
@@ -57,6 +58,8 @@ export function KeepAliveStage<T>({
   working?: ReadonlySet<string>;
   renderKept: (kept: T, state: KeptState) => ReactNode;
   ttlMs?: number;
+  /** 换走后最多保留几段闲置对话；正在回答的不计入容量。0 保留原来只留正在回答的行为。 */
+  maxIdlePages?: number;
   children: ReactNode;
 }) {
   const busy = (kept: T) => Boolean(keyOf && working?.has(keyOf(kept)));
@@ -69,7 +72,7 @@ export function KeepAliveStage<T>({
   }));
   let view = pages;
   if (address !== null && (pages.current === null || !same(address, pages.current.kept))) {
-    view = switchTo(pages, address, sameKey, busy);
+    view = switchTo(pages, address, sameKey, busy, maxIdlePages > 0);
     setPages(view);
   }
   const current = view.current;
@@ -86,15 +89,26 @@ export function KeepAliveStage<T>({
     return () => window.clearTimeout(timer);
   }, [visible, current, currentBusy, ttlMs]);
 
-  // 留着等它答完的那几页：答完就放。
-  const heldKeys = view.held.map((page) => (keyOf ? keyOf(page.kept) : "")).join("\n");
+  // 保留最近用过的闲置页，忙页不淘汰；忙页答完以后才开始闲置计时。
+  const heldPages = view.held;
   useEffect(() => {
-    if (!heldKeys || !keyOf) return;
-    setPages((p) => {
-      const held = p.held.filter((page) => working?.has(keyOf(page.kept)));
-      return held.length === p.held.length ? p : { ...p, held };
-    });
-  }, [heldKeys, working, keyOf]);
+    if (heldPages.length === 0) return;
+    const isBusy = (kept: T) => Boolean(keyOf && working?.has(keyOf(kept)));
+    const prune = (p: Pages<T>, now: number) => {
+      const held = retainHeld(p.held, isBusy, maxIdlePages, ttlMs, now);
+      return held === p.held ? p : { ...p, held };
+    };
+    const now = Date.now();
+    const retained = retainHeld(heldPages, isBusy, maxIdlePages, ttlMs, now);
+    if (retained !== heldPages) setPages((p) => prune(p, now));
+    const expiresAt = retained.reduce(
+      (next, page) => page.idleSince === undefined ? next : Math.min(next, page.idleSince + ttlMs),
+      Number.POSITIVE_INFINITY,
+    );
+    if (!Number.isFinite(expiresAt)) return;
+    const timer = window.setTimeout(() => setPages((p) => prune(p, Date.now())), Math.max(0, expiresAt - now));
+    return () => window.clearTimeout(timer);
+  }, [heldPages, working, keyOf, maxIdlePages, ttlMs]);
 
   // 按 slot 排：新的位置永远排在最后，已有的几页在 DOM 里不挪动（挪动节点会丢掉滚动位置）。
   const all = [...view.held.map((page) => ({ page, held: true })), ...(current ? [{ page: current, held: false }] : [])].sort(
@@ -119,17 +133,37 @@ export function KeepAliveStage<T>({
 }
 
 /** 地址换到 `address`：当前页正在回答就挪去留着，否则让出位置；之前留着的那段就直接回到它自己的位置上。 */
-function switchTo<T>(pages: Pages<T>, address: T, sameKey: (a: T, b: T) => boolean, busy: (kept: T) => boolean): Pages<T> {
+function switchTo<T>(pages: Pages<T>, address: T, sameKey: (a: T, b: T) => boolean, busy: (kept: T) => boolean, keepIdle: boolean): Pages<T> {
   const outgoing = pages.current;
   // 同一段对话，只是地址里别的部分变了（设置窗格、`?watch`）：同一个位置。
   if (outgoing && sameKey(address, outgoing.kept)) return { ...pages, current: { slot: outgoing.slot, kept: address } };
   const back = pages.held.find((page) => sameKey(page.kept, address));
   const held = pages.held.filter((page) => page !== back);
-  const keepOutgoing = outgoing !== null && busy(outgoing.kept);
-  if (keepOutgoing) held.push(outgoing);
+  const outgoingBusy = outgoing !== null && busy(outgoing.kept);
+  const keepOutgoing = outgoing !== null && (outgoingBusy || keepIdle);
+  if (keepOutgoing) held.push({ ...outgoing, idleSince: outgoingBusy ? undefined : Date.now() });
   if (back) return { ...pages, current: { slot: back.slot, kept: address }, held };
   if (outgoing && !keepOutgoing) return { ...pages, current: { slot: outgoing.slot, kept: address }, held };
   return { current: { slot: pages.next, kept: address }, held, next: pages.next + 1 };
+}
+
+/** held 的顺序是最后离开的顺序；从末尾保留最近的闲置页，忙页始终保留。 */
+function retainHeld<T>(held: Slot<T>[], busy: (kept: T) => boolean, capacity: number, ttlMs: number, now: number): Slot<T>[] {
+  let idleCount = 0;
+  const retained: Slot<T>[] = [];
+  for (let at = held.length - 1; at >= 0; at--) {
+    const page = held[at]!;
+    if (busy(page.kept)) {
+      retained.push(page.idleSince === undefined ? page : { ...page, idleSince: undefined });
+      continue;
+    }
+    const idleSince = page.idleSince ?? now;
+    if (idleCount >= capacity || now - idleSince >= ttlMs) continue;
+    idleCount++;
+    retained.push(page.idleSince === undefined ? { ...page, idleSince } : page);
+  }
+  retained.reverse();
+  return retained.length === held.length && retained.every((page, at) => page === held[at]) ? held : retained;
 }
 
 /**

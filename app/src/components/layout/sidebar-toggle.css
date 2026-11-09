@@ -1,0 +1,89 @@
+/* Keep the menu control in the permanent top bar, with room for its visible label. */
+.glass-topbar.glass-topbar-with-menu-toggle {
+  grid-template-columns: max-content minmax(0, 1fr) max-content;
+}
+
+.glass-topbar.glass-topbar-with-menu-toggle .glass-topbar-start,
+html[data-phone] .glass-topbar.glass-topbar-with-menu-toggle .glass-topbar-start {
+  width: auto;
+  min-width: 0;
+  justify-content: flex-start;
+  gap: 12px;
+}
+
+html[data-phone] .glass-topbar.glass-topbar-with-menu-toggle {
+  grid-template-columns: max-content minmax(0, 1fr) max-content;
+}
+
+.glass-topbar .glass-menu-toggle,
+.sidebar-mobile-menu-close .glass-menu-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  flex: none;
+  min-width: 104px;
+  min-height: 36px;
+  padding: 8px 12px;
+  border: 1px solid var(--line-strong, rgba(100, 116, 139, 0.35));
+  border-radius: 10px;
+  background: var(--glass-2, rgba(255, 255, 255, 0.8));
+  color: var(--ink-1, #16181d);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.2;
+  white-space: nowrap;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
+.glass-menu-toggle .glass-menu-toggle-icon {
+  width: 18px;
+  height: 18px;
+  flex: none;
+}
+
+.glass-menu-toggle:hover {
+  background: var(--glass-hover, rgba(148, 163, 184, 0.18));
+}
+
+.glass-menu-toggle:focus-visible {
+  outline: 2px solid var(--focus-line, #4777db);
+  outline-offset: 2px;
+}
+
+.sidebar-mobile-menu-close {
+  display: flex;
+  justify-content: flex-end;
+  flex: none;
+  padding-bottom: 12px;
+}
+
+.sidebar-mobile-menu-close .glass-menu-toggle {
+  min-height: 44px;
+}
+
+/* The native window buttons are absolute; reserve their actual width. */
+html[data-desktop] .glass-topbar.glass-topbar-with-menu-toggle {
+  padding-right: calc(46px * 4 + 12px);
+}
+
+html[data-desktop] .glass-topbar.glass-topbar-with-menu-toggle:has(.win-ctrls[data-count="3"]) {
+  padding-right: calc(46px * 3 + 12px);
+}
+
+@media (max-width: 767px) {
+  .glass-topbar .glass-menu-toggle {
+    min-height: 40px;
+  }
+
+  html[data-desktop] .glass-topbar.glass-topbar-with-menu-toggle {
+    padding-right: calc(36px * 4 + 8px);
+  }
+
+  html[data-desktop] .glass-topbar.glass-topbar-with-menu-toggle:has(.win-ctrls[data-count="3"]) {
+    padding-right: calc(36px * 3 + 8px);
+  }
+}

@@ -170,7 +170,11 @@ function raw(port: number, request: string) {
     socket.setTimeout(5_000, () => socket.destroy(new Error("timed out")));
     socket.on("data", (chunk) => {
       seen += chunk.toString();
-      if (seen.includes("reached") || /^HTTP\/1\.1 403/.test(seen)) {
+      if (
+        seen.includes("reached") ||
+        /^HTTP\/1\.1 403/.test(seen) ||
+        /^HTTP\/1\.1 407/.test(seen)
+      ) {
         if (seen.includes("\r\n\r\n")) socket.end();
       }
     });
@@ -310,33 +314,63 @@ describe("the filter: who may go out as whom", () => {
     setEgressPolicy("b", { mode: "allow_all", rules: [] });
     expect(ANONYMOUS_EGRESS_POLICY.rules).toEqual([]);
 
-    // A's allowlist and B's allow_all are not anonymous's.
-    expect(await get(filter.port, "site.a.test")).toContain("403");
-    expect(await get(filter.port, "anything.example.test")).toContain("403");
-    expect(await tunnel(filter.port, "site.a.test:443")).toContain("403");
-    // The fallback's own defaults (package registries) do go out.
+    // A's allowlist and B's allow_all are not anonymous's — challenge so Chromium can authenticate.
+    expect(await get(filter.port, "site.a.test")).toContain("407");
+    expect(await get(filter.port, "anything.example.test")).toContain("407");
+    expect(await tunnel(filter.port, "site.a.test:443")).toContain("407");
+    // After the challenge, the Bot's own credentials use that Bot's policy (allow_all here).
+    const keyB = egressFor("b", {})?.password ?? "";
+    expect(
+      await get(filter.port, "anything.example.test", basic(`b:${keyB}`)),
+    ).toContain("reached");
+    expect(
+      await tunnel(
+        filter.port,
+        "anything.example.test:443",
+        basic(`b:${keyB}`),
+      ),
+    ).toContain("reached");
+    // The fallback's own defaults (package registries) do go out without a challenge.
     expect(await get(filter.port, "registry.npmjs.org")).toContain("reached");
     expect(await tunnel(filter.port, "registry.npmjs.org:443")).toContain(
       "reached",
     );
     expect(asked).toEqual([
+      "http://anything.example.test/",
+      "anything.example.test:443",
       "http://registry.npmjs.org/",
       "registry.npmjs.org:443",
     ]);
 
-    // Stripping credentials never gets a stricter Bot more than it has.
+    // Stripping credentials never gets a stricter Bot more than it has — still a challenge,
+    // and authenticating as that Bot is refused by its own policy.
     setEgressPolicy("c", {
       mode: "allowlist_only",
       rules: [{ type: "domain", value: "registry.npmjs.org" }],
     });
-    expect(await get(filter.port, "registry.npmjs.org")).toContain("403");
+    expect(await get(filter.port, "registry.npmjs.org")).toContain("407");
+    const keyC = egressFor("c", {})?.password ?? "";
+    expect(
+      await get(filter.port, "site.a.test", basic(`c:${keyC}`)),
+    ).toContain("403");
     setEgressPolicy("c", { mode: "deny_all", rules: [] });
     expect(await tunnel(filter.port, "registry.npmjs.org:443")).toContain(
-      "403",
+      "407",
     );
-    // The private-net floor holds for anonymous too.
+    expect(
+      await tunnel(
+        filter.port,
+        "registry.npmjs.org:443",
+        basic(`c:${keyC}`),
+      ),
+    ).toContain("403");
+    // The private-net floor: anonymous is challenged; a Bot is still refused.
     setEgressPolicy("c", null);
-    expect(await tunnel(filter.port, "100.64.0.1:443")).toContain("403");
+    setEgressPolicy("b", { mode: "allow_all", rules: [] });
+    expect(await tunnel(filter.port, "100.64.0.1:443")).toContain("407");
+    expect(
+      await tunnel(filter.port, "100.64.0.1:443", basic(`b:${keyB}`)),
+    ).toContain("403");
   });
 
   test("anonymous connections are logged with where they came from, throttled, without a key", async () => {

@@ -23,8 +23,8 @@ import {
 const css = readFileSync(path.join(import.meta.dir, "../src/styles.css"), "utf8");
 
 describe("appearance palettes, Hark WebGL sky scenes, wallpapers & glass", () => {
-  test("provides 8 curated high-contrast theme palettes and computes sky variables for non-default palettes", () => {
-    expect(THEME_PALETTES.length).toBe(8);
+  test("provides 6 curated high-contrast theme palettes and computes sky variables for non-default palettes", () => {
+    expect(THEME_PALETTES.length).toBe(6);
     expect(computePaletteSky("default", false)).toBeNull();
     for (const p of THEME_PALETTES) {
       // Every theme's dark sky scene is a deep night scene (2 or 4) for dark mode legibility
@@ -39,14 +39,14 @@ describe("appearance palettes, Hark WebGL sky scenes, wallpapers & glass", () =>
     }
   });
 
-  test("provides Hark WebGL wallpaper_core.html and 8 curated sky scene options plus backward-compatible scene resolution", () => {
+  test("provides Hark WebGL wallpaper_core.html and 6 curated sky scene options plus backward-compatible scene resolution", () => {
     const wallpaperHtmlPath = path.join(import.meta.dir, "../public/wallpaper_core.html");
     expect(existsSync(wallpaperHtmlPath)).toBe(true);
     const wallpaperHtml = readFileSync(wallpaperHtmlPath, "utf8");
     expect(wallpaperHtml).toContain("window.hark");
     expect(wallpaperHtml).toContain("const SCENES = [");
 
-    expect(HARK_SKY_SCENES.length).toBe(8);
+    expect(HARK_SKY_SCENES.length).toBe(6);
     resetAppearanceDefaults();
     expect(getAppearanceState().harkScene).toBe("auto");
     expect(resolveEffectiveHarkScene(getAppearanceState(), false)).toBe(0);
@@ -103,15 +103,14 @@ describe("appearance palettes, Hark WebGL sky scenes, wallpapers & glass", () =>
     expect(getAppearanceState().wallpaperId).toBe("none");
   });
 
-  test("styles.css defines Hark #sky-root, 4 translucent borderless glass modes, light/dark sky contrast veils, and zero -webkit-backdrop-filter minifier traps", () => {
+  test("styles.css defines Hark #sky-root, 3 translucent borderless glass modes, light/dark sky contrast veils, and zero -webkit-backdrop-filter minifier traps", () => {
     expect(css).toContain("#sky-root");
     expect(css).toContain("html:not(.dark) #sky-root::after");
     expect(css).toContain("html.dark #sky-root::after");
     expect(css).toContain('html[data-glass="liquid"]');
-    expect(css).toContain('html[data-glass="mist"]');
     expect(css).toContain('html[data-glass="crystal"]');
     expect(css).toContain('html[data-glass="frosted"]');
-    expect(css).toMatch(/@property --lg-alpha \{[^}]*inherits: false; initial-value: 0\.16;/);
+    expect(css).toContain("--lg-alpha: 0.16");
     expect(css).toContain("--lg-border: transparent");
     expect(css).toContain("border: 0 !important");
     expect(css).toContain(".chisabot-wallpaper");

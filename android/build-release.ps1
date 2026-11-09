@@ -32,7 +32,7 @@ try {
     Copy-Item -LiteralPath $apk -Destination $dest
     $sha = (Get-FileHash -LiteralPath $dest -Algorithm SHA256).Hash.ToLowerInvariant()
     "$sha  $name" | Set-Content (Join-Path $OutputDirectory "$name.sha256") -Encoding utf8
-    [ordered]@{ version = $version; versionCode = $code; packageName = 'cn.ayase.chisabot'; url = $name; sha256 = $sha; notes = '安卓原生模型选择、搜索与刷新；签名安装包。' } |
+    [ordered]@{ version = $version; versionCode = $code; packageName = 'cn.ayase.chisabot'; url = $name; sha256 = $sha; notes = '修复手机新会话找不到、误开旧会话；新增原生历史对话选择，补齐会话活动同步；包含正式版聊天闪退修复。' } |
         ConvertTo-Json | Set-Content (Join-Path $OutputDirectory 'latest.json') -Encoding utf8NoBOM
     Write-Output "已验证签名、包名和版本：$dest"
 } finally { Pop-Location }
